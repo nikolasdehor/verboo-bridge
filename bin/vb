@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# vb - Verboo CLI direct (bypasses @verboo/code OAuth block)
+# Uso: vb <prompt> [--model <model>] [--system "<sys>"] [--temp <0-2>]
+set -euo pipefail
+API="${VERBOO_API_KEY:-}"
+if [ -z "$API" ] && [ -f ~/.config/claude-secrets.env ]; then
+  API=$(grep '^export VERBOO_API_KEY=' ~/.config/claude-secrets.env | sed 's/^export VERBOO_API_KEY="//;s/"$//')
+fi
+[ -z "$API" ] && { echo "Error: VERBOO_API_KEY not set" >&2; exit 1; }
+
+MODEL="deepseek-v4-flash"; TEMP="0.3"; SYS=""; P=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model|-m) MODEL="$2"; shift 2 ;;
+    --system|-s) SYS="$2"; shift 2 ;;
+    --temp|-t) TEMP="$2"; shift 2 ;;
+    --help|-h)
+      echo "Uso: vb <prompt> [--model M] [--system S] [--temp N]"
+      echo "Models: deepseek-v4-flash, glm-5.2, mimo-v2.5, kimi-k2.7, glm-4.7-flash, minimax-m3, qwen3.6-27b"
+      exit 0 ;;
+    *) P="$1"; shift ;;
+  esac
+done
+[ -z "$P" ] && { echo "Error: prompt required" >&2; exit 1; }
+
+MSG="[{\"role\":\"user\",\"content\":$(echo "$P" | jq -Rs .)}]"
+[ -n "$SYS" ] && MSG="[{\"role\":\"system\",\"content\":$(echo "$SYS" | jq -Rs .)},{\"role\":\"user\",\"content\":$(echo "$P" | jq -Rs .)}]"
+
+echo "=> [$MODEL] $P" >&2
+curl -s "https://code.verboo.ai/router/v1/chat/completions" \
+  -H "Authorization: Bearer $API" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"$MODEL\",\"messages\":$MSG,\"temperature\":$TEMP}" |
+  jq -r '.choices[0].message.content // .error.message // "error"'

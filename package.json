@@ -1,0 +1,25 @@
+{
+  "name": "verboo-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MCP server to use Verboo AI models as sub-agents in Claude Code, Codex, Cursor, or any MCP-compatible client",
+  "keywords": ["verboo", "mcp", "claude", "codex", "ai", "models", "bridge"],
+  "homepage": "https://github.com/nikolasdehor/verboo-bridge",
+  "license": "MIT",
+  "author": "Nikolas de Hor (https://github.com/nikolasdehor)",
+  "bin": {
+    "verboo-bridge": "index.mjs",
+    "vb": "bin/vb"
+  },
+  "files": ["index.mjs", "bin/", "skills/", "README.md", "LICENSE"],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.16.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nikolasdehor/verboo-bridge.git"
+  }
+}
