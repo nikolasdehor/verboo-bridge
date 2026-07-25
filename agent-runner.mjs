@@ -3,6 +3,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 export const AGENT_MODES = ['read_only', 'write'];
+export const AGENT_EXECUTORS = ['opencode', 'native'];
 export const DEFAULT_AGENT_MODEL = 'deepseek-v4-flash';
 export const MIN_TIMEOUT_SECONDS = 10;
 export const MAX_TIMEOUT_SECONDS = 1800;
@@ -25,8 +26,6 @@ const CHILD_ENV_ALLOWLIST = [
   'TERM',
   'TMPDIR',
   'USER',
-  'VERBOO_API_KEY',
-  'VERBOO_BASE_URL',
   'XDG_CACHE_HOME',
   'XDG_CONFIG_HOME',
   'XDG_DATA_HOME',
@@ -175,6 +174,8 @@ function inlineConfig(mode) {
 
 export function buildOpenCodeInvocation(request, opencodeBin = 'opencode') {
   return {
+    executor: 'opencode',
+    label: 'OpenCode',
     command: opencodeBin,
     args: [
       'run',
@@ -194,13 +195,98 @@ export function buildOpenCodeInvocation(request, opencodeBin = 'opencode') {
   };
 }
 
-export function buildChildEnv(sourceEnv, opencodeConfigContent) {
+function nativePathPattern(cwd, suffix = '**') {
+  const normalized = cwd.split(path.sep).join(path.posix.sep);
+  const escaped = normalized.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+  return `${escaped.replace(/\/+$/, '')}/${suffix}`;
+}
+
+function nativePermissionSettings(request) {
+  const write = request.mode === 'write';
+  const projectFiles = nativePathPattern(request.cwd);
+  const secretFiles = [
+    nativePathPattern(request.cwd, '**/.env'),
+    nativePathPattern(request.cwd, '**/.env.*'),
+  ];
+  const allow = [
+    `Read(${projectFiles})`,
+    `Glob(${projectFiles})`,
+    'Grep',
+  ];
+  if (write) {
+    allow.push(`Edit(${projectFiles})`, `Write(${projectFiles})`);
+  }
+  const deny = [
+    ...secretFiles.map((pattern) => `Read(${pattern})`),
+    ...secretFiles.map((pattern) => `Edit(${pattern})`),
+    ...secretFiles.map((pattern) => `Write(${pattern})`),
+    ...(!write ? ['Edit', 'Write'] : []),
+    'Bash',
+    'WebFetch',
+    'WebSearch',
+    'Task',
+  ];
+  return JSON.stringify({
+    disableAllHooks: true,
+    permissions: {
+      defaultMode: 'dontAsk',
+      allow,
+      deny,
+    },
+  });
+}
+
+export function buildVerbooCodeInvocation(
+  request,
+  verbooCodeBin = 'verboo',
+  entrypoint = '',
+) {
+  const tools = request.mode === 'write'
+    ? 'Read,Glob,Grep,Edit,Write'
+    : 'Read,Glob,Grep';
+  const args = [];
+  if (entrypoint) args.push(entrypoint);
+  args.push(
+    '-p',
+    '--output-format',
+    'stream-json',
+    '--verbose',
+    '--model',
+    request.model,
+    '--permission-mode',
+    'dontAsk',
+    '--tools',
+    tools,
+    '--strict-mcp-config',
+    '--disable-slash-commands',
+    '--no-chrome',
+    '--settings',
+    nativePermissionSettings(request),
+    '--',
+    request.prompt,
+  );
+  return {
+    executor: 'native',
+    label: 'Verboo Code',
+    command: verbooCodeBin,
+    args,
+  };
+}
+
+export function buildChildEnv(sourceEnv, invocation) {
   const childEnv = {};
   for (const key of CHILD_ENV_ALLOWLIST) {
     if (sourceEnv[key] !== undefined) childEnv[key] = sourceEnv[key];
   }
-  childEnv.OPENCODE_CONFIG_CONTENT = opencodeConfigContent;
-  childEnv.OPENCODE_DISABLE_PROJECT_CONFIG = '1';
+  if (invocation.executor === 'opencode') {
+    for (const key of ['VERBOO_API_KEY', 'VERBOO_BASE_URL']) {
+      if (sourceEnv[key] !== undefined) childEnv[key] = sourceEnv[key];
+    }
+    childEnv.OPENCODE_CONFIG_CONTENT = invocation.inlineConfig;
+    childEnv.OPENCODE_DISABLE_PROJECT_CONFIG = '1';
+  } else {
+    childEnv.VERBOO_DISABLE_EARLY_INPUT = '1';
+  }
   return childEnv;
 }
 
@@ -252,6 +338,85 @@ export function parseOpenCodeEvents(raw, cwd) {
   };
 }
 
+function nativeEventBlocks(event) {
+  const content = event.message?.content ?? event.content;
+  return Array.isArray(content) ? content : [];
+}
+
+export function parseVerbooCodeEvents(raw, cwd) {
+  let sessionId = null;
+  let result = '';
+  const artifacts = new Set();
+  const toolsUsed = new Set();
+  const successfulTools = new Set();
+  const pendingTools = new Map();
+
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    sessionId ||= event.session_id ?? event.sessionId ?? null;
+    if (event.type === 'result' && typeof event.result === 'string') {
+      const candidate = stripReasoning(event.result);
+      if (candidate) result = candidate;
+    }
+
+    for (const block of nativeEventBlocks(event)) {
+      if (block.type === 'text') {
+        const candidate = stripReasoning(block.text ?? '');
+        if (candidate) result = candidate;
+        continue;
+      }
+      if (block.type === 'tool_use') {
+        const tool = String(block.name ?? '');
+        if (tool) toolsUsed.add(tool);
+        const paths = [];
+        for (const value of [
+          block.input?.file_path,
+          block.input?.filePath,
+          block.input?.path,
+        ]) {
+          if (typeof value !== 'string') continue;
+          const candidate = path.resolve(cwd, value);
+          if (isInside(cwd, candidate)) paths.push(candidate);
+        }
+        if (block.id) pendingTools.set(block.id, { tool, paths });
+        continue;
+      }
+      if (block.type === 'tool_result') {
+        const pending = pendingTools.get(block.tool_use_id);
+        if (!pending || block.is_error === true) continue;
+        if (pending.tool) successfulTools.add(pending.tool);
+        for (const artifact of pending.paths) artifacts.add(artifact);
+      }
+    }
+  }
+
+  return {
+    sessionId,
+    result,
+    artifacts: [...artifacts].sort(),
+    toolsUsed: [...toolsUsed].sort(),
+    successfulTools: [...successfulTools].sort(),
+  };
+}
+
+function configuredExecutor(env) {
+  const executor = String(env.VERBOO_AGENT_EXECUTOR ?? 'opencode').toLowerCase();
+  if (!AGENT_EXECUTORS.includes(executor)) {
+    throw agentError(
+      'EXECUTOR_INVALID',
+      `VERBOO_AGENT_EXECUTOR deve ser um de: ${AGENT_EXECUTORS.join(', ')}.`,
+    );
+  }
+  return executor;
+}
+
 function recoveryFor(error) {
   const recovery = {
     ALLOWED_ROOTS_MISSING: [
@@ -264,6 +429,16 @@ function recoveryFor(error) {
     OPENCODE_NOT_FOUND: [
       'Instale o OpenCode ou configure VERBOO_OPENCODE_BIN com o caminho absoluto.',
     ],
+    VERBOO_CODE_NOT_FOUND: [
+      'Instale @verboo/code ou configure VERBOO_CODE_BIN e VERBOO_CODE_ENTRYPOINT.',
+    ],
+    VERBOO_AUTH_REQUIRED: [
+      'Execute a CLI oficial com `verboo auth login` ou `verboo auth login --headless`.',
+      'Depois reinicie o cliente MCP para que o executor herde a sessão OAuth.',
+    ],
+    EXECUTOR_INVALID: [
+      `Configure VERBOO_AGENT_EXECUTOR como ${AGENT_EXECUTORS.join(' ou ')}.`,
+    ],
     WRITE_DISABLED: [
       'Configure VERBOO_AGENT_WRITE_ENABLED=1 no servidor MCP somente se edição remota estiver autorizada.',
     ],
@@ -275,7 +450,7 @@ function recoveryFor(error) {
     ],
     OUTPUT_LIMIT: ['Reduza o escopo; a execução excedeu o limite de saída do bridge.'],
     EXIT_ERROR: [
-      'Execute opencode models verboo e confirme credenciais/configuração antes de tentar novamente.',
+      'Confirme a autenticação e a configuração do executor antes de tentar novamente.',
     ],
   };
   return recovery[error.code] ?? ['Corrija a entrada ou configuração indicada e tente novamente.'];
@@ -316,7 +491,7 @@ function execute(invocation, options) {
 
     const child = spawnImpl(invocation.command, invocation.args, {
       cwd,
-      env: buildChildEnv(env, invocation.inlineConfig),
+      env: buildChildEnv(env, invocation),
       detached: process.platform !== 'win32',
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -356,7 +531,7 @@ function execute(invocation, options) {
     timer = setTimeout(() => {
       terminate(agentError(
         'TIMEOUT',
-        `OpenCode excedeu o timeout de ${timeoutSeconds}s e foi interrompido.`,
+        `${invocation.label} excedeu o timeout de ${timeoutSeconds}s e foi interrompido.`,
       ));
     }, timeoutSeconds * 1000);
 
@@ -365,7 +540,10 @@ function execute(invocation, options) {
       stdoutBytes += chunk.length;
       if (stdoutBytes > MAX_STDOUT_BYTES) {
         terminate(
-          agentError('OUTPUT_LIMIT', 'Saída do OpenCode excedeu 4 MiB e foi interrompida.'),
+          agentError(
+            'OUTPUT_LIMIT',
+            `Saída do ${invocation.label} excedeu 4 MiB e foi interrompida.`,
+          ),
         );
         return;
       }
@@ -380,10 +558,14 @@ function execute(invocation, options) {
 
     child.on('error', (error) => {
       const wrapped = agentError(
-        error.code === 'ENOENT' ? 'OPENCODE_NOT_FOUND' : 'EXIT_ERROR',
         error.code === 'ENOENT'
-          ? `OpenCode não encontrado: ${invocation.command}`
-          : `Falha ao iniciar OpenCode: ${error.message}`,
+          ? invocation.executor === 'native'
+            ? 'VERBOO_CODE_NOT_FOUND'
+            : 'OPENCODE_NOT_FOUND'
+          : 'EXIT_ERROR',
+        error.code === 'ENOENT'
+          ? `${invocation.label} não encontrado: ${invocation.command}`
+          : `Falha ao iniciar ${invocation.label}: ${error.message}`,
       );
       finish(reject, wrapped);
     });
@@ -397,9 +579,25 @@ function execute(invocation, options) {
       if (code !== 0) {
         const detail = stderr.trim().split('\n').at(-1);
         const suffix = detail ? ` (${detail.slice(0, 300)})` : '';
+        if (
+          invocation.executor === 'native'
+          && /não autenticado no verboo|not authenticated.*verboo/i.test(stderr)
+        ) {
+          finish(
+            reject,
+            agentError(
+              'VERBOO_AUTH_REQUIRED',
+              'Sessão OAuth do Verboo Code não encontrada.',
+            ),
+          );
+          return;
+        }
         finish(
           reject,
-          agentError('EXIT_ERROR', `OpenCode encerrou com código ${code}${suffix}.`),
+          agentError(
+            'EXIT_ERROR',
+            `${invocation.label} encerrou com código ${code}${suffix}.`,
+          ),
         );
         return;
       }
@@ -423,10 +621,17 @@ export async function runVerbooAgent(args, options) {
       request.cwd,
       options.env.VERBOO_AGENT_ALLOWED_ROOTS,
     );
-    const invocation = buildOpenCodeInvocation(
-      request,
-      options.env.VERBOO_OPENCODE_BIN || 'opencode',
-    );
+    const executor = configuredExecutor(options.env);
+    const invocation = executor === 'native'
+      ? buildVerbooCodeInvocation(
+          request,
+          options.env.VERBOO_CODE_BIN || 'verboo',
+          options.env.VERBOO_CODE_ENTRYPOINT || '',
+        )
+      : buildOpenCodeInvocation(
+          request,
+          options.env.VERBOO_OPENCODE_BIN || 'opencode',
+        );
     const raw = await execute(invocation, {
       cwd: request.cwd,
       timeoutSeconds: request.timeoutSeconds,
@@ -435,9 +640,11 @@ export async function runVerbooAgent(args, options) {
       killImpl: options.killImpl,
       killGraceMs: options.killGraceMs,
     });
-    const parsed = parseOpenCodeEvents(raw, request.cwd);
+    const parsed = executor === 'native'
+      ? parseVerbooCodeEvents(raw, request.cwd)
+      : parseOpenCodeEvents(raw, request.cwd);
     const hasWriteExecution = parsed.successfulTools.some((tool) => (
-      ['apply_patch', 'edit', 'write'].includes(tool)
+      ['apply_patch', 'edit', 'write'].includes(tool.toLowerCase())
     ));
     const status = request.mode === 'write' && !hasWriteExecution ? 'warning' : 'success';
 
@@ -464,6 +671,7 @@ export async function runVerbooAgent(args, options) {
       model: request.model,
       mode: request.mode,
       cwd: request.cwd,
+      executor,
     };
   } finally {
     releaseAgentSlot();

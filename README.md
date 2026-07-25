@@ -28,7 +28,8 @@ graph TB
         MCP[MCP Server<br/>stdio]
         CLI[CLI wrapper<br/>bin/vb]
         AGENT[verboo_agent<br/>repo-aware]
-        HARNESS[OpenCode harness]
+        NATIVE[Verboo Code nativo<br/>OAuth]
+        HARNESS[OpenCode<br/>fallback]
     end
 
     subgraph "Verboo API"
@@ -44,7 +45,9 @@ graph TB
     Terminal -->|CLI direta| CLI
 
     MCP --> AGENT
-    AGENT --> HARNESS
+    AGENT -->|preferencial| NATIVE
+    AGENT -->|opcional| HARNESS
+    NATIVE -->|OAuth| DS
     HARNESS -->|provider verboo| DS
     OPENCODE -->|provider verboo| DS
     MCP -->|API key| DS
@@ -79,20 +82,34 @@ cd verboo-bridge
 npm install
 ```
 
-Requisitos: Node.js 18+ e, para `verboo_agent`, OpenCode 1.17.9+.
+Requisitos: Node.js 18+ e, para `verboo_agent`, `@verboo/code` com OAuth
+ou OpenCode 1.17.9+ como fallback.
 
 ### Variavel de ambiente
 
 ```bash
-# Injete VERBOO_API_KEY pelo ambiente ou gerenciador de segredos do cliente.
 export VERBOO_AGENT_ALLOWED_ROOTS="/caminho/para/seus/projetos"
-export VERBOO_OPENCODE_BIN="/caminho/para/opencode"
+export VERBOO_AGENT_EXECUTOR="native"
+export VERBOO_CODE_BIN="/caminho/para/verboo"
 # Opcional e sensivel: habilita edicao (sem shell)
 export VERBOO_AGENT_WRITE_ENABLED="1"
 ```
 
-Nao grave `VERBOO_API_KEY` no repositorio. Se usa Claude Code, injete-a pelo
-ambiente seguro que inicia o cliente.
+Antes do modo nativo, autentique a CLI oficial uma vez com
+`verboo auth login` ou `verboo auth login --headless`. A sessão OAuth é lida
+pelo subprocesso via diretório do usuário; a API key não é repassada ao
+executor nativo.
+
+Se o comando `verboo` não apontar para a CLI oficial, use Node e o entrypoint:
+
+```bash
+export VERBOO_CODE_BIN="/caminho/para/node"
+export VERBOO_CODE_ENTRYPOINT="/caminho/para/@verboo/code/dist/cli.mjs"
+```
+
+`VERBOO_API_KEY` continua opcionalmente disponível para as tools de prompt
+simples (`verboo_code`, `verboo_review` e tools por modelo). Não grave a chave
+no repositório.
 
 ---
 
@@ -109,16 +126,17 @@ Adicione no `~/.claude.json`:
       "command": "node",
       "args": ["/caminho/para/verboo-bridge/index.mjs"],
       "env": {
-        "VERBOO_API_KEY": "${VERBOO_API_KEY}",
         "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/para/seus/projetos",
-        "VERBOO_OPENCODE_BIN": "/caminho/para/opencode"
+        "VERBOO_AGENT_EXECUTOR": "native",
+        "VERBOO_CODE_BIN": "/caminho/para/verboo"
       }
     }
   }
 }
 ```
 
-O `${VERBOO_API_KEY}` sera resolvido automaticamente pelo Claude Code a partir do environment.
+O Claude Code ainda pode pedir aprovação para a chamada MCP. Essa aprovação é
+do orquestrador e é separada do OAuth e das permissões internas do Verboo Code.
 
 ### OpenCode
 
@@ -183,11 +201,14 @@ args = ["/caminho/para/verboo-bridge/index.mjs"]
 
 [mcp_servers.verboo-bridge.env]
 VERBOO_AGENT_ALLOWED_ROOTS = "/caminho/para/seus/projetos"
-VERBOO_OPENCODE_BIN = "/caminho/para/opencode"
+VERBOO_AGENT_EXECUTOR = "native"
+VERBOO_CODE_BIN = "/caminho/para/verboo"
 ```
 
-O processo do Codex deve receber `VERBOO_API_KEY` pelo ambiente; evite salvar a
-chave literal no TOML.
+O Codex ainda controla a aprovação da chamada `verboo_agent`. O executor nativo
+recebe apenas as ferramentas compatíveis com o modo solicitado: leitura no
+`read_only`; leitura e edição no `write`; Bash, web, hooks e MCPs internos ficam
+bloqueados.
 
 Reinicie o cliente depois de alterar a configuracao. MCPs novos nao entram em
 uma sessao ja aberta.
@@ -222,7 +243,7 @@ Quando o MCP server estiver registrado, o orquestrador tera acesso a estas tools
 
 | Tool | Descricao |
 |------|-----------|
-| `verboo_agent` | Subagente repo-aware via OpenCode (`read_only` ou `write`) |
+| `verboo_agent` | Subagente repo-aware via Verboo Code nativo/OAuth ou OpenCode fallback (`read_only` ou `write`) |
 | `verboo_code` | Codificacao com DeepSeek V4 Flash |
 | `verboo_review` | Code review |
 | `verboo_deepseek_v4_flash` | Modelo especifico |
@@ -262,7 +283,14 @@ cat main.py | vb -m mimo-v2.5 "Revise este codigo"
 vb --list
 ```
 
-### Via OpenCode (provider direto)
+### Via Verboo Code nativo
+
+```bash
+verboo auth login
+verboo -p --output-format stream-json "Revise este projeto"
+```
+
+### Via OpenCode (fallback)
 
 ```bash
 opencode run -m verboo/deepseek-v4-flash "Refatore este componente"
@@ -359,6 +387,9 @@ O server tambem expoe **resources** e **prompts**:
 | `VERBOO_AGENT_ALLOWED_ROOTS` | — | Raizes repo-aware separadas pelo delimitador de paths do SO; sem valor, `verboo_agent` falha fechado |
 | `VERBOO_AGENT_WRITE_ENABLED` | — | Defina `1` para habilitar `write`; por padrao somente `read_only` e aceito |
 | `VERBOO_AGENT_MAX_CONCURRENCY` | `1` | Execucoes simultaneas do agente; inteiro entre 1 e 8, valores invalidos usam 1 |
+| `VERBOO_AGENT_EXECUTOR` | `opencode` | `native` usa Verboo Code/OAuth; `opencode` preserva compatibilidade |
+| `VERBOO_CODE_BIN` | `verboo` | Executavel da CLI oficial; pode ser Node quando `VERBOO_CODE_ENTRYPOINT` estiver definido |
+| `VERBOO_CODE_ENTRYPOINT` | — | Caminho opcional para `@verboo/code/dist/cli.mjs` |
 | `VERBOO_OPENCODE_BIN` | `opencode` | Caminho do OpenCode 1.17.9+ |
 | `VERBOO_ENV_FILE` | — | Arquivo opcional lido por `bin/verboo-mcp` para obter `VERBOO_API_KEY` sem `source` |
 | `VERBOO_NODE_BIN` | `node` | Binario Node usado por `bin/verboo-mcp` |

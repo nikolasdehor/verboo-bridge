@@ -37,11 +37,17 @@ const MODELS = {
 const API_KEY = process.env.VERBOO_API_KEY;
 const BASE_URL = process.env.VERBOO_BASE_URL || 'https://code.verboo.ai/router/v1';
 const LOG_LEVEL = (process.env.VERBOO_LOG_LEVEL || 'info').toLowerCase();
+const AGENT_EXECUTOR = (process.env.VERBOO_AGENT_EXECUTOR || 'opencode').toLowerCase();
 
-if (!API_KEY) {
+if (!API_KEY && AGENT_EXECUTOR !== 'native') {
   console.error('ERRO: VERBOO_API_KEY nao definida');
   console.error('Defina a variavel de ambiente com sua chave Verboo.');
   process.exit(1);
+}
+if (!API_KEY) {
+  console.error(
+    'AVISO: VERBOO_API_KEY nao definida; somente verboo_agent via executor nativo estara disponivel.',
+  );
 }
 
 function log(level, ...args) {
@@ -71,6 +77,11 @@ function parseSSE(raw) {
 // ── API Client ──────────────────────────────────────────────────────────
 
 async function callVerboo(model, messages, opts = {}) {
+  if (!API_KEY) {
+    throw new Error(
+      'VERBOO_API_KEY não definida; use verboo_agent com executor nativo ou configure a chave.',
+    );
+  }
   const info = MODELS[model];
   if (!info) {
     const available = Object.keys(MODELS).join(', ');
@@ -162,7 +173,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'verboo_agent',
-      description: 'Executa um subagente Verboo repo-aware via OpenCode. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1 e pode somente editar. O orquestrador executa testes e outros comandos.',
+      description: `Executa um subagente Verboo repo-aware via ${AGENT_EXECUTOR === 'native' ? 'Verboo Code nativo/OAuth' : 'OpenCode'}. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1 e pode somente editar. O orquestrador executa testes e outros comandos.`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -388,6 +399,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
           log_level: LOG_LEVEL,
           api_key_configured: Boolean(API_KEY),
           agent_allowed_roots_configured: Boolean(process.env.VERBOO_AGENT_ALLOWED_ROOTS),
+          agent_executor: AGENT_EXECUTOR,
         }, null, 2),
       }],
     };

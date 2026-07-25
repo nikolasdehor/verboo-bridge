@@ -8,10 +8,12 @@ import test from 'node:test';
 
 import {
   buildOpenCodeInvocation,
+  buildVerbooCodeInvocation,
   buildChildEnv,
   formatAgentFailure,
   normalizeAgentRequest,
   parseOpenCodeEvents,
+  parseVerbooCodeEvents,
   resolveAllowedCwd,
   runVerbooAgent,
 } from '../agent-runner.mjs';
@@ -125,7 +127,46 @@ test('read_only usa default deny e libera somente ferramentas de inspeção', ()
   assert.equal(permission.task, 'deny');
 });
 
+test('invocação nativa usa Verboo Code headless com ferramentas delimitadas', () => {
+  const request = {
+    prompt: '--file=/etc/passwd',
+    cwd: '/repo',
+    mode: 'write',
+    model: 'glm-5.2',
+  };
+  const invocation = buildVerbooCodeInvocation(
+    request,
+    '/opt/node',
+    '/opt/@verboo/code/dist/cli.mjs',
+  );
+
+  assert.equal(invocation.executor, 'native');
+  assert.equal(invocation.command, '/opt/node');
+  assert.equal(invocation.args[0], '/opt/@verboo/code/dist/cli.mjs');
+  assert.ok(invocation.args.includes('stream-json'));
+  assert.ok(invocation.args.includes('dontAsk'));
+  assert.ok(invocation.args.includes('Read,Glob,Grep,Edit,Write'));
+  assert.ok(!invocation.args.includes('--allowedTools'));
+  assert.ok(!invocation.args.includes('Bash'));
+  assert.equal(invocation.args.at(-2), '--');
+  assert.equal(invocation.args.at(-1), request.prompt);
+
+  const settings = JSON.parse(invocation.args[invocation.args.indexOf('--settings') + 1]);
+  assert.equal(settings.disableAllHooks, true);
+  assert.ok(settings.permissions.allow.includes('Read(/repo/**)'));
+  assert.ok(settings.permissions.allow.includes('Edit(/repo/**)'));
+  assert.ok(settings.permissions.allow.includes('Write(/repo/**)'));
+  assert.ok(settings.permissions.deny.includes('Read(/repo/**/.env.*)'));
+  assert.ok(settings.permissions.deny.includes('Bash'));
+});
+
 test('subprocesso desativa config de projeto e recebe apenas ambiente necessário', () => {
+  const invocation = buildOpenCodeInvocation({
+    prompt: 'audite',
+    cwd: '/repo',
+    mode: 'read_only',
+    model: 'deepseek-v4-flash',
+  });
   const env = buildChildEnv(
     {
       HOME: '/home/test',
@@ -135,15 +176,39 @@ test('subprocesso desativa config de projeto e recebe apenas ambiente necessári
       AWS_SECRET_ACCESS_KEY: 'nao-deve-vazar',
       OPENCODE_DISABLE_PROJECT_CONFIG: '0',
     },
-    '{"permission":{}}',
+    invocation,
   );
 
   assert.deepEqual(env, {
     HOME: '/home/test',
     PATH: '/bin',
     VERBOO_API_KEY: 'vbk_test',
-    OPENCODE_CONFIG_CONTENT: '{"permission":{}}',
+    OPENCODE_CONFIG_CONTENT: invocation.inlineConfig,
     OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+  });
+});
+
+test('executor nativo herda OAuth pelo HOME sem receber API key', () => {
+  const invocation = buildVerbooCodeInvocation({
+    prompt: 'audite',
+    cwd: '/repo',
+    mode: 'read_only',
+    model: 'deepseek-v4-flash',
+  });
+  const env = buildChildEnv(
+    {
+      HOME: '/home/test',
+      PATH: '/bin',
+      VERBOO_API_KEY: 'nao-deve-vazar',
+      GITHUB_TOKEN: 'nao-deve-vazar',
+    },
+    invocation,
+  );
+
+  assert.deepEqual(env, {
+    HOME: '/home/test',
+    PATH: '/bin',
+    VERBOO_DISABLE_EARLY_INPUT: '1',
   });
 });
 
@@ -180,6 +245,61 @@ test('parser retorna resposta final, sessão e artefatos internos', () => {
     artifacts: ['/repo/src/app.js'],
     toolsUsed: ['read'],
     successfulTools: ['read'],
+  });
+});
+
+test('parser nativo confirma somente ferramentas concluídas e artefatos internos', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({ type: 'system', subtype: 'init', session_id: 'native_123' }),
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 'native_123',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tool_ok',
+            name: 'Edit',
+            input: { file_path: '/repo/src/app.js' },
+          },
+          {
+            type: 'tool_use',
+            id: 'tool_failed',
+            name: 'Read',
+            input: { file_path: '/etc/passwd' },
+          },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: 'user',
+      session_id: 'native_123',
+      message: {
+        content: [
+          { type: 'tool_result', tool_use_id: 'tool_ok', content: 'ok' },
+          {
+            type: 'tool_result',
+            tool_use_id: 'tool_failed',
+            content: 'denied',
+            is_error: true,
+          },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: 'result',
+      session_id: 'native_123',
+      result: '<think>oculto</think>\nConcluído nativamente.',
+    }),
+  ].join('\n');
+
+  assert.deepEqual(parseVerbooCodeEvents(raw, cwd), {
+    sessionId: 'native_123',
+    result: 'Concluído nativamente.',
+    artifacts: ['/repo/src/app.js'],
+    toolsUsed: ['Edit', 'Read'],
+    successfulTools: ['Edit'],
   });
 });
 
@@ -241,6 +361,106 @@ test('write falha fechado sem feature gate server-side', async () => {
       },
     ),
     (error) => error.code === 'WRITE_DISABLED',
+  );
+});
+
+test('runVerbooAgent seleciona executor nativo e retorna contrato E2E', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-'));
+  const fakeVerboo = path.join(base, 'verboo-code');
+  await writeFile(
+    fakeVerboo,
+    `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  type: 'system',
+  subtype: 'init',
+  session_id: 'native_run'
+}) + '\\n');
+process.stdout.write(JSON.stringify({
+  type: 'assistant',
+  session_id: 'native_run',
+  message: {
+    content: [{
+      type: 'tool_use',
+      id: 'edit_1',
+      name: 'Edit',
+      input: { file_path: 'status.txt' }
+    }]
+  }
+}) + '\\n');
+process.stdout.write(JSON.stringify({
+  type: 'user',
+  session_id: 'native_run',
+  message: {
+    content: [{
+      type: 'tool_result',
+      tool_use_id: 'edit_1',
+      content: 'ok'
+    }]
+  }
+}) + '\\n');
+process.stdout.write(JSON.stringify({
+  type: 'result',
+  session_id: 'native_run',
+  result: 'Alteração concluída.'
+}) + '\\n');
+`,
+  );
+  await chmod(fakeVerboo, 0o755);
+
+  const result = await runVerbooAgent(
+    { prompt: 'edite status.txt', cwd: base, mode: 'write', timeout_seconds: 10 },
+    {
+      availableModels: MODELS,
+      env: {
+        ...process.env,
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_AGENT_WRITE_ENABLED: '1',
+        VERBOO_AGENT_EXECUTOR: 'native',
+        VERBOO_CODE_BIN: fakeVerboo,
+      },
+    },
+  );
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.executor, 'native');
+  assert.equal(result.session_id, 'native_run');
+  assert.deepEqual(result.tools_used, ['Edit']);
+  assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'status.txt')]);
+});
+
+test('executor nativo traduz ausência de OAuth em recuperação acionável', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-auth-'));
+  const fakeVerboo = path.join(base, 'verboo-code');
+  await writeFile(
+    fakeVerboo,
+    `#!/usr/bin/env node
+process.stderr.write('Não autenticado no Verboo. Execute verboo auth login.\\n');
+process.exit(1);
+`,
+  );
+  await chmod(fakeVerboo, 0o755);
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      { prompt: 'audite', cwd: base, mode: 'read_only', timeout_seconds: 10 },
+      {
+        availableModels: MODELS,
+        env: {
+          ...process.env,
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_AGENT_EXECUTOR: 'native',
+          VERBOO_CODE_BIN: fakeVerboo,
+        },
+      },
+    ),
+    (error) => {
+      assert.equal(error.code, 'VERBOO_AUTH_REQUIRED');
+      assert.deepEqual(formatAgentFailure(error).next_actions, [
+        'Execute a CLI oficial com `verboo auth login` ou `verboo auth login --headless`.',
+        'Depois reinicie o cliente MCP para que o executor herde a sessão OAuth.',
+      ]);
+      return true;
+    },
   );
 });
 
