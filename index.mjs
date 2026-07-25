@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
+import { createRequire } from 'module';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+const require = createRequire(import.meta.url);
+const { version: VERSION } = require('./package.json');
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -43,6 +46,23 @@ function log(level, ...args) {
   }
 }
 
+function pickContent(choice) {
+  const m = choice?.message;
+  const d = choice?.delta;
+  return m?.content || m?.reasoning_content || d?.content || d?.reasoning_content || '';
+}
+
+function parseSSE(raw) {
+  let full = ''; let usage = {};
+  for (const line of raw.split('\n')) {
+    if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+    const parsed = JSON.parse(line.slice(6));
+    full += pickContent(parsed.choices?.[0]);
+    if (parsed.usage) usage = parsed.usage;
+  }
+  return { full, usage };
+}
+
 // ── API Client ──────────────────────────────────────────────────────────
 
 async function callVerboo(model, messages, opts = {}) {
@@ -78,21 +98,9 @@ async function callVerboo(model, messages, opts = {}) {
 
   const raw = await res.text();
 
-  function pickContent(choice) {
-    const m = choice?.message;
-    const d = choice?.delta;
-    return m?.content || m?.reasoning_content || d?.content || d?.reasoning_content || '';
-  }
-
   // SSE streaming format — router pode retornar data: lines mesmo com stream:false
   if (raw.startsWith('data:') || raw.includes('\ndata:')) {
-    let full = ''; let usage = {};
-    for (const line of raw.split('\n')) {
-      if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
-      const parsed = JSON.parse(line.slice(6));
-      full += pickContent(parsed.choices?.[0]);
-      if (parsed.usage) usage = parsed.usage;
-    }
+    const { full, usage } = parseSSE(raw);
     if (!full) throw new Error('Resposta vazia da API');
     return { content: full, model, usage };
   }
@@ -107,7 +115,7 @@ async function callVerboo(model, messages, opts = {}) {
 // ── MCP Server ──────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'verboo-bridge', version: '1.0.0' },
+  { name: 'verboo-bridge', version: VERSION },
   {
     capabilities: {
       tools: {},
@@ -120,51 +128,34 @@ const server = new Server(
 // ── Tools ───────────────────────────────────────────────────────────────
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const tools = Object.entries(MODELS).map(([id, info]) => ({
-    name: `verboo_${id.replace(/[.-]/g, '_')}`,
-    description: `${info.name} — ${info.note}. ${(info.ctx / 1024).toFixed(0)}K ctx, ${info.out} max output. Plano: ${info.tier}.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        prompt:      { type: 'string', description: 'Instrucao para o modelo' },
-        system:      { type: 'string', description: 'Contexto/persona opcional' },
-        temperature: { type: 'number', description: 'Criatividade (0-2). Menor = mais deterministico.', default: 0.3 },
-        max_tokens:  { type: 'number', description: `Max tokens na resposta (max ${info.out})`, default: Math.min(info.out, 8192) },
-      },
-      required: ['prompt'],
-    },
-  }));
+  const codec = { type: 'object', properties: { prompt: { type: 'string' }, system: { type: 'string' }, temperature: { type: 'number', default: 0.3 }, max_tokens: { type: 'number', default: 65536 } }, required: ['prompt'] };
 
-  tools.push({
-    name: 'verboo_code',
-    description: 'Executa tarefa de codificacao com DeepSeek V4 Flash (1M ctx, melhor CxB)',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        prompt:      { type: 'string', description: 'Descricao da tarefa de codigo' },
-        system:      { type: 'string', description: 'Instrucoes de sistema opcionais' },
-        model:       { type: 'string', description: `Modelo (default: deepseek-v4-flash)`, default: 'deepseek-v4-flash' },
-        temperature: { type: 'number', default: 0.3 },
-        max_tokens:  { type: 'number', default: 65536 },
-      },
-      required: ['prompt'],
+  const tools = [
+    ...Object.entries(MODELS).map(([id, info]) => ({
+      name: `verboo_${id.replace(/[.-]/g, '_')}`,
+      description: `${info.name} — ${info.note}. ${(info.ctx / 1024).toFixed(0)}K ctx, ${info.out} max output. Plano: ${info.tier}.`,
+      inputSchema: { ...codec, properties: { ...codec.properties, max_tokens: { type: 'number', description: `Max tokens (max ${info.out})`, default: Math.min(info.out, 8192) } } },
+    })),
+    {
+      name: 'verboo_code',
+      description: 'Executa tarefa de codificacao com DeepSeek V4 Flash (1M ctx, melhor CxB)',
+      inputSchema: { ...codec, properties: { ...codec.properties, model: { type: 'string', default: 'deepseek-v4-flash' } } },
     },
-  });
-
-  tools.push({
-    name: 'verboo_review',
-    description: 'Revisa codigo buscando bugs, vulnerabilidades e problemas de performance',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        code:        { type: 'string', description: 'Codigo a ser revisado' },
-        context:     { type: 'string', description: 'Contexto adicional (ex: linguagem, framework)' },
-        model:       { type: 'string', default: 'deepseek-v4-flash' },
-        temperature: { type: 'number', default: 0.2 },
+    {
+      name: 'verboo_review',
+      description: 'Revisa codigo buscando bugs, vulnerabilidades e problemas de performance',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          code: { type: 'string', description: 'Codigo a ser revisado' },
+          context: { type: 'string', description: 'Contexto adicional (ex: linguagem, framework)' },
+          model: { type: 'string', default: 'deepseek-v4-flash' },
+          temperature: { type: 'number', default: 0.2 },
+        },
+        required: ['code'],
       },
-      required: ['code'],
     },
-  });
+  ];
 
   return { tools };
 });
@@ -187,10 +178,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       messages.push({ role: 'user', content: args.prompt });
     } else if (name === 'verboo_review') {
       model = args.model ?? 'deepseek-v4-flash';
-      messages = [
-        { role: 'system', content: 'Voce e um revisor de codigo especialista. Analise o codigo abaixo e aponte: bugs, vulnerabilidades de seguranca, problemas de performance, code smells, e sugestoes de melhoria. Seja direto e especifico.' },
-        { role: 'user', content: `${args.context ? `Contexto: ${args.context}\n\n` : ''}\`\`\`\n${args.code}\n\`\`\`` },
-      ];
+        let contextPrefix = '';
+        if (args.context) contextPrefix = `Contexto: ${args.context}\n\n`;
+        messages = [
+          { role: 'system', content: 'Voce e um revisor de codigo especialista. Analise o codigo abaixo e aponte: bugs, vulnerabilidades de seguranca, problemas de performance, code smells, e sugestoes de melhoria. Seja direto e especifico.' },
+          { role: 'user', content: `${contextPrefix}\`\`\`\n${args.code}\n\`\`\`` },
+        ];
     } else {
       model = Object.keys(MODELS).find(m => m.replace(/[.-]/g, '_') === match[1]);
       if (!model) {
@@ -356,13 +349,11 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
 
 // ── Start ───────────────────────────────────────────────────────────────
 
-async function main() {
+try {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   log('info', `verboo-bridge ready | ${Object.keys(MODELS).length} models | ${BASE_URL}`);
-}
-
-main().catch((err) => {
+} catch (err) {
   console.error('FATAL:', err.message);
   process.exit(1);
-});
+}

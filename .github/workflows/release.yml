@@ -19,7 +19,7 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Install
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Validate
         run: node -e "require('./index.mjs')" --help 2>&1 || true
@@ -43,7 +43,7 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.check.outputs.published == 'false'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: v${{ steps.check.outputs.version }}
           name: v${{ steps.check.outputs.version }}
