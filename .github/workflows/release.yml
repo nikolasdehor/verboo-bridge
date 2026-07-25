@@ -22,7 +22,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Validate
-        run: node -e "require('./index.mjs')" --help 2>&1 || true
+        run: npm test
 
       - name: Check npm version
         id: check

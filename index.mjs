@@ -3,6 +3,12 @@
 import { createRequire } from 'module';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  formatAgentFailure,
+  MAX_TIMEOUT_SECONDS,
+  MIN_TIMEOUT_SECONDS,
+  runVerbooAgent,
+} from './agent-runner.mjs';
 const require = createRequire(import.meta.url);
 const { version: VERSION } = require('./package.json');
 import {
@@ -35,7 +41,6 @@ const LOG_LEVEL = (process.env.VERBOO_LOG_LEVEL || 'info').toLowerCase();
 if (!API_KEY) {
   console.error('ERRO: VERBOO_API_KEY nao definida');
   console.error('Defina a variavel de ambiente com sua chave Verboo.');
-  console.error('Ex: export VERBOO_API_KEY="vbk_..."');
   process.exit(1);
 }
 
@@ -155,6 +160,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         required: ['code'],
       },
     },
+    {
+      name: 'verboo_agent',
+      description: 'Executa um subagente Verboo repo-aware via OpenCode. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1 e pode somente editar. O orquestrador executa testes e outros comandos.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'Tarefa concreta e delimitada para o agente' },
+          cwd: { type: 'string', description: 'Diretório do projeto, dentro de VERBOO_AGENT_ALLOWED_ROOTS' },
+          mode: {
+            type: 'string',
+            enum: ['read_only', 'write'],
+            default: 'read_only',
+            description: 'read_only para análise; write somente para edição autorizada, sem shell',
+          },
+          model: {
+            type: 'string',
+            enum: Object.keys(MODELS),
+            default: 'deepseek-v4-flash',
+          },
+          timeout_seconds: {
+            type: 'integer',
+            minimum: MIN_TIMEOUT_SECONDS,
+            maximum: MAX_TIMEOUT_SECONDS,
+            default: 600,
+          },
+        },
+        required: ['prompt', 'cwd'],
+      },
+    },
   ];
 
   return { tools };
@@ -171,7 +205,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     let model, messages;
 
-    if (name === 'verboo_code') {
+    if (name === 'verboo_agent') {
+      const result = await runVerbooAgent(args, {
+        availableModels: Object.keys(MODELS),
+        env: process.env,
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } else if (name === 'verboo_code') {
       model = args.model ?? 'deepseek-v4-flash';
       messages = [];
       if (args.system) messages.push({ role: 'system', content: args.system });
@@ -209,6 +251,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   } catch (err) {
     log('error', err.message);
+    if (name === 'verboo_agent') {
+      return {
+        content: [{ type: 'text', text: JSON.stringify(formatAgentFailure(err), null, 2) }],
+        isError: true,
+      };
+    }
     return {
       content: [{ type: 'text', text: `Erro: ${err.message}` }],
       isError: true,
@@ -334,11 +382,12 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
         uri: 'verboo://status',
         mimeType: 'application/json',
         text: JSON.stringify({
-          version: '1.0.0',
+          version: VERSION,
           base_url: BASE_URL,
           models_count: Object.keys(MODELS).length,
           log_level: LOG_LEVEL,
-          key_prefix: API_KEY.substring(0, 7) + '...',
+          api_key_configured: Boolean(API_KEY),
+          agent_allowed_roots_configured: Boolean(process.env.VERBOO_AGENT_ALLOWED_ROOTS),
         }, null, 2),
       }],
     };

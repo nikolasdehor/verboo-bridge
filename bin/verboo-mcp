@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR=$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)
+  SCRIPT_PATH=$(readlink "$SCRIPT_PATH")
+  [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+BRIDGE_DIR=$(cd -P "$(dirname "$SCRIPT_PATH")/.." && pwd)
+ENV_FILE="${VERBOO_ENV_FILE:-}"
+
+if [ -z "${VERBOO_API_KEY:-}" ] && [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
+  API_LINE=$(sed -n 's/^export VERBOO_API_KEY=//p' "$ENV_FILE" | tail -n 1)
+  API_LINE="${API_LINE#\"}"
+  API_LINE="${API_LINE%\"}"
+  [ -n "$API_LINE" ] && export VERBOO_API_KEY="$API_LINE"
+fi
+
+NODE_BIN="${VERBOO_NODE_BIN:-node}"
+exec "$NODE_BIN" "$BRIDGE_DIR/index.mjs"

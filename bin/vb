@@ -22,7 +22,15 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -z "$PROMPT" ] && [ ! -t 0 ] && PROMPT=$(cat)
+STDIN_PROMPT=""
+[ ! -t 0 ] && STDIN_PROMPT=$(cat)
+if [ -n "$STDIN_PROMPT" ]; then
+  if [ -n "$PROMPT" ]; then
+    PROMPT="${PROMPT}"$'\n\n'"${STDIN_PROMPT}"
+  else
+    PROMPT="$STDIN_PROMPT"
+  fi
+fi
 [ -z "$PROMPT" ] && { echo "Usage: vb <prompt> [--model M] [--system S] [--temp N]"; exit 1; }
 
 MSG=$(jq -n --arg user "$PROMPT" '[{role:"user",content:$user}]')

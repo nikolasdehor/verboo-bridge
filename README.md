@@ -27,6 +27,8 @@ graph TB
     subgraph "verboo-bridge"
         MCP[MCP Server<br/>stdio]
         CLI[CLI wrapper<br/>bin/vb]
+        AGENT[verboo_agent<br/>repo-aware]
+        HARNESS[OpenCode harness]
     end
 
     subgraph "Verboo API"
@@ -38,10 +40,13 @@ graph TB
 
     CLAUDE -->|MCP tools| MCP
     CODEX -->|MCP tools| MCP
-    OPENCODE -->|Provider config| CLI
     CURSOR -->|MCP tools| MCP
     Terminal -->|CLI direta| CLI
 
+    MCP --> AGENT
+    AGENT --> HARNESS
+    HARNESS -->|provider verboo| DS
+    OPENCODE -->|provider verboo| DS
     MCP -->|API key| DS
     MCP -->|API key| GLM
     MCP -->|API key| MIMO
@@ -74,16 +79,20 @@ cd verboo-bridge
 npm install
 ```
 
+Requisitos: Node.js 18+ e, para `verboo_agent`, OpenCode 1.17.9+.
+
 ### Variavel de ambiente
 
 ```bash
-export VERBOO_API_KEY="sua_chave_aqui"
+# Injete VERBOO_API_KEY pelo ambiente ou gerenciador de segredos do cliente.
+export VERBOO_AGENT_ALLOWED_ROOTS="/caminho/para/seus/projetos"
+export VERBOO_OPENCODE_BIN="/caminho/para/opencode"
+# Opcional e sensivel: habilita edicao (sem shell)
+export VERBOO_AGENT_WRITE_ENABLED="1"
 ```
 
-> Se usa Claude Code, pode colocar no `~/.config/claude-secrets.env`:
-> ```bash
-> export VERBOO_API_KEY="vbk_..."
-> ```
+Nao grave `VERBOO_API_KEY` no repositorio. Se usa Claude Code, injete-a pelo
+ambiente seguro que inicia o cliente.
 
 ---
 
@@ -100,7 +109,9 @@ Adicione no `~/.claude.json`:
       "command": "node",
       "args": ["/caminho/para/verboo-bridge/index.mjs"],
       "env": {
-        "VERBOO_API_KEY": "${VERBOO_API_KEY}"
+        "VERBOO_API_KEY": "${VERBOO_API_KEY}",
+        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/para/seus/projetos",
+        "VERBOO_OPENCODE_BIN": "/caminho/para/opencode"
       }
     }
   }
@@ -111,23 +122,31 @@ O `${VERBOO_API_KEY}` sera resolvido automaticamente pelo Claude Code a partir d
 
 ### OpenCode
 
-**Opcao 1 — MCP server** (tools via Claude):
+**Opcao 1 — MCP server**:
 
 ```json
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "verboo-bridge": {
-      "command": "node",
-      "args": ["/caminho/para/verboo-bridge/index.mjs"],
-      "env": {
-        "VERBOO_API_KEY": "{env:VERBOO_API_KEY}"
-      }
+      "type": "local",
+      "command": ["node", "/caminho/para/verboo-bridge/index.mjs"],
+      "environment": {
+        "VERBOO_API_KEY": "{env:VERBOO_API_KEY}",
+        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/para/seus/projetos",
+        "VERBOO_OPENCODE_BIN": "/caminho/para/opencode"
+      },
+      "enabled": true
     }
   }
 }
 ```
 
-**Opcao 2 — Provider direto** (ja configurado, use `opencode -m verboo:deepseek-v4-flash`):
+Para habilitar edicao conscientemente, adicione
+`"VERBOO_AGENT_WRITE_ENABLED": "1"` ao bloco `environment`. Sem isso,
+`verboo_agent` aceita somente `read_only`.
+
+**Opcao 2 — Provider direto** (necessario para `verboo_agent`):
 
 ```json
 {
@@ -155,21 +174,23 @@ O `${VERBOO_API_KEY}` sera resolvido automaticamente pelo Claude Code a partir d
 
 ### Codex
 
-Adicione no `~/.codex/config.json`:
+Adicione no `~/.codex/config.toml`:
 
-```json
-{
-  "mcpServers": {
-    "verboo-bridge": {
-      "command": "node",
-      "args": ["/caminho/para/verboo-bridge/index.mjs"],
-      "env": {
-        "VERBOO_API_KEY": "${VERBOO_API_KEY}"
-      }
-    }
-  }
-}
+```toml
+[mcp_servers.verboo-bridge]
+command = "node"
+args = ["/caminho/para/verboo-bridge/index.mjs"]
+
+[mcp_servers.verboo-bridge.env]
+VERBOO_AGENT_ALLOWED_ROOTS = "/caminho/para/seus/projetos"
+VERBOO_OPENCODE_BIN = "/caminho/para/opencode"
 ```
+
+O processo do Codex deve receber `VERBOO_API_KEY` pelo ambiente; evite salvar a
+chave literal no TOML.
+
+Reinicie o cliente depois de alterar a configuracao. MCPs novos nao entram em
+uma sessao ja aberta.
 
 ### Cursor
 
@@ -182,7 +203,9 @@ Adicione no `.cursor/mcp.json` do projeto:
       "command": "node",
       "args": ["/caminho/para/verboo-bridge/index.mjs"],
       "env": {
-        "VERBOO_API_KEY": "${VERBOO_API_KEY}"
+        "VERBOO_API_KEY": "${VERBOO_API_KEY}",
+        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/para/seus/projetos",
+        "VERBOO_OPENCODE_BIN": "/caminho/para/opencode"
       }
     }
   }
@@ -199,6 +222,7 @@ Quando o MCP server estiver registrado, o orquestrador tera acesso a estas tools
 
 | Tool | Descricao |
 |------|-----------|
+| `verboo_agent` | Subagente repo-aware via OpenCode (`read_only` ou `write`) |
 | `verboo_code` | Codificacao com DeepSeek V4 Flash |
 | `verboo_review` | Code review |
 | `verboo_deepseek_v4_flash` | Modelo especifico |
@@ -209,9 +233,18 @@ Quando o MCP server estiver registrado, o orquestrador tera acesso a estas tools
 | `verboo_glm_4_7_flash` | Modelo especifico |
 | `verboo_qwen3_6_27b` | Modelo especifico |
 
-Exemplo de prompt para o Claude:
+Exemplo de delegacao nativa:
 
-> _"Use a tool verboo_code para gerar os testes deste modulo, e verboo_review para revisar o codigo atual."_
+> _"Use `verboo_agent` em modo `write`, com cwd neste repo, para editar os testes
+> deste modulo. Depois revise o diff e rode a suite local no orquestrador."_
+
+`read_only` bloqueia edicao, shell, web, agentes aninhados e acesso fora do
+projeto. `write` libera somente ferramentas de leitura e edicao; shell, web,
+agentes aninhados e diretorios externos permanecem desabilitados. O orquestrador
+continua responsavel por executar testes e outros comandos, revisar o diff,
+commitar e fazer deploy. O subprocesso recebe somente uma allowlist minima de
+variaveis de ambiente; tokens de GitHub, AWS e outros servicos nao sao herdados.
+O modo `write` falha fechado enquanto `VERBOO_AGENT_WRITE_ENABLED` nao for `1`.
 
 ### Via CLI direta
 
@@ -225,9 +258,6 @@ vb -m glm-5.2 -s "Seja conciso e tecnico" "Analise a complexidade deste algoritm
 # Pipe de arquivo
 cat main.py | vb -m mimo-v2.5 "Revise este codigo"
 
-# Streaming (veja os tokens em tempo real)
-vb --stream "Escreva um CRUD em Node.js"
-
 # Listar modelos
 vb --list
 ```
@@ -235,25 +265,26 @@ vb --list
 ### Via OpenCode (provider direto)
 
 ```bash
-opencode -m verboo:deepseek-v4-flash "Refatore este componente"
-opencode -m verboo:glm-5.2 "Resolva este problema complexo"
+opencode run -m verboo/deepseek-v4-flash "Refatore este componente"
+opencode run -m verboo/glm-5.2 "Resolva este problema complexo"
 ```
 
 ---
 
-## Skill para Claude
+## Skill para Claude e Codex
 
 Para ensinar o Claude a delegar automaticamente tarefas de volume para a Verboo, copie o skill file:
 
 ```bash
 cp -r skills/verboo-executor ~/.claude/skills/
+cp -r skills/verboo-executor ~/.codex/skills/
 ```
 
 O skill ensina o padrao de delegacao:
 
 1. Claude recebe a tarefa
 2. Claude separa em **orquestracao** (fica com Claude) + **volume** (delega pra Verboo)
-3. Claude chama `verboo_code` ou `verboo_review` com instrucoes claras
+3. Claude/Codex chama `verboo_agent` com `cwd`, modo e instrucoes claras
 4. Claude integra e valida o resultado
 
 ---
@@ -325,6 +356,12 @@ O server tambem expoe **resources** e **prompts**:
 | `VERBOO_API_KEY` | — | **Obrigatoria.** Chave da API Verboo |
 | `VERBOO_BASE_URL` | `https://code.verboo.ai/router/v1` | URL base da API |
 | `VERBOO_LOG_LEVEL` | `info` | Nivel de log: `debug`, `info`, `warn`, `error` |
+| `VERBOO_AGENT_ALLOWED_ROOTS` | — | Raizes repo-aware separadas pelo delimitador de paths do SO; sem valor, `verboo_agent` falha fechado |
+| `VERBOO_AGENT_WRITE_ENABLED` | — | Defina `1` para habilitar `write`; por padrao somente `read_only` e aceito |
+| `VERBOO_AGENT_MAX_CONCURRENCY` | `1` | Execucoes simultaneas do agente; inteiro entre 1 e 8, valores invalidos usam 1 |
+| `VERBOO_OPENCODE_BIN` | `opencode` | Caminho do OpenCode 1.17.9+ |
+| `VERBOO_ENV_FILE` | — | Arquivo opcional lido por `bin/verboo-mcp` para obter `VERBOO_API_KEY` sem `source` |
+| `VERBOO_NODE_BIN` | `node` | Binario Node usado por `bin/verboo-mcp` |
 
 ---
 
@@ -334,7 +371,8 @@ O server tambem expoe **resources** e **prompts**:
 git clone https://github.com/nikolasdehor/verboo-bridge.git
 cd verboo-bridge
 npm install
-VERBOO_API_KEY="vbk_..." node index.mjs
+node index.mjs
+npm test
 ```
 
 Testar o MCP server:
