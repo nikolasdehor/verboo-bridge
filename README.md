@@ -27,7 +27,7 @@ graph TB
     subgraph "verboo-bridge"
         MCP[MCP Server<br/>stdio]
         CLI[CLI wrapper<br/>bin/vb]
-        AGENT[verboo_agent<br/>repo-aware]
+        AGENT[verboo_agent<br/>executor por chamada]
         NATIVE[Verboo Code nativo<br/>OAuth]
         HARNESS[OpenCode<br/>fallback]
     end
@@ -45,8 +45,8 @@ graph TB
     Terminal -->|CLI direta| CLI
 
     MCP --> AGENT
-    AGENT -->|preferencial| NATIVE
-    AGENT -->|opcional| HARNESS
+    AGENT -->|executor: native| NATIVE
+    AGENT -->|executor: opencode| HARNESS
     NATIVE -->|OAuth| DS
     HARNESS -->|provider verboo| DS
     OPENCODE -->|provider verboo| DS
@@ -89,6 +89,7 @@ ou OpenCode 1.17.9+ como fallback.
 
 ```bash
 export VERBOO_AGENT_ALLOWED_ROOTS="/caminho/para/seus/projetos"
+# Default opcional; cada chamada pode escolher native ou opencode
 export VERBOO_AGENT_EXECUTOR="native"
 export VERBOO_CODE_BIN="/caminho/para/verboo"
 # Opcional e sensivel: habilita edicao (sem shell)
@@ -99,6 +100,10 @@ Antes do modo nativo, autentique a CLI oficial uma vez com
 `verboo auth login` ou `verboo auth login --headless`. A sessão OAuth é lida
 pelo subprocesso via diretório do usuário; a API key não é repassada ao
 executor nativo.
+
+`verboo_agent` aceita `executor: "native"` ou `executor: "opencode"` em cada
+chamada. A escolha da chamada tem precedencia sobre `VERBOO_AGENT_EXECUTOR`.
+Sem nenhuma configuracao, o default e `native`.
 
 Se o comando `verboo` não apontar para a CLI oficial, use Node e o entrypoint:
 
@@ -137,6 +142,8 @@ Adicione no `~/.claude.json`:
 
 O Claude Code ainda pode pedir aprovação para a chamada MCP. Essa aprovação é
 do orquestrador e é separada do OAuth e das permissões internas do Verboo Code.
+O campo `executor` da chamada permite ao usuário ou ao orquestrador escolher o
+harness nativo ou o fallback OpenCode sem reiniciar o MCP.
 
 ### OpenCode
 
@@ -164,7 +171,8 @@ Para habilitar edicao conscientemente, adicione
 `"VERBOO_AGENT_WRITE_ENABLED": "1"` ao bloco `environment`. Sem isso,
 `verboo_agent` aceita somente `read_only`.
 
-**Opcao 2 — Provider direto** (necessario para `verboo_agent`):
+**Opcao 2 — Provider direto** (necessario para `verboo_agent` quando
+`executor: "opencode"`):
 
 ```json
 {
@@ -210,6 +218,9 @@ recebe apenas as ferramentas compatíveis com o modo solicitado: leitura no
 `read_only`; leitura e edição no `write`; Bash, web, hooks e MCPs internos ficam
 bloqueados.
 
+Mesmo com `VERBOO_AGENT_EXECUTOR = "native"` como default, uma chamada pode
+escolher `executor: "opencode"`. O inverso também funciona.
+
 Reinicie o cliente depois de alterar a configuracao. MCPs novos nao entram em
 uma sessao ja aberta.
 
@@ -243,7 +254,7 @@ Quando o MCP server estiver registrado, o orquestrador tera acesso a estas tools
 
 | Tool | Descricao |
 |------|-----------|
-| `verboo_agent` | Subagente repo-aware via Verboo Code nativo/OAuth ou OpenCode fallback (`read_only` ou `write`) |
+| `verboo_agent` | Subagente repo-aware com `executor` escolhido por chamada: Verboo Code nativo/OAuth ou OpenCode (`read_only` ou `write`) |
 | `verboo_code` | Codificacao com DeepSeek V4 Flash |
 | `verboo_review` | Code review |
 | `verboo_deepseek_v4_flash` | Modelo especifico |
@@ -256,8 +267,18 @@ Quando o MCP server estiver registrado, o orquestrador tera acesso a estas tools
 
 Exemplo de delegacao nativa:
 
-> _"Use `verboo_agent` em modo `write`, com cwd neste repo, para editar os testes
-> deste modulo. Depois revise o diff e rode a suite local no orquestrador."_
+> _"Use `verboo_agent` com `executor: native`, em modo `write`, com cwd neste
+> repo, para editar os testes deste modulo. Depois revise o diff e rode a suite
+> local no orquestrador."_
+
+Escolha do harness:
+
+- `native`: usa a CLI oficial e a sessão OAuth, preservando o harness
+  Claude Code-style do Verboo.
+- `opencode`: executa o mesmo agente delimitado pelo harness OpenCode e requer
+  o provider Verboo/API key configurado.
+- se `executor` for omitido, vale `VERBOO_AGENT_EXECUTOR`; sem a variável, o
+  default é `native`.
 
 `read_only` bloqueia edicao, shell, web, agentes aninhados e acesso fora do
 projeto. `write` libera somente ferramentas de leitura e edicao; shell, web,
@@ -312,8 +333,9 @@ O skill ensina o padrao de delegacao:
 
 1. Claude recebe a tarefa
 2. Claude separa em **orquestracao** (fica com Claude) + **volume** (delega pra Verboo)
-3. Claude/Codex chama `verboo_agent` com `cwd`, modo e instrucoes claras
-4. Claude integra e valida o resultado
+3. Claude/Codex escolhe `executor: native` ou `executor: opencode`
+4. Claude/Codex chama `verboo_agent` com `cwd`, modo e instrucoes claras
+5. Claude integra e valida o resultado
 
 ---
 
@@ -381,13 +403,13 @@ O server tambem expoe **resources** e **prompts**:
 
 | Variavel | Default | Descricao |
 |----------|---------|-----------|
-| `VERBOO_API_KEY` | — | **Obrigatoria.** Chave da API Verboo |
+| `VERBOO_API_KEY` | — | Necessaria para tools de prompt direto e para `executor: opencode`; nao e repassada ao executor nativo |
 | `VERBOO_BASE_URL` | `https://code.verboo.ai/router/v1` | URL base da API |
 | `VERBOO_LOG_LEVEL` | `info` | Nivel de log: `debug`, `info`, `warn`, `error` |
 | `VERBOO_AGENT_ALLOWED_ROOTS` | — | Raizes repo-aware separadas pelo delimitador de paths do SO; sem valor, `verboo_agent` falha fechado |
 | `VERBOO_AGENT_WRITE_ENABLED` | — | Defina `1` para habilitar `write`; por padrao somente `read_only` e aceito |
 | `VERBOO_AGENT_MAX_CONCURRENCY` | `1` | Execucoes simultaneas do agente; inteiro entre 1 e 8, valores invalidos usam 1 |
-| `VERBOO_AGENT_EXECUTOR` | `opencode` | `native` usa Verboo Code/OAuth; `opencode` preserva compatibilidade |
+| `VERBOO_AGENT_EXECUTOR` | `native` | Default administrativo; cada chamada pode substituir por `native` ou `opencode` |
 | `VERBOO_CODE_BIN` | `verboo` | Executavel da CLI oficial; pode ser Node quando `VERBOO_CODE_ENTRYPOINT` estiver definido |
 | `VERBOO_CODE_ENTRYPOINT` | — | Caminho opcional para `@verboo/code/dist/cli.mjs` |
 | `VERBOO_OPENCODE_BIN` | `opencode` | Caminho do OpenCode 1.17.9+ |

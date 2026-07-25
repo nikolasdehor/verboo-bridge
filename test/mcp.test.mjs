@@ -25,7 +25,13 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   await client.connect(transport);
 
   const listed = await client.listTools();
-  assert.ok(listed.tools.some((tool) => tool.name === 'verboo_agent'));
+  const agentTool = listed.tools.find((tool) => tool.name === 'verboo_agent');
+  assert.ok(agentTool);
+  assert.deepEqual(agentTool.inputSchema.properties.executor.enum, [
+    'opencode',
+    'native',
+  ]);
+  assert.equal(agentTool.inputSchema.properties.executor.default, 'native');
 
   const result = await client.callTool({
     name: 'verboo_agent',

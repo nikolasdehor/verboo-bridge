@@ -14,6 +14,7 @@ import {
   normalizeAgentRequest,
   parseOpenCodeEvents,
   parseVerbooCodeEvents,
+  resolveAgentExecutor,
   resolveAllowedCwd,
   runVerbooAgent,
 } from '../agent-runner.mjs';
@@ -45,6 +46,26 @@ test('rejeita modelo, modo e timeout fora da allowlist', () => {
   assert.throws(
     () => normalizeAgentRequest({ prompt: 'x', cwd: '/repo', timeout_seconds: 2 }, MODELS),
     /timeout_seconds/,
+  );
+});
+
+test('executor pode ser escolhido por chamada e usa native como padrão', () => {
+  assert.equal(resolveAgentExecutor(undefined, {}), 'native');
+  assert.equal(
+    resolveAgentExecutor(undefined, { VERBOO_AGENT_EXECUTOR: 'opencode' }),
+    'opencode',
+  );
+  assert.equal(
+    resolveAgentExecutor('native', { VERBOO_AGENT_EXECUTOR: 'opencode' }),
+    'native',
+  );
+  assert.equal(
+    resolveAgentExecutor('opencode', { VERBOO_AGENT_EXECUTOR: 'native' }),
+    'opencode',
+  );
+  assert.throws(
+    () => resolveAgentExecutor('inventado', {}),
+    /executor deve ser/,
   );
 });
 
@@ -331,19 +352,28 @@ process.stdout.write(JSON.stringify({
   await chmod(fakeOpenCode, 0o755);
 
   const result = await runVerbooAgent(
-    { prompt: 'crie um arquivo', cwd: base, mode: 'write', timeout_seconds: 10 },
+    {
+      prompt: 'crie um arquivo',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'write',
+      timeout_seconds: 10,
+    },
     {
       availableModels: MODELS,
       env: {
         ...process.env,
         VERBOO_AGENT_ALLOWED_ROOTS: base,
         VERBOO_AGENT_WRITE_ENABLED: '1',
+        VERBOO_AGENT_EXECUTOR: 'native',
+        VERBOO_API_KEY: 'test-key',
         VERBOO_OPENCODE_BIN: fakeOpenCode,
       },
     },
   );
 
   assert.equal(result.status, 'warning');
+  assert.equal(result.executor, 'opencode');
   assert.match(result.summary, /nenhuma mudança foi confirmada/);
   assert.deepEqual(result.artifacts, []);
   assert.deepEqual(result.tools_used, ['edit']);
@@ -361,6 +391,27 @@ test('write falha fechado sem feature gate server-side', async () => {
       },
     ),
     (error) => error.code === 'WRITE_DISABLED',
+  );
+});
+
+test('executor opencode exige API key por chamada, mas native não', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-opencode-key-'));
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'audite',
+        cwd: base,
+        executor: 'opencode',
+        mode: 'read_only',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+      },
+    ),
+    (error) => error.code === 'VERBOO_API_KEY_REQUIRED',
   );
 });
 
@@ -408,14 +459,20 @@ process.stdout.write(JSON.stringify({
   await chmod(fakeVerboo, 0o755);
 
   const result = await runVerbooAgent(
-    { prompt: 'edite status.txt', cwd: base, mode: 'write', timeout_seconds: 10 },
+    {
+      prompt: 'edite status.txt',
+      cwd: base,
+      executor: 'native',
+      mode: 'write',
+      timeout_seconds: 10,
+    },
     {
       availableModels: MODELS,
       env: {
         ...process.env,
         VERBOO_AGENT_ALLOWED_ROOTS: base,
         VERBOO_AGENT_WRITE_ENABLED: '1',
-        VERBOO_AGENT_EXECUTOR: 'native',
+        VERBOO_AGENT_EXECUTOR: 'opencode',
         VERBOO_CODE_BIN: fakeVerboo,
       },
     },
@@ -442,13 +499,18 @@ process.exit(1);
 
   await assert.rejects(
     () => runVerbooAgent(
-      { prompt: 'audite', cwd: base, mode: 'read_only', timeout_seconds: 10 },
+      {
+        prompt: 'audite',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        timeout_seconds: 10,
+      },
       {
         availableModels: MODELS,
         env: {
           ...process.env,
           VERBOO_AGENT_ALLOWED_ROOTS: base,
-          VERBOO_AGENT_EXECUTOR: 'native',
           VERBOO_CODE_BIN: fakeVerboo,
         },
       },
@@ -496,18 +558,31 @@ test('limite global rejeita concorrência com AGENT_BUSY e libera o slot', async
     env: {
       VERBOO_AGENT_ALLOWED_ROOTS: base,
       VERBOO_AGENT_MAX_CONCURRENCY: '1',
+      VERBOO_API_KEY: 'test-key',
     },
     spawnImpl,
   };
 
   const first = runVerbooAgent(
-    { prompt: 'primeira', cwd: base, mode: 'read_only', timeout_seconds: 10 },
+    {
+      prompt: 'primeira',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      timeout_seconds: 10,
+    },
     options,
   );
   await started;
   await assert.rejects(
     () => runVerbooAgent(
-      { prompt: 'segunda', cwd: base, mode: 'read_only', timeout_seconds: 10 },
+      {
+        prompt: 'segunda',
+        cwd: base,
+        executor: 'opencode',
+        mode: 'read_only',
+        timeout_seconds: 10,
+      },
       options,
     ),
     (error) => error.code === 'AGENT_BUSY',
@@ -517,7 +592,13 @@ test('limite global rejeita concorrência com AGENT_BUSY e libera o slot', async
   assert.equal((await first).status, 'success');
 
   const afterRelease = runVerbooAgent(
-    { prompt: 'terceira', cwd: base, mode: 'read_only', timeout_seconds: 10 },
+    {
+      prompt: 'terceira',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      timeout_seconds: 10,
+    },
     options,
   );
   await startedAgain;
@@ -549,10 +630,19 @@ test('limite de saída encerra o grupo POSIX com TERM, graça e KILL', {
 
   await assert.rejects(
     () => runVerbooAgent(
-      { prompt: 'audite', cwd: base, mode: 'read_only', timeout_seconds: 10 },
+      {
+        prompt: 'audite',
+        cwd: base,
+        executor: 'opencode',
+        mode: 'read_only',
+        timeout_seconds: 10,
+      },
       {
         availableModels: MODELS,
-        env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_API_KEY: 'test-key',
+        },
         spawnImpl,
         killImpl,
         killGraceMs: 5,
@@ -590,10 +680,19 @@ test('fechamento do processo direto após TERM não cancela KILL do grupo POSIX'
 
   await assert.rejects(
     () => runVerbooAgent(
-      { prompt: 'audite', cwd: base, mode: 'read_only', timeout_seconds: 10 },
+      {
+        prompt: 'audite',
+        cwd: base,
+        executor: 'opencode',
+        mode: 'read_only',
+        timeout_seconds: 10,
+      },
       {
         availableModels: MODELS,
-        env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_API_KEY: 'test-key',
+        },
         spawnImpl,
         killImpl,
         killGraceMs: 5,

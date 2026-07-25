@@ -4,9 +4,11 @@ import { createRequire } from 'module';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
+  AGENT_EXECUTORS,
   formatAgentFailure,
   MAX_TIMEOUT_SECONDS,
   MIN_TIMEOUT_SECONDS,
+  resolveAgentExecutor,
   runVerbooAgent,
 } from './agent-runner.mjs';
 const require = createRequire(import.meta.url);
@@ -37,16 +39,11 @@ const MODELS = {
 const API_KEY = process.env.VERBOO_API_KEY;
 const BASE_URL = process.env.VERBOO_BASE_URL || 'https://code.verboo.ai/router/v1';
 const LOG_LEVEL = (process.env.VERBOO_LOG_LEVEL || 'info').toLowerCase();
-const AGENT_EXECUTOR = (process.env.VERBOO_AGENT_EXECUTOR || 'opencode').toLowerCase();
+const DEFAULT_AGENT_EXECUTOR = resolveAgentExecutor(undefined, process.env);
 
-if (!API_KEY && AGENT_EXECUTOR !== 'native') {
-  console.error('ERRO: VERBOO_API_KEY nao definida');
-  console.error('Defina a variavel de ambiente com sua chave Verboo.');
-  process.exit(1);
-}
 if (!API_KEY) {
   console.error(
-    'AVISO: VERBOO_API_KEY nao definida; somente verboo_agent via executor nativo estara disponivel.',
+    'AVISO: VERBOO_API_KEY nao definida; tools de prompt direto e executor OpenCode podem ficar indisponiveis.',
   );
 }
 
@@ -173,12 +170,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'verboo_agent',
-      description: `Executa um subagente Verboo repo-aware via ${AGENT_EXECUTOR === 'native' ? 'Verboo Code nativo/OAuth' : 'OpenCode'}. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1 e pode somente editar. O orquestrador executa testes e outros comandos.`,
+      description: 'Executa um subagente Verboo repo-aware. Quem chama escolhe native para usar o harness Verboo Code/OAuth ou opencode como fallback. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1 e pode somente editar. O orquestrador executa testes e outros comandos.',
       inputSchema: {
         type: 'object',
         properties: {
           prompt: { type: 'string', description: 'Tarefa concreta e delimitada para o agente' },
           cwd: { type: 'string', description: 'Diretório do projeto, dentro de VERBOO_AGENT_ALLOWED_ROOTS' },
+          executor: {
+            type: 'string',
+            enum: AGENT_EXECUTORS,
+            default: DEFAULT_AGENT_EXECUTOR,
+            description: 'native usa o harness Verboo Code com OAuth; opencode usa o provider Verboo dentro do OpenCode',
+          },
           mode: {
             type: 'string',
             enum: ['read_only', 'write'],
@@ -399,7 +402,9 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
           log_level: LOG_LEVEL,
           api_key_configured: Boolean(API_KEY),
           agent_allowed_roots_configured: Boolean(process.env.VERBOO_AGENT_ALLOWED_ROOTS),
-          agent_executor: AGENT_EXECUTOR,
+          agent_executor: DEFAULT_AGENT_EXECUTOR,
+          agent_default_executor: DEFAULT_AGENT_EXECUTOR,
+          agent_executors: AGENT_EXECUTORS,
         }, null, 2),
       }],
     };

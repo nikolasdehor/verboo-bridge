@@ -406,12 +406,14 @@ export function parseVerbooCodeEvents(raw, cwd) {
   };
 }
 
-function configuredExecutor(env) {
-  const executor = String(env.VERBOO_AGENT_EXECUTOR ?? 'opencode').toLowerCase();
+export function resolveAgentExecutor(requestedExecutor, env) {
+  const executor = String(
+    requestedExecutor ?? env.VERBOO_AGENT_EXECUTOR ?? 'native',
+  ).toLowerCase();
   if (!AGENT_EXECUTORS.includes(executor)) {
     throw agentError(
       'EXECUTOR_INVALID',
-      `VERBOO_AGENT_EXECUTOR deve ser um de: ${AGENT_EXECUTORS.join(', ')}.`,
+      `executor deve ser um de: ${AGENT_EXECUTORS.join(', ')}.`,
     );
   }
   return executor;
@@ -429,6 +431,9 @@ function recoveryFor(error) {
     OPENCODE_NOT_FOUND: [
       'Instale o OpenCode ou configure VERBOO_OPENCODE_BIN com o caminho absoluto.',
     ],
+    VERBOO_API_KEY_REQUIRED: [
+      'Configure VERBOO_API_KEY no servidor MCP ou escolha executor native com OAuth.',
+    ],
     VERBOO_CODE_NOT_FOUND: [
       'Instale @verboo/code ou configure VERBOO_CODE_BIN e VERBOO_CODE_ENTRYPOINT.',
     ],
@@ -437,7 +442,7 @@ function recoveryFor(error) {
       'Depois reinicie o cliente MCP para que o executor herde a sessão OAuth.',
     ],
     EXECUTOR_INVALID: [
-      `Configure VERBOO_AGENT_EXECUTOR como ${AGENT_EXECUTORS.join(' ou ')}.`,
+      `Escolha executor como ${AGENT_EXECUTORS.join(' ou ')} na chamada, ou configure VERBOO_AGENT_EXECUTOR.`,
     ],
     WRITE_DISABLED: [
       'Configure VERBOO_AGENT_WRITE_ENABLED=1 no servidor MCP somente se edição remota estiver autorizada.',
@@ -621,7 +626,13 @@ export async function runVerbooAgent(args, options) {
       request.cwd,
       options.env.VERBOO_AGENT_ALLOWED_ROOTS,
     );
-    const executor = configuredExecutor(options.env);
+    const executor = resolveAgentExecutor(args.executor, options.env);
+    if (executor === 'opencode' && !options.env.VERBOO_API_KEY) {
+      throw agentError(
+        'VERBOO_API_KEY_REQUIRED',
+        'executor opencode requer VERBOO_API_KEY no servidor MCP.',
+      );
+    }
     const invocation = executor === 'native'
       ? buildVerbooCodeInvocation(
           request,

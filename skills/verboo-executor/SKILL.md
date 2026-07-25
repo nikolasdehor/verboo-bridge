@@ -12,12 +12,18 @@ orchestrator, reviewer, and final validator.
 
 Prefer `verboo_agent` when the task needs to inspect or modify a repository:
 
-- Requires OpenCode 1.17.9 or newer.
 - `prompt`: one concrete task with owned files and validation commands.
 - `cwd`: project directory under `VERBOO_AGENT_ALLOWED_ROOTS`.
+- `executor`: choose `native` to use the Verboo Code/Claude Code-style harness
+  with OAuth, or `opencode` to use the OpenCode fallback.
 - `mode`: `read_only` by default; use `write` only when the user authorized changes.
 - `model`: `deepseek-v4-flash` by default; use `glm-5.2` for harder reasoning.
 - `timeout_seconds`: 10-1800, normally 600.
+
+Prefer `native` when `@verboo/code` is installed and authenticated. It keeps
+Verboo's own agent harness while the MCP caller remains the orchestrator.
+Use `opencode` when the caller explicitly wants the OpenCode harness or native
+OAuth is unavailable.
 
 `read_only` enables only repository inspection tools. `write` adds the edit tool;
 shell, nested-agent, web, and external-directory tools remain disabled. The
@@ -28,17 +34,18 @@ and unrelated service tokens. Treat these controls as defense in depth, not a
 security sandbox.
 
 The tool returns a stable object with `status`, `summary`, `result`,
-`next_actions`, `artifacts`, and the OpenCode `session_id`.
+`next_actions`, `artifacts`, `executor`, and the executor `session_id`.
 
 ## Delegation pattern
 
 1. Keep architecture, product decisions, secrets, production, and user communication
    with the orchestrator.
 2. Give Verboo a narrow task and explicit file ownership.
-3. Use `read_only` for exploration or review.
-4. Use `write` only for an authorized, bounded patch.
-5. Inspect the diff and run the repository's own checks in the orchestrator.
-6. Never let the Verboo agent commit, push, deploy, or handle credentials.
+3. Choose `native` or `opencode` explicitly when the harness matters.
+4. Use `read_only` for exploration or review.
+5. Use `write` only for an authorized, bounded patch.
+6. Inspect the diff and run the repository's own checks in the orchestrator.
+7. Never let the Verboo agent commit, push, deploy, or handle credentials.
 
 For health, auth, clinical, financial, tenant-isolation, or other high-risk code,
 use Verboo only as an additional opinion. The primary security/code reviewer owns
