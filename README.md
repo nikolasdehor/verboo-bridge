@@ -60,13 +60,9 @@ graph TB
 | **Mimo V2.5** | 1.048.576 | Pro | - | - | - | Analise pesada, 63 tok/s |
 | **GLM 4.7 Flash** | 200.704 | Pro | - | - | - | Tarefas rapidas |
 | **Qwen 3.6 27B** | 262.144 | Pro | - | - | - | Tarefas leves, 27B params |
-| **Step 3.7 Flash** | 262.144 | Pro | - | - | - | Modelo StepFun |
 | **GLM 5.2** | 524.288 | Ultra | 62.1% | 81.0 | #2 (1.593 Elo) | Raciocinio complexo |
-| **Kimi K2.7** | 259.072 | Ultra | ~60% | - | - | Tarefas gerais, visao |
+| **Kimi K2.7** | 262.144 | Ultra | ~60% | - | - | Tarefas gerais, visao |
 | **Minimax M3** | 1.048.576 | Ultra | - | - | - | Codificacao, 87 tok/s, visao |
-| **GPT-OSS 120B** | 128.000 | Ultra | ~62% | - | - | MoE OpenAI, Apache 2.0 |
-| **GPT-OSS 20B** | 128.000 | Ultra | - | - | - | Versao 20B, Apache 2.0 |
-| **LongCat 2.0** | 1.048.576 | Ultra | 59.5% | 70.8 | - | MIT, 1.6T params, 1M ctx |
 
 ---
 
