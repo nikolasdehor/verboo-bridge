@@ -15,9 +15,9 @@ while [ $# -gt 0 ]; do
     --model|-m) MODEL="$2"; shift 2 ;;
     --system|-s) SYS="$2"; shift 2 ;;
     --temp|-t) TEMP="$2"; shift 2 ;;
-    --list) echo "deepseek-v4-flash glm-5.2 mimo-v2.5 kimi-k2.7 glm-4.7-flash minimax-m3 qwen3.6-27b"; exit 0 ;;
+    --list) echo "deepseek-v4-flash glm-5.2 mimo-v2.5 kimi-k2.7 glm-4.7-flash minimax-m3 qwen3.6-27b stepfun-ai/step-3.7-flash gpt-oss-120b gpt-oss-20b LongCat-2.0"; exit 0 ;;
     --help|-h)
-      echo -e "${W}vb${N} — Verboo CLI direta\nUso: vb [opcoes] <prompt>\nModelos: deepseek-v4-flash, glm-5.2, mimo-v2.5, etc."; exit 0 ;;
+      echo -e "${W}vb${N} — Verboo CLI direta\nUso: vb [opcoes] <prompt>\nModelos: deepseek-v4-flash, glm-5.2, mimo-v2.5, etc. Use --list para todos."; exit 0 ;;
     *) PROMPT="$1"; shift ;;
   esac
 done

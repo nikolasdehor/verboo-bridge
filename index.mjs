@@ -14,13 +14,17 @@ import {
 // ── Models ──────────────────────────────────────────────────────────────
 
 const MODELS = {
-  'deepseek-v4-flash': { name: 'DeepSeek V4 Flash', ctx: 1_048_576, out: 65_536, tier: 'pro',  note: 'Melhor CxB para codificacao' },
-  'glm-4.7-flash':     { name: 'GLM 4.7 Flash',     ctx: 200_704,  out: 65_536, tier: 'pro',  note: 'Rapido para tarefas simples' },
-  'glm-5.2':           { name: 'GLM 5.2',            ctx: 524_288,  out: 65_536, tier: 'ultra', note: '#2 WebDev Arena, 62.1% SWE-bench Pro' },
-  'kimi-k2.7':         { name: 'Kimi K2.7',          ctx: 262_144,  out: 65_536, tier: 'pro',  note: 'Bom equilibrio' },
-  'mimo-v2.5':         { name: 'Mimo V2.5',          ctx: 1_048_576, out: 65_536, tier: 'pro',  note: '1M contexto, ideal para analise' },
-  'minimax-m3':        { name: 'Minimax M3',         ctx: 1_048_576, out: 65_536, tier: 'pro',  note: '1M contexto' },
-  'qwen3.6-27b':       { name: 'Qwen 3.6 27B',       ctx: 262_144,  out: 65_536, tier: 'pro',  note: 'Leve e rapido' },
+  'deepseek-v4-flash':       { name: 'DeepSeek V4 Flash',       ctx: 1_048_576, out: 65_536, tier: 'pro',   note: 'Melhor CxB para codificacao' },
+  'glm-4.7-flash':           { name: 'GLM 4.7 Flash',           ctx: 200_704,  out: 65_536, tier: 'pro',   note: 'Rapido para tarefas simples' },
+  'glm-5.2':                 { name: 'GLM 5.2',                 ctx: 524_288,  out: 65_536, tier: 'ultra', note: '#2 WebDev Arena, 62.1% SWE-bench Pro' },
+  'kimi-k2.7':               { name: 'Kimi K2.7',               ctx: 262_144,  out: 65_536, tier: 'ultra', note: 'Bom equilibrio custo-beneficio' },
+  'mimo-v2.5':               { name: 'Mimo V2.5',               ctx: 1_048_576, out: 65_536, tier: 'pro',   note: '1M contexto, ideal para analise' },
+  'minimax-m3':              { name: 'Minimax M3',              ctx: 1_048_576, out: 65_536, tier: 'ultra', note: '1M contexto, 87 tok/s' },
+  'qwen3.6-27b':             { name: 'Qwen 3.6 27B',            ctx: 262_144,  out: 65_536, tier: 'pro',   note: 'Leve e rapido, 27B params' },
+  'stepfun-ai/step-3.7-flash': { name: 'StepFun Step 3.7 Flash', ctx: 262_144, out: 65_536, tier: 'pro',   note: 'Modelo da StepFun, 262K ctx' },
+  'gpt-oss-120b':            { name: 'GPT-OSS 120B',            ctx: 128_000,  out: 65_536, tier: 'ultra', note: 'MoE OpenAI Apache 2.0, ~62% SWE-bench' },
+  'gpt-oss-20b':             { name: 'GPT-OSS 20B',             ctx: 128_000,  out: 65_536, tier: 'ultra', note: 'Versao 20B do modelo aberto OpenAI' },
+  'LongCat-2.0':             { name: 'LongCat 2.0',             ctx: 1_048_576, out: 65_536, tier: 'ultra', note: 'MIT, 59.5% SWE-bench Pro, 1.6T params' },
 };
 
 // ── Config ──────────────────────────────────────────────────────────────
