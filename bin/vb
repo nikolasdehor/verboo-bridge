@@ -1,34 +1,56 @@
 #!/usr/bin/env bash
-# vb - Verboo CLI direct (bypasses @verboo/code OAuth block)
-# Uso: vb <prompt> [--model <model>] [--system "<sys>"] [--temp <0-2>]
+# vb — Verboo CLI direta (sem depender do @verboo/code OAuth)
 set -euo pipefail
-API="${VERBOO_API_KEY:-}"
-if [ -z "$API" ] && [ -f ~/.config/claude-secrets.env ]; then
-  API=$(grep '^export VERBOO_API_KEY=' ~/.config/claude-secrets.env | sed 's/^export VERBOO_API_KEY="//;s/"$//')
-fi
-[ -z "$API" ] && { echo "Error: VERBOO_API_KEY not set" >&2; exit 1; }
 
-MODEL="deepseek-v4-flash"; TEMP="0.3"; SYS=""; P=""
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; M='\033[0;35m'; W='\033[1;37m'; N='\033[0m'
+
+API="${VERBOO_API_KEY:-}"
+[ -z "$API" ] && [ -f ~/.config/claude-secrets.env ] \
+  && API=$(grep '^export VERBOO_API_KEY=' ~/.config/claude-secrets.env | sed 's/^export VERBOO_API_KEY="//;s/"$//')
+[ -z "$API" ] && { echo -e "${R}ERRO${N}: VERBOO_API_KEY nao definida" >&2; exit 1; }
+
+MODEL="deepseek-v4-flash"; TEMP="0.3"; SYS=""; PROMPT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --model|-m) MODEL="$2"; shift 2 ;;
     --system|-s) SYS="$2"; shift 2 ;;
     --temp|-t) TEMP="$2"; shift 2 ;;
+    --list) echo "deepseek-v4-flash glm-5.2 mimo-v2.5 kimi-k2.7 glm-4.7-flash minimax-m3 qwen3.6-27b"; exit 0 ;;
     --help|-h)
-      echo "Uso: vb <prompt> [--model M] [--system S] [--temp N]"
-      echo "Models: deepseek-v4-flash, glm-5.2, mimo-v2.5, kimi-k2.7, glm-4.7-flash, minimax-m3, qwen3.6-27b"
-      exit 0 ;;
-    *) P="$1"; shift ;;
+      echo -e "${W}vb${N} — Verboo CLI direta\nUso: vb [opcoes] <prompt>\nModelos: deepseek-v4-flash, glm-5.2, mimo-v2.5, etc."; exit 0 ;;
+    *) PROMPT="$1"; shift ;;
   esac
 done
-[ -z "$P" ] && { echo "Error: prompt required" >&2; exit 1; }
 
-MSG="[{\"role\":\"user\",\"content\":$(echo "$P" | jq -Rs .)}]"
-[ -n "$SYS" ] && MSG="[{\"role\":\"system\",\"content\":$(echo "$SYS" | jq -Rs .)},{\"role\":\"user\",\"content\":$(echo "$P" | jq -Rs .)}]"
+[ -z "$PROMPT" ] && [ ! -t 0 ] && PROMPT=$(cat)
+[ -z "$PROMPT" ] && { echo "Usage: vb <prompt> [--model M] [--system S] [--temp N]"; exit 1; }
 
-echo "=> [$MODEL] $P" >&2
-curl -s "https://code.verboo.ai/router/v1/chat/completions" \
+MSG=$(jq -n --arg user "$PROMPT" '[{role:"user",content:$user}]')
+[ -n "$SYS" ] && MSG=$(jq -n --arg sys "$SYS" --arg user "$PROMPT" \
+  '[{role:"system",content:$sys},{role:"user",content:$user}]')
+
+DATA=$(jq -n --arg model "$MODEL" --argjson msg "$MSG" --argjson temp "$TEMP" \
+  '{model:$model,messages:$msg,temperature:$temp}')
+
+echo -e "${M}┌─${N} ${W}${MODEL}${N}" >&2
+
+RAW=$(curl -s "https://code.verboo.ai/router/v1/chat/completions" \
   -H "Authorization: Bearer $API" \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"$MODEL\",\"messages\":$MSG,\"temperature\":$TEMP}" |
-  jq -r '.choices[0].message.content // .error.message // "error"'
+  -d "$DATA")
+
+# Router retorna SSE (deepseek) ou JSON (kimi, glm etc) — trata ambos
+if [[ "$RAW" =~ ^data: ]]; then
+  echo "$RAW" | while IFS= read -r line; do
+    [[ "$line" =~ ^data:\  ]] || continue
+    chunk="${line#data: }"
+    [ "$chunk" = "[DONE]" ] && continue
+    content=$(echo "$chunk" | jq -r '.choices[0].delta.content // .choices[0].delta.reasoning_content // ""')
+    echo -n "$content"
+  done
+  echo
+else
+  echo "$RAW" | jq -r '.choices[0].message.content // .choices[0].message.reasoning_content // "ERRO: sem resposta"'
+fi
+
+echo -e "${M}└─${N} ${C}modelo:${N} ${MODEL}" >&2

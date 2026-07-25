@@ -1,62 +1,58 @@
-Use when the task at hand is large, repetitive, volume-heavy, or parallelizable:
-- Code review of 5+ files
-- Large refactors across many files
-- Batch operations (rename, migrate, format)
-- Running multiple independent subtasks in parallel
-- Any task where Claude's context or rate limit would be hit
+Use when the task is large, repetitive, or volume-heavy - delegate execution to Verboo models with unlimited tokens.
 
-## How to use
+## How it works
 
-The MCP server `verboo-bridge` exposes 9 tools:
+The `verboo-bridge` MCP server exposes 9 tools. Call them like any other MCP tool.
 
-### Model-specific tools
-
-| Tool | Model | Best for |
-|------|-------|----------|
-| `verboo_deepseek_v4_flash` | DeepSeek V4 Flash | General coding, 1M ctx, best CxB |
-| `verboo_glm_5_2` | GLM 5.2 (Ultra) | Complex reasoning, WebDev #2, 512K ctx |
-| `verboo_mimo_v2_5` | Mimo V2.5 | Analysis, 1M ctx |
-| `verboo_glm_4_7_flash` | GLM 4.7 Flash | Quick tasks |
-| `verboo_kimi_k2_7` | Kimi K2.7 | General, 256K ctx |
-| `verboo_minimax_m3` | Minimax M3 | Coding, 1M ctx |
-| `verboo_qwen3_6_27b` | Qwen 3.6 27B | Light tasks |
+## Available tools
 
 ### Convenience tools
 
-- `verboo_code(prompt, system?, model?)` - Execute coding/implementation
-- `verboo_review(code, context?, model?)` - Code review with context
+- `verboo_code(prompt, system?, model?, temperature?, max_tokens?)`
+  - Default model: `deepseek-v4-flash` (best CxB, 1M ctx)
+- `verboo_review(code, context?, model?, temperature?)`
+  - Default model: `deepseek-v4-flash`
 
-## When to delegate
+### Model-specific tools
 
-| Claude handles (complex reasoning) | Verboo handles (volume) |
-|-------------------------------------|------------------------|
-| Architecture decisions | Bulk code generation |
-| Security audits | Lint fixes, formatting |
-| API design | Test writing |
-| Debugging complex bugs | Refactoring known patterns |
-| Orchestration coordination | Parallel subtask execution |
-| Prompt engineering | Code review of many files |
-| User-facing decisions | Documentation generation |
+| Tool | Model | When to use |
+|------|-------|-------------|
+| `verboo_deepseek_v4_flash` | DeepSeek V4 Flash | General coding, 1M ctx |
+| `verboo_glm_5_2` | GLM 5.2 | Complex reasoning, 512K ctx |
+| `verboo_mimo_v2_5` | Mimo V2.5 | Heavy analysis, 1M ctx |
+| `verboo_kimi_k2_7` | Kimi K2.7 | Balanced tasks |
+| `verboo_minimax_m3` | Minimax M3 | Coding, 1M ctx |
+| `verboo_glm_4_7_flash` | GLM 4.7 Flash | Quick tasks |
+| `verboo_qwen3_6_27b` | Qwen 3.6 27B | Light tasks |
 
 ## Delegation pattern
 
 ```
-1. Claude receives task
-2. Claude splits into orchestration (keeps) + volume (delegates to Verboo)
-3. Claude calls `verboo_code` with clear prompt + system instructions
-4. Claude integrates Verboo's output into the final result
-5. Claude reviews/validates the result before presenting to user
+1. Receive task from user
+2. Split into orchestration (keep) + volume (delegate to Verboo)
+3. Call verboo_code with clear instructions
+4. Integrate result
+5. Review/validate before presenting
 ```
 
-## Model selection guide
+## When to delegate
 
-- **deepseek-v4-flash**: default for most coding tasks (82-89% SWE-bench, 1M ctx)
-- **glm-5.2**: when task needs stronger reasoning (62.1% SWE-bench Pro, 81.0 Terminal-Bench, #2 WebDev Arena)
-- **mimo-v2.5**: analysis-heavy tasks (1M ctx)
-- **qwen3.6-27b**: very simple/queries (cheapest)
+| Keep (Claude) | Delegate (Verboo) |
+|---------------|-------------------|
+| Architecture decisions | Bulk code generation |
+| Security audits | Lint fixes, formatting |
+| API design | Test writing |
+| Debugging complex bugs | Refactoring known patterns |
+| Prompt engineering | Code review of many files |
+| User interactions | Documentation generation |
 
-## Cost awareness
+## Available resources
 
-Verboo Pro = R$174/mes flat, unlimited tokens.
-Claude Max 20x = $200/mes with weekly caps.
-Prioritize Verboo for high-volume work to preserve Claude cap.
+- `verboo://models` — JSON list of all models with specs
+- `verboo://status` — Connection status
+
+## Available prompts
+
+- `revisar-codigo` — Code review prompt template
+- `refatorar` — Refactoring prompt template
+- `explicar` — Code explanation prompt template
