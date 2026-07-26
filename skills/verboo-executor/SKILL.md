@@ -12,12 +12,15 @@ orchestrator, reviewer, and final validator.
 
 Prefer `verboo_agent` when the task needs to inspect or modify a repository:
 
+- Use `verboo_route` first when you need an explainable ranking without executing
+  an agent.
 - `prompt`: one concrete task with owned files and validation commands.
 - `cwd`: project directory under `VERBOO_AGENT_ALLOWED_ROOTS`.
 - `executor`: choose `native` to use the Verboo Code/Claude Code-style harness
   with OAuth, or `opencode` to use the OpenCode fallback.
 - `mode`: `read_only` by default; use `write` only when the user authorized changes.
-- `model`: `deepseek-v4-flash` by default; use `glm-5.2` for harder reasoning.
+- `model`: `auto` by default. Pin a model only when the orchestrator has a
+  concrete reason to override the explainable router.
 - `timeout_seconds`: 10-1800, normally 600.
 
 Prefer `native` when `@verboo/code` is installed and authenticated. It keeps
@@ -33,19 +36,28 @@ The subprocess inherits only a small environment allowlist, excluding GitHub, AW
 and unrelated service tokens. Treat these controls as defense in depth, not a
 security sandbox.
 
+The auto router classifies coding, security, review, UX/web, analysis, long
+context, and quick tasks. It also considers in-flight work, recent use, failures,
+and cooldown so concurrent calls are distributed without blind round-robin.
+Recoverable model errors can fall back to a freshly ranked model only in
+`read_only`; `write` and explicit model choices never rotate silently.
+
 The tool returns a stable object with `status`, `summary`, `result`,
-`next_actions`, `artifacts`, `executor`, and the executor `session_id`.
+`next_actions`, `artifacts`, `executor`, the executor `session_id`, and
+`routing` metadata with the reason, ranking, and attempts.
 
 ## Delegation pattern
 
 1. Keep architecture, product decisions, secrets, production, and user communication
    with the orchestrator.
 2. Give Verboo a narrow task and explicit file ownership.
-3. Choose `native` or `opencode` explicitly when the harness matters.
-4. Use `read_only` for exploration or review.
-5. Use `write` only for an authorized, bounded patch.
-6. Inspect the diff and run the repository's own checks in the orchestrator.
-7. Never let the Verboo agent commit, push, deploy, or handle credentials.
+3. Keep `model: auto` unless a manual model choice is justified; inspect
+   `verboo_route` when the routing decision matters.
+4. Choose `native` or `opencode` explicitly when the harness matters.
+5. Use `read_only` for exploration or review.
+6. Use `write` only for an authorized, bounded patch.
+7. Inspect the diff and run the repository's own checks in the orchestrator.
+8. Never let the Verboo agent commit, push, deploy, or handle credentials.
 
 For health, auth, clinical, financial, tenant-isolation, or other high-risk code,
 use Verboo only as an additional opinion. The primary security/code reviewer owns

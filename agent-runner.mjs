@@ -2,9 +2,11 @@ import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
+import { MODEL_CATALOG, selectModelForTask } from './model-router.mjs';
+
 export const AGENT_MODES = ['read_only', 'write'];
 export const AGENT_EXECUTORS = ['opencode', 'native'];
-export const DEFAULT_AGENT_MODEL = 'deepseek-v4-flash';
+export const DEFAULT_AGENT_MODEL = 'auto';
 export const MIN_TIMEOUT_SECONDS = 10;
 export const MAX_TIMEOUT_SECONDS = 1800;
 
@@ -14,6 +16,24 @@ const MAX_AGENT_CONCURRENCY = 8;
 const KILL_GRACE_MS = 2_000;
 const AGENT_NAME = 'verboo-bridge-agent';
 let activeAgentRuns = 0;
+
+function createModelRuntimeState() {
+  return Object.fromEntries(Object.keys(MODEL_CATALOG).map((model) => [
+    model,
+    {
+      inFlight: 0,
+      lastSelectedAt: 0,
+      failures: 0,
+      cooldownUntil: 0,
+    },
+  ]));
+}
+
+let modelRuntimeState = createModelRuntimeState();
+
+export function resetModelRuntimeState() {
+  modelRuntimeState = createModelRuntimeState();
+}
 const CHILD_ENV_ALLOWLIST = [
   'CI',
   'HOME',
@@ -113,7 +133,7 @@ export function normalizeAgentRequest(args, availableModels) {
   }
 
   const model = args.model ?? DEFAULT_AGENT_MODEL;
-  if (!availableModels.includes(model)) {
+  if (model !== 'auto' && !availableModels.includes(model)) {
     throw agentError(
       'MODEL_INVALID',
       `Modelo desconhecido: ${model}. Disponíveis: ${availableModels.join(', ')}.`,
@@ -133,6 +153,144 @@ export function normalizeAgentRequest(args, availableModels) {
   }
 
   return { prompt, cwd: String(args.cwd ?? ''), mode, model, timeoutSeconds };
+}
+
+function configuredModelAttempts(env) {
+  const value = Number(env.VERBOO_AGENT_MAX_MODEL_ATTEMPTS ?? 2);
+  return Number.isInteger(value) && value >= 1 && value <= 3 ? value : 2;
+}
+
+function configuredCooldownMs(env) {
+  const value = Number(env.VERBOO_MODEL_COOLDOWN_SECONDS ?? 60);
+  return Number.isFinite(value) && value >= 0 && value <= 3600
+    ? value * 1000
+    : 60_000;
+}
+
+function envList(value) {
+  return String(value ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function validateConfiguredModels(variable, models) {
+  const unknown = models.filter((model) => !(model in MODEL_CATALOG));
+  if (unknown.length) {
+    throw agentError(
+      'MODEL_POLICY_INVALID',
+      `${variable} contém modelos desconhecidos: ${unknown.join(', ')}.`,
+    );
+  }
+}
+
+function availableModelsForAuto(availableModels, env) {
+  const allowlist = envList(env.VERBOO_MODEL_ALLOWLIST);
+  const deniedModels = envList(env.VERBOO_MODEL_DENYLIST);
+  validateConfiguredModels('VERBOO_MODEL_ALLOWLIST', allowlist);
+  validateConfiguredModels('VERBOO_MODEL_DENYLIST', deniedModels);
+  const denylist = new Set(deniedModels);
+  return availableModels.filter((model) => (
+    (!allowlist.length || allowlist.includes(model)) && !denylist.has(model)
+  ));
+}
+
+function allowedTiers(env) {
+  const configured = envList(env.VERBOO_MODEL_TIERS);
+  if (!configured.length) return ['pro', 'ultra'];
+  const knownTiers = new Set(
+    Object.values(MODEL_CATALOG).map((model) => model.tier),
+  );
+  const unknown = configured.filter((tier) => !knownTiers.has(tier));
+  if (unknown.length) {
+    throw agentError(
+      'MODEL_POLICY_INVALID',
+      `VERBOO_MODEL_TIERS contém tiers desconhecidos: ${unknown.join(', ')}.`,
+    );
+  }
+  return configured;
+}
+
+export function configuredModelPolicy(availableModels, env) {
+  return {
+    availableModels: availableModelsForAuto(availableModels, env),
+    allowTiers: allowedTiers(env),
+  };
+}
+
+function markModelStarted(model) {
+  const state = modelRuntimeState[model];
+  state.inFlight += 1;
+  state.lastSelectedAt = Date.now();
+}
+
+function markModelFinished(model, error, env) {
+  const state = modelRuntimeState[model];
+  state.inFlight = Math.max(0, state.inFlight - 1);
+  if (error) {
+    if (recoverableModelFailure(error)) {
+      state.failures += 1;
+      state.cooldownUntil = Date.now() + configuredCooldownMs(env);
+    }
+    return;
+  }
+  state.failures = 0;
+  state.cooldownUntil = 0;
+}
+
+function recoverableModelFailure(error) {
+  return ['EXIT_ERROR', 'TIMEOUT'].includes(error.code);
+}
+
+function modelRouteFor(request, availableModels, env) {
+  if (request.model !== 'auto') {
+    const allowlist = envList(env.VERBOO_MODEL_ALLOWLIST);
+    const denylist = new Set(envList(env.VERBOO_MODEL_DENYLIST));
+    const tiers = allowedTiers(env);
+    const tier = MODEL_CATALOG[request.model]?.tier;
+    if (allowlist.length && !allowlist.includes(request.model)) {
+      throw agentError(
+        'MODEL_NOT_ALLOWED',
+        `Modelo fora de VERBOO_MODEL_ALLOWLIST: ${request.model}.`,
+      );
+    }
+    if (denylist.has(request.model)) {
+      throw agentError(
+        'MODEL_NOT_ALLOWED',
+        `Modelo bloqueado por VERBOO_MODEL_DENYLIST: ${request.model}.`,
+      );
+    }
+    if (!tier || !tiers.includes(tier)) {
+      throw agentError(
+        'MODEL_NOT_ALLOWED',
+        `Tier do modelo bloqueado por VERBOO_MODEL_TIERS: ${request.model} (${tier ?? 'unknown'}).`,
+      );
+    }
+    return {
+      strategy: 'manual',
+      model: request.model,
+      profile: null,
+      reason: 'Modelo definido explicitamente pelo orquestrador.',
+      ranking: [{
+        model: request.model,
+        name: MODEL_CATALOG[request.model]?.name ?? request.model,
+        tier: MODEL_CATALOG[request.model]?.tier ?? 'unknown',
+        score: null,
+        reasons: ['seleção manual'],
+        penalties: [],
+      }],
+    };
+  }
+
+  const policy = configuredModelPolicy(availableModels, env);
+  const route = selectModelForTask({
+    prompt: request.prompt,
+    mode: request.mode,
+    availableModels: policy.availableModels,
+    allowTiers: policy.allowTiers,
+    runtimeState: modelRuntimeState,
+  });
+  return { strategy: 'auto', ...route };
 }
 
 function inlineConfig(mode) {
@@ -421,6 +579,13 @@ export function resolveAgentExecutor(requestedExecutor, env) {
 
 function recoveryFor(error) {
   const recovery = {
+    PROMPT_REQUIRED: ['Informe um prompt não vazio e tente novamente.'],
+    PROMPT_TOO_LARGE: ['Reduza o prompt para o limite informado e tente novamente.'],
+    MODE_INVALID: ['Escolha mode como read_only ou write.'],
+    MODEL_INVALID: ['Escolha auto ou um modelo exposto pelo contrato MCP.'],
+    TIMEOUT_INVALID: [
+      `Escolha timeout_seconds entre ${MIN_TIMEOUT_SECONDS} e ${MAX_TIMEOUT_SECONDS}.`,
+    ],
     ALLOWED_ROOTS_MISSING: [
       'Configure VERBOO_AGENT_ALLOWED_ROOTS com raízes explícitas e reinicie o cliente MCP.',
     ],
@@ -444,6 +609,12 @@ function recoveryFor(error) {
     EXECUTOR_INVALID: [
       `Escolha executor como ${AGENT_EXECUTORS.join(' ou ')} na chamada, ou configure VERBOO_AGENT_EXECUTOR.`,
     ],
+    MODEL_NOT_ALLOWED: [
+      'Escolha outro modelo ou revise VERBOO_MODEL_ALLOWLIST, VERBOO_MODEL_DENYLIST e VERBOO_MODEL_TIERS no servidor MCP.',
+    ],
+    MODEL_ROUTE_EMPTY: [
+      'Revise VERBOO_MODEL_ALLOWLIST, VERBOO_MODEL_DENYLIST e VERBOO_MODEL_TIERS.',
+    ],
     WRITE_DISABLED: [
       'Configure VERBOO_AGENT_WRITE_ENABLED=1 no servidor MCP somente se edição remota estiver autorizada.',
     ],
@@ -462,7 +633,7 @@ function recoveryFor(error) {
 }
 
 export function formatAgentFailure(error) {
-  return {
+  const failure = {
     status: 'error',
     summary: error.message,
     result: '',
@@ -470,6 +641,8 @@ export function formatAgentFailure(error) {
     artifacts: [],
     session_id: null,
   };
+  if (error.routing) failure.routing = error.routing;
+  return failure;
 }
 
 function execute(invocation, options) {
@@ -611,6 +784,209 @@ function execute(invocation, options) {
   });
 }
 
+function buildAgentInvocation(request, executor, env) {
+  if (executor === 'native') {
+    return buildVerbooCodeInvocation(
+      request,
+      env.VERBOO_CODE_BIN || 'verboo',
+      env.VERBOO_CODE_ENTRYPOINT || '',
+    );
+  }
+  return buildOpenCodeInvocation(
+    request,
+    env.VERBOO_OPENCODE_BIN || 'opencode',
+  );
+}
+
+async function executeAgentAttempt(
+  request,
+  executor,
+  options,
+  timeoutSeconds = request.timeoutSeconds,
+) {
+  const invocation = buildAgentInvocation(request, executor, options.env);
+  const raw = await execute(invocation, {
+    cwd: request.cwd,
+    timeoutSeconds,
+    env: options.env,
+    spawnImpl: options.spawnImpl,
+    killImpl: options.killImpl,
+    killGraceMs: options.killGraceMs,
+  });
+  const parsed = executor === 'native'
+    ? parseVerbooCodeEvents(raw, request.cwd)
+    : parseOpenCodeEvents(raw, request.cwd);
+  const hasWriteExecution = parsed.successfulTools.some((tool) => (
+    ['apply_patch', 'edit', 'write'].includes(tool.toLowerCase())
+  ));
+  return {
+    parsed,
+    status: request.mode === 'write' && !hasWriteExecution
+      ? 'warning'
+      : 'success',
+  };
+}
+
+function routingResult(route, initialRoute, model, attempts) {
+  const fallbackCount = attempts.length - 1;
+  return {
+    strategy: route.strategy,
+    selected_model: model,
+    reason: fallbackCount > 0
+      ? `Fallback após ${fallbackCount} falha(s): ${route.reason}`
+      : route.reason,
+    task_profile: route.profile,
+    ranking: initialRoute.ranking,
+    attempts,
+  };
+}
+
+function successfulAgentResult({
+  request,
+  executor,
+  route,
+  initialRoute,
+  model,
+  attempts,
+  parsed,
+  status,
+}) {
+  return {
+    status,
+    summary: status === 'warning'
+      ? 'O agente encerrou sem executar ferramenta de edição; nenhuma mudança foi confirmada.'
+      : `Agente Verboo concluiu a tarefa em modo ${request.mode}.`,
+    result: parsed.result || 'Execução concluída sem mensagem final.',
+    next_actions: status === 'warning'
+      ? [
+          'Não trate a tarefa como concluída.',
+          'Revise a instrução ou escolha manualmente outro modelo.',
+        ]
+      : request.mode === 'write'
+      ? [
+          'Revise o diff e os artefatos no orquestrador.',
+          'Rode as validações do projeto no orquestrador antes de commit ou deploy.',
+        ]
+      : ['Revise a análise e delegue escrita somente se a mudança estiver autorizada.'],
+    artifacts: parsed.artifacts,
+    tools_used: parsed.toolsUsed,
+    session_id: parsed.sessionId,
+    model,
+    mode: request.mode,
+    cwd: request.cwd,
+    executor,
+    routing: routingResult(route, initialRoute, model, attempts),
+  };
+}
+
+function maxAttemptsFor(request, route, env) {
+  if (route.strategy !== 'auto' || request.mode !== 'read_only') return 1;
+  return Math.min(configuredModelAttempts(env), route.ranking.length);
+}
+
+function canRetryAttempt(request, route, error, attempts, maxAttempts) {
+  return (
+    request.mode === 'read_only'
+    && route.strategy === 'auto'
+    && recoverableModelFailure(error)
+    && attempts.length < maxAttempts
+  );
+}
+
+function rerouteAfterFailure(request, options, attempts) {
+  const attemptedModels = new Set(attempts.map((attempt) => attempt.model));
+  const remainingModels = options.availableModels.filter(
+    (model) => !attemptedModels.has(model),
+  );
+  return modelRouteFor(
+    { ...request, model: 'auto' },
+    remainingModels,
+    options.env,
+  );
+}
+
+async function runRoutedAgent(request, executor, options) {
+  const initialRoute = modelRouteFor(
+    request,
+    options.availableModels,
+    options.env,
+  );
+  const maxAttempts = maxAttemptsFor(request, initialRoute, options.env);
+  const attempts = [];
+  const now = options.now ?? Date.now;
+  const deadline = now() + request.timeoutSeconds * 1000;
+  let route = initialRoute;
+
+  while (attempts.length < maxAttempts) {
+    const remainingSeconds = (deadline - now()) / 1000;
+    if (remainingSeconds <= 0) {
+      const error = agentError(
+        'TIMEOUT',
+        `Agente excedeu o orçamento total de ${request.timeoutSeconds}s.`,
+      );
+      error.routing = routingResult(
+        route,
+        initialRoute,
+        attempts.at(-1)?.model ?? route.ranking[0].model,
+        attempts,
+      );
+      throw error;
+    }
+    const model = route.ranking[0].model;
+    const attemptRequest = { ...request, model };
+    markModelStarted(model);
+    try {
+      const { parsed, status } = await executeAgentAttempt(
+        attemptRequest,
+        executor,
+        options,
+        remainingSeconds,
+      );
+      attempts.push({ model, status });
+      markModelFinished(model, null, options.env);
+      return successfulAgentResult({
+        request,
+        executor,
+        route,
+        initialRoute,
+        model,
+        attempts,
+        parsed,
+        status,
+      });
+    } catch (error) {
+      attempts.push({
+        model,
+        status: 'error',
+        code: error.code ?? 'UNKNOWN',
+        summary: error.message,
+      });
+      markModelFinished(model, error, options.env);
+      if (!canRetryAttempt(request, route, error, attempts, maxAttempts)) {
+        error.routing = routingResult(
+          route,
+          initialRoute,
+          model,
+          attempts,
+        );
+        throw error;
+      }
+      route = rerouteAfterFailure(request, options, attempts);
+    }
+  }
+
+  throw agentError('MODEL_ROUTE_EMPTY', 'Nenhum modelo pôde executar a tarefa.');
+}
+
+function validateExecutorCredentials(executor, env) {
+  if (executor === 'opencode' && !env.VERBOO_API_KEY) {
+    throw agentError(
+      'VERBOO_API_KEY_REQUIRED',
+      'executor opencode requer VERBOO_API_KEY no servidor MCP.',
+    );
+  }
+}
+
 export async function runVerbooAgent(args, options) {
   const request = normalizeAgentRequest(args, options.availableModels);
   if (request.mode === 'write' && options.env.VERBOO_AGENT_WRITE_ENABLED !== '1') {
@@ -627,63 +1003,8 @@ export async function runVerbooAgent(args, options) {
       options.env.VERBOO_AGENT_ALLOWED_ROOTS,
     );
     const executor = resolveAgentExecutor(args.executor, options.env);
-    if (executor === 'opencode' && !options.env.VERBOO_API_KEY) {
-      throw agentError(
-        'VERBOO_API_KEY_REQUIRED',
-        'executor opencode requer VERBOO_API_KEY no servidor MCP.',
-      );
-    }
-    const invocation = executor === 'native'
-      ? buildVerbooCodeInvocation(
-          request,
-          options.env.VERBOO_CODE_BIN || 'verboo',
-          options.env.VERBOO_CODE_ENTRYPOINT || '',
-        )
-      : buildOpenCodeInvocation(
-          request,
-          options.env.VERBOO_OPENCODE_BIN || 'opencode',
-        );
-    const raw = await execute(invocation, {
-      cwd: request.cwd,
-      timeoutSeconds: request.timeoutSeconds,
-      env: options.env,
-      spawnImpl: options.spawnImpl,
-      killImpl: options.killImpl,
-      killGraceMs: options.killGraceMs,
-    });
-    const parsed = executor === 'native'
-      ? parseVerbooCodeEvents(raw, request.cwd)
-      : parseOpenCodeEvents(raw, request.cwd);
-    const hasWriteExecution = parsed.successfulTools.some((tool) => (
-      ['apply_patch', 'edit', 'write'].includes(tool.toLowerCase())
-    ));
-    const status = request.mode === 'write' && !hasWriteExecution ? 'warning' : 'success';
-
-    return {
-      status,
-      summary: status === 'warning'
-        ? 'O agente encerrou sem executar ferramenta de edição; nenhuma mudança foi confirmada.'
-        : `Agente Verboo concluiu a tarefa em modo ${request.mode}.`,
-      result: parsed.result || 'Execução concluída sem mensagem final.',
-      next_actions: status === 'warning'
-        ? [
-            'Não trate a tarefa como concluída.',
-            'Tente novamente com DeepSeek V4 Flash ou GLM 5.2 e uma instrução mais explícita.',
-          ]
-        : request.mode === 'write'
-        ? [
-            'Revise o diff e os artefatos no orquestrador.',
-            'Rode as validações do projeto no orquestrador antes de commit ou deploy.',
-          ]
-        : ['Revise a análise e delegue escrita somente se a mudança estiver autorizada.'],
-      artifacts: parsed.artifacts,
-      tools_used: parsed.toolsUsed,
-      session_id: parsed.sessionId,
-      model: request.model,
-      mode: request.mode,
-      cwd: request.cwd,
-      executor,
-    };
+    validateExecutorCredentials(executor, options.env);
+    return await runRoutedAgent(request, executor, options);
   } finally {
     releaseAgentSlot();
   }

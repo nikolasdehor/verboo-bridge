@@ -14,6 +14,9 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
       ...process.env,
       VERBOO_API_KEY: 'test-key',
       VERBOO_AGENT_ALLOWED_ROOTS: repo,
+      VERBOO_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+      VERBOO_MODEL_DENYLIST: '',
+      VERBOO_MODEL_TIERS: 'pro',
     },
     stderr: 'pipe',
   });
@@ -25,13 +28,39 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   await client.connect(transport);
 
   const listed = await client.listTools();
+  const routeTool = listed.tools.find((tool) => tool.name === 'verboo_route');
   const agentTool = listed.tools.find((tool) => tool.name === 'verboo_agent');
+  assert.ok(routeTool);
   assert.ok(agentTool);
   assert.deepEqual(agentTool.inputSchema.properties.executor.enum, [
     'opencode',
     'native',
   ]);
   assert.equal(agentTool.inputSchema.properties.executor.default, 'native');
+  assert.equal(agentTool.inputSchema.properties.model.default, 'auto');
+  assert.ok(agentTool.inputSchema.properties.model.enum.includes('auto'));
+
+  const routed = await client.callTool({
+    name: 'verboo_route',
+    arguments: {
+      prompt: 'Faça uma auditoria de segurança complexa da arquitetura.',
+      mode: 'read_only',
+    },
+  });
+  assert.notEqual(routed.isError, true);
+  const routePayload = JSON.parse(routed.content[0].text);
+  assert.equal(routePayload.selected_model, 'deepseek-v4-flash');
+  assert.deepEqual(
+    routePayload.ranking.map((candidate) => candidate.model),
+    ['deepseek-v4-flash'],
+  );
+
+  const oversizedRoute = await client.callTool({
+    name: 'verboo_route',
+    arguments: { prompt: 'x'.repeat(100_001) },
+  });
+  assert.equal(oversizedRoute.isError, true);
+  assert.match(oversizedRoute.content[0].text, /limite de 100000 caracteres/);
 
   const result = await client.callTool({
     name: 'verboo_agent',
