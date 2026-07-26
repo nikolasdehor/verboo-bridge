@@ -6,6 +6,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   AGENT_EXECUTORS,
   configuredModelPolicy,
+  executorAvailableModels,
   formatAgentFailure,
   MAX_TIMEOUT_SECONDS,
   MIN_TIMEOUT_SECONDS,
@@ -190,6 +191,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             items: { type: 'string', enum: Object.keys(MODELS) },
             default: [],
           },
+          executor: {
+            type: 'string',
+            enum: AGENT_EXECUTORS,
+            default: DEFAULT_AGENT_EXECUTOR,
+            description: 'Aplica à prévia a mesma disponibilidade de modelos do executor que executará a tarefa',
+          },
         },
         required: ['prompt'],
       },
@@ -251,7 +258,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       if (prompt.length > 100_000) {
         throw new Error('prompt excede o limite de 100000 caracteres.');
       }
-      const policy = configuredModelPolicy(Object.keys(MODELS), process.env);
+      const executor = resolveAgentExecutor(args.executor, process.env);
+      const executorModels = executorAvailableModels(
+        executor,
+        Object.keys(MODELS),
+        process.env,
+      );
+      const policy = configuredModelPolicy(executorModels, process.env);
       const requestedTiers = args.tiers ?? policy.allowTiers;
       const route = selectModelForTask({
         prompt,
@@ -266,6 +279,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         content: [{
           type: 'text',
           text: JSON.stringify({
+            executor,
             selected_model: route.model,
             reason: route.reason,
             task_profile: route.profile,

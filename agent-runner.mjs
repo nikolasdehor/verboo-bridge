@@ -184,6 +184,12 @@ function validateConfiguredModels(variable, models) {
   }
 }
 
+function executorAllowlistVariable(executor) {
+  return executor === 'native'
+    ? 'VERBOO_NATIVE_MODEL_ALLOWLIST'
+    : 'VERBOO_OPENCODE_MODEL_ALLOWLIST';
+}
+
 function availableModelsForAuto(availableModels, env) {
   const allowlist = envList(env.VERBOO_MODEL_ALLOWLIST);
   const deniedModels = envList(env.VERBOO_MODEL_DENYLIST);
@@ -578,6 +584,9 @@ export function resolveAgentExecutor(requestedExecutor, env) {
 }
 
 function recoveryFor(error) {
+  const executorAllowlist = error.executor
+    ? ` e ${executorAllowlistVariable(error.executor)}`
+    : '';
   const recovery = {
     PROMPT_REQUIRED: ['Informe um prompt não vazio e tente novamente.'],
     PROMPT_TOO_LARGE: ['Reduza o prompt para o limite informado e tente novamente.'],
@@ -610,10 +619,13 @@ function recoveryFor(error) {
       `Escolha executor como ${AGENT_EXECUTORS.join(' ou ')} na chamada, ou configure VERBOO_AGENT_EXECUTOR.`,
     ],
     MODEL_NOT_ALLOWED: [
-      'Escolha outro modelo ou revise VERBOO_MODEL_ALLOWLIST, VERBOO_MODEL_DENYLIST e VERBOO_MODEL_TIERS no servidor MCP.',
+      `Escolha outro modelo ou revise VERBOO_MODEL_ALLOWLIST, VERBOO_MODEL_DENYLIST, VERBOO_MODEL_TIERS${executorAllowlist} no servidor MCP.`,
     ],
     MODEL_ROUTE_EMPTY: [
-      'Revise VERBOO_MODEL_ALLOWLIST, VERBOO_MODEL_DENYLIST e VERBOO_MODEL_TIERS.',
+      `Revise VERBOO_MODEL_ALLOWLIST, VERBOO_MODEL_DENYLIST, VERBOO_MODEL_TIERS${executorAllowlist}.`,
+    ],
+    MODEL_POLICY_INVALID: [
+      'Corrija os modelos ou tiers desconhecidos nas políticas VERBOO_MODEL_* e reinicie o servidor MCP.',
     ],
     WRITE_DISABLED: [
       'Configure VERBOO_AGENT_WRITE_ENABLED=1 no servidor MCP somente se edição remota estiver autorizada.',
@@ -987,14 +999,10 @@ function validateExecutorCredentials(executor, env) {
   }
 }
 
-function executorAvailableModels(executor, availableModels, env) {
-  const variable = executor === 'native'
-    ? 'VERBOO_NATIVE_MODEL_ALLOWLIST'
-    : 'VERBOO_OPENCODE_MODEL_ALLOWLIST';
-  const configured = String(env[variable] ?? '')
-    .split(',')
-    .map((model) => model.trim())
-    .filter(Boolean);
+export function executorAvailableModels(executor, availableModels, env) {
+  const variable = executorAllowlistVariable(executor);
+  const configured = envList(env[variable]);
+  validateConfiguredModels(variable, configured);
   if (configured.length === 0) return availableModels;
   const allowed = new Set(configured);
   return availableModels.filter((model) => allowed.has(model));
@@ -1023,16 +1031,20 @@ export async function runVerbooAgent(args, options) {
       options.env,
     );
     if (availableModels.length === 0) {
-      throw agentError(
+      const error = agentError(
         'MODEL_ROUTE_EMPTY',
         `Nenhum modelo disponível para o executor ${executor}.`,
       );
+      error.executor = executor;
+      throw error;
     }
     if (request.model !== 'auto' && !availableModels.includes(request.model)) {
-      throw agentError(
+      const error = agentError(
         'MODEL_NOT_ALLOWED',
         `Modelo ${request.model} indisponível para o executor ${executor}.`,
       );
+      error.executor = executor;
+      throw error;
     }
     return await runRoutedAgent(request, executor, {
       ...options,

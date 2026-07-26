@@ -716,6 +716,66 @@ test('allowlist por executor impede fallback silencioso do OAuth nativo', async 
   );
 });
 
+test('allowlist por executor rejeita modelo desconhecido com recuperação acionável', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-invalid-native-models-'));
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'Revise a arquitetura.',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flahs',
+        },
+      },
+    ),
+    (error) => {
+      assert.equal(error.code, 'MODEL_POLICY_INVALID');
+      assert.match(error.message, /VERBOO_NATIVE_MODEL_ALLOWLIST/);
+      assert.match(formatAgentFailure(error).next_actions[0], /VERBOO_MODEL_/);
+      return true;
+    },
+  );
+});
+
+test('erro manual por executor aponta a allowlist correta na recuperação', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-recovery-'));
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'Revise a arquitetura.',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'glm-5.2',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+        },
+      },
+    ),
+    (error) => {
+      assert.match(
+        formatAgentFailure(error).next_actions[0],
+        /VERBOO_NATIVE_MODEL_ALLOWLIST/,
+      );
+      return true;
+    },
+  );
+});
+
 test('rejeita política administrativa com modelo ou tier desconhecido', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-invalid-policy-'));
   const request = {
