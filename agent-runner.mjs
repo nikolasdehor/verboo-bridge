@@ -987,6 +987,19 @@ function validateExecutorCredentials(executor, env) {
   }
 }
 
+function executorAvailableModels(executor, availableModels, env) {
+  const variable = executor === 'native'
+    ? 'VERBOO_NATIVE_MODEL_ALLOWLIST'
+    : 'VERBOO_OPENCODE_MODEL_ALLOWLIST';
+  const configured = String(env[variable] ?? '')
+    .split(',')
+    .map((model) => model.trim())
+    .filter(Boolean);
+  if (configured.length === 0) return availableModels;
+  const allowed = new Set(configured);
+  return availableModels.filter((model) => allowed.has(model));
+}
+
 export async function runVerbooAgent(args, options) {
   const request = normalizeAgentRequest(args, options.availableModels);
   if (request.mode === 'write' && options.env.VERBOO_AGENT_WRITE_ENABLED !== '1') {
@@ -1004,7 +1017,27 @@ export async function runVerbooAgent(args, options) {
     );
     const executor = resolveAgentExecutor(args.executor, options.env);
     validateExecutorCredentials(executor, options.env);
-    return await runRoutedAgent(request, executor, options);
+    const availableModels = executorAvailableModels(
+      executor,
+      options.availableModels,
+      options.env,
+    );
+    if (availableModels.length === 0) {
+      throw agentError(
+        'MODEL_ROUTE_EMPTY',
+        `Nenhum modelo disponível para o executor ${executor}.`,
+      );
+    }
+    if (request.model !== 'auto' && !availableModels.includes(request.model)) {
+      throw agentError(
+        'MODEL_NOT_ALLOWED',
+        `Modelo ${request.model} indisponível para o executor ${executor}.`,
+      );
+    }
+    return await runRoutedAgent(request, executor, {
+      ...options,
+      availableModels,
+    });
   } finally {
     releaseAgentSlot();
   }

@@ -454,6 +454,8 @@ O server tambem expoe **resources** e **prompts**:
 | `VERBOO_MODEL_COOLDOWN_SECONDS` | `60` | Cooldown de um modelo apos falha recuperavel |
 | `VERBOO_CODE_BIN` | `verboo` | Executavel da CLI oficial; pode ser Node quando `VERBOO_CODE_ENTRYPOINT` estiver definido |
 | `VERBOO_CODE_ENTRYPOINT` | — | Caminho opcional para `@verboo/code/dist/cli.mjs` |
+| `VERBOO_NATIVE_MODEL_ALLOWLIST` | todos | Modelos comprovadamente saudáveis no OAuth do executor nativo; impede seleção silenciosa de modelos listados pela CLI mas indisponíveis na conta |
+| `VERBOO_OPENCODE_MODEL_ALLOWLIST` | todos | Modelos permitidos especificamente no executor OpenCode |
 | `VERBOO_OPENCODE_BIN` | `opencode` | Caminho do OpenCode 1.17.9+ |
 | `VERBOO_ENV_FILE` | — | Arquivo opcional lido por `bin/verboo-mcp` para obter `VERBOO_API_KEY` sem `source` |
 | `VERBOO_NODE_BIN` | `node` | Binario Node usado por `bin/verboo-mcp` |

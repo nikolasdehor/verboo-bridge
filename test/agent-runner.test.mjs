@@ -167,6 +167,10 @@ test('invocação nativa usa Verboo Code headless com ferramentas delimitadas', 
   assert.equal(invocation.args[0], '/opt/@verboo/code/dist/cli.mjs');
   assert.ok(invocation.args.includes('stream-json'));
   assert.ok(invocation.args.includes('dontAsk'));
+  assert.equal(
+    invocation.args[invocation.args.indexOf('--model') + 1],
+    'glm-5.2',
+  );
   assert.ok(invocation.args.includes('Read,Glob,Grep,Edit,Write'));
   assert.ok(!invocation.args.includes('--allowedTools'));
   assert.ok(!invocation.args.includes('Bash'));
@@ -681,6 +685,34 @@ test('modelo manual respeita allowlist e tiers administrativos', async () => {
       },
     }),
     (error) => error.code === 'MODEL_NOT_ALLOWED' && /TIERS/.test(error.message),
+  );
+});
+
+test('allowlist por executor impede fallback silencioso do OAuth nativo', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-models-'));
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'Revise a arquitetura.',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'glm-5.2',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+        },
+      },
+    ),
+    (error) => (
+      error.code === 'MODEL_NOT_ALLOWED'
+      && /executor native/.test(error.message)
+    ),
   );
 });
 
