@@ -246,10 +246,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     let model, messages;
 
     if (name === 'verboo_route') {
+      const prompt = String(args.prompt ?? '').trim();
+      if (!prompt) throw new Error('prompt é obrigatório.');
+      if (prompt.length > 100_000) {
+        throw new Error('prompt excede o limite de 100000 caracteres.');
+      }
       const policy = configuredModelPolicy(Object.keys(MODELS), process.env);
       const requestedTiers = args.tiers ?? policy.allowTiers;
       const route = selectModelForTask({
-        prompt: args.prompt,
+        prompt,
         mode: args.mode ?? 'read_only',
         availableModels: policy.availableModels,
         allowTiers: requestedTiers.filter(

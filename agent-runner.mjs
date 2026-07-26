@@ -16,8 +16,9 @@ const MAX_AGENT_CONCURRENCY = 8;
 const KILL_GRACE_MS = 2_000;
 const AGENT_NAME = 'verboo-bridge-agent';
 let activeAgentRuns = 0;
-const modelRuntimeState = Object.fromEntries(
-  Object.keys(MODEL_CATALOG).map((model) => [
+
+function createModelRuntimeState() {
+  return Object.fromEntries(Object.keys(MODEL_CATALOG).map((model) => [
     model,
     {
       inFlight: 0,
@@ -25,8 +26,14 @@ const modelRuntimeState = Object.fromEntries(
       failures: 0,
       cooldownUntil: 0,
     },
-  ]),
-);
+  ]));
+}
+
+let modelRuntimeState = createModelRuntimeState();
+
+export function resetModelRuntimeState() {
+  modelRuntimeState = createModelRuntimeState();
+}
 const CHILD_ENV_ALLOWLIST = [
   'CI',
   'HOME',
@@ -167,9 +174,22 @@ function envList(value) {
     .filter(Boolean);
 }
 
+function validateConfiguredModels(variable, models) {
+  const unknown = models.filter((model) => !(model in MODEL_CATALOG));
+  if (unknown.length) {
+    throw agentError(
+      'MODEL_POLICY_INVALID',
+      `${variable} contém modelos desconhecidos: ${unknown.join(', ')}.`,
+    );
+  }
+}
+
 function availableModelsForAuto(availableModels, env) {
   const allowlist = envList(env.VERBOO_MODEL_ALLOWLIST);
-  const denylist = new Set(envList(env.VERBOO_MODEL_DENYLIST));
+  const deniedModels = envList(env.VERBOO_MODEL_DENYLIST);
+  validateConfiguredModels('VERBOO_MODEL_ALLOWLIST', allowlist);
+  validateConfiguredModels('VERBOO_MODEL_DENYLIST', deniedModels);
+  const denylist = new Set(deniedModels);
   return availableModels.filter((model) => (
     (!allowlist.length || allowlist.includes(model)) && !denylist.has(model)
   ));
@@ -177,7 +197,18 @@ function availableModelsForAuto(availableModels, env) {
 
 function allowedTiers(env) {
   const configured = envList(env.VERBOO_MODEL_TIERS);
-  return configured.length ? configured : ['pro', 'ultra'];
+  if (!configured.length) return ['pro', 'ultra'];
+  const knownTiers = new Set(
+    Object.values(MODEL_CATALOG).map((model) => model.tier),
+  );
+  const unknown = configured.filter((tier) => !knownTiers.has(tier));
+  if (unknown.length) {
+    throw agentError(
+      'MODEL_POLICY_INVALID',
+      `VERBOO_MODEL_TIERS contém tiers desconhecidos: ${unknown.join(', ')}.`,
+    );
+  }
+  return configured;
 }
 
 export function configuredModelPolicy(availableModels, env) {
@@ -767,11 +798,16 @@ function buildAgentInvocation(request, executor, env) {
   );
 }
 
-async function executeAgentAttempt(request, executor, options) {
+async function executeAgentAttempt(
+  request,
+  executor,
+  options,
+  timeoutSeconds = request.timeoutSeconds,
+) {
   const invocation = buildAgentInvocation(request, executor, options.env);
   const raw = await execute(invocation, {
     cwd: request.cwd,
-    timeoutSeconds: request.timeoutSeconds,
+    timeoutSeconds,
     env: options.env,
     spawnImpl: options.spawnImpl,
     killImpl: options.killImpl,
@@ -877,9 +913,25 @@ async function runRoutedAgent(request, executor, options) {
   );
   const maxAttempts = maxAttemptsFor(request, initialRoute, options.env);
   const attempts = [];
+  const now = options.now ?? Date.now;
+  const deadline = now() + request.timeoutSeconds * 1000;
   let route = initialRoute;
 
   while (attempts.length < maxAttempts) {
+    const remainingSeconds = (deadline - now()) / 1000;
+    if (remainingSeconds <= 0) {
+      const error = agentError(
+        'TIMEOUT',
+        `Agente excedeu o orçamento total de ${request.timeoutSeconds}s.`,
+      );
+      error.routing = routingResult(
+        route,
+        initialRoute,
+        attempts.at(-1)?.model ?? route.ranking[0].model,
+        attempts,
+      );
+      throw error;
+    }
     const model = route.ranking[0].model;
     const attemptRequest = { ...request, model };
     markModelStarted(model);
@@ -888,6 +940,7 @@ async function runRoutedAgent(request, executor, options) {
         attemptRequest,
         executor,
         options,
+        remainingSeconds,
       );
       attempts.push({ model, status });
       markModelFinished(model, null, options.env);

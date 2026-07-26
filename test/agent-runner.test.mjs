@@ -16,6 +16,7 @@ import {
   parseVerbooCodeEvents,
   resolveAgentExecutor,
   resolveAllowedCwd,
+  resetModelRuntimeState,
   runVerbooAgent,
 } from '../agent-runner.mjs';
 
@@ -486,6 +487,7 @@ process.stdout.write(JSON.stringify({
 });
 
 test('model auto tenta fallback recuperável e relata todas as tentativas', async () => {
+  resetModelRuntimeState();
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-model-fallback-'));
   const invokedModels = [];
   const spawnImpl = (_command, args) => {
@@ -539,17 +541,67 @@ test('model auto tenta fallback recuperável e relata todas as tentativas', asyn
 
   assert.deepEqual(invokedModels, [
     'verboo/glm-5.2',
-    'verboo/mimo-v2.5',
+    'verboo/deepseek-v4-flash',
   ]);
   assert.equal(result.status, 'success');
-  assert.equal(result.model, 'mimo-v2.5');
+  assert.equal(result.model, 'deepseek-v4-flash');
   assert.equal(result.routing.strategy, 'auto');
   assert.equal(result.routing.attempts.length, 2);
   assert.equal(result.routing.attempts[0].status, 'error');
+  assert.equal(result.routing.attempts[0].code, 'EXIT_ERROR');
   assert.equal(result.routing.attempts[1].status, 'success');
   assert.match(result.routing.reason, /^Fallback após 1 falha/);
-  assert.match(result.routing.reason, /segurança 7\/10/);
+  assert.match(result.routing.reason, /segurança 8\/10/);
   assert.doesNotMatch(result.routing.reason, /segurança 10\/10/);
+});
+
+test('timeout_seconds é orçamento total da chamada com fallback', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-total-timeout-'));
+  let spawnCalls = 0;
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    spawnCalls += 1;
+    setImmediate(() => {
+      child.stderr.end('modelo indisponível\n');
+      child.stdout.end();
+      child.emit('close', 1);
+    });
+    return child;
+  };
+  const timestamps = [0, 0, 10_001];
+  const now = () => timestamps.shift() ?? 10_001;
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'Faça uma auditoria de segurança complexa da arquitetura.',
+        cwd: base,
+        executor: 'opencode',
+        mode: 'read_only',
+        model: 'auto',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: ['deepseek-v4-flash', 'glm-5.2'],
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_API_KEY: 'test-key',
+          VERBOO_AGENT_MAX_MODEL_ATTEMPTS: '2',
+        },
+        spawnImpl,
+        now,
+      },
+    ),
+    (error) => (
+      error.code === 'TIMEOUT'
+      && error.routing.attempts.length === 1
+    ),
+  );
+  assert.equal(spawnCalls, 1);
 });
 
 test('model auto nunca tenta fallback depois de execução write falhar', async () => {
@@ -629,6 +681,38 @@ test('modelo manual respeita allowlist e tiers administrativos', async () => {
       },
     }),
     (error) => error.code === 'MODEL_NOT_ALLOWED' && /TIERS/.test(error.message),
+  );
+});
+
+test('rejeita política administrativa com modelo ou tier desconhecido', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-invalid-policy-'));
+  const request = {
+    prompt: 'Revise a arquitetura.',
+    cwd: base,
+    executor: 'native',
+    mode: 'read_only',
+    timeout_seconds: 10,
+  };
+
+  await assert.rejects(
+    () => runVerbooAgent(request, {
+      availableModels: MODELS,
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_MODEL_ALLOWLIST: 'modelo-inexistente',
+      },
+    }),
+    (error) => error.code === 'MODEL_POLICY_INVALID' && /ALLOWLIST/.test(error.message),
+  );
+  await assert.rejects(
+    () => runVerbooAgent(request, {
+      availableModels: MODELS,
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_MODEL_TIERS: 'premium',
+      },
+    }),
+    (error) => error.code === 'MODEL_POLICY_INVALID' && /TIERS/.test(error.message),
   );
 });
 

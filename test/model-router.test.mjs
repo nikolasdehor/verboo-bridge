@@ -112,3 +112,30 @@ test('classificação é explicável e não depende de aleatoriedade', () => {
   assert.equal(selection.model, 'glm-5.2');
   assert.ok(selection.ranking[0].reasons.length > 0);
 });
+
+test('lança MODEL_ROUTE_EMPTY quando os filtros removem todos os modelos', () => {
+  assert.throws(
+    () => selectModelForTask({
+      prompt: 'Implemente algo.',
+      availableModels: ALL_MODELS,
+      excludeModels: ALL_MODELS,
+    }),
+    (error) => error.code === 'MODEL_ROUTE_EMPTY',
+  );
+});
+
+test('cooldown ativo desprioriza o modelo', () => {
+  const now = 1_000_000;
+  const ranking = rankModelsForTask({
+    prompt: 'Implemente uma refatoração grande com testes.',
+    mode: 'write',
+    availableModels: ALL_MODELS,
+    runtimeState: {
+      'deepseek-v4-flash': { cooldownUntil: now + 60_000 },
+    },
+    now,
+  });
+
+  assert.notEqual(ranking[0].model, 'deepseek-v4-flash');
+  assert.equal(ranking.at(-1).model, 'deepseek-v4-flash');
+});

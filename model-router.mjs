@@ -1,4 +1,4 @@
-const MODEL_ORDER = [
+const TIE_BREAK_ORDER = [
   'deepseek-v4-flash',
   'glm-5.2',
   'mimo-v2.5',
@@ -144,6 +144,13 @@ export const MODEL_CATALOG = Object.freeze({
   },
 });
 
+const MODEL_ORDER = [
+  ...TIE_BREAK_ORDER.filter((model) => model in MODEL_CATALOG),
+  ...Object.keys(MODEL_CATALOG).filter(
+    (model) => !TIE_BREAK_ORDER.includes(model),
+  ),
+];
+
 const DIMENSION_LABELS = {
   coding: 'codificação',
   reasoning: 'raciocínio',
@@ -271,13 +278,14 @@ function reasonsFor(profile, model) {
 export function rankModelsForTask({
   prompt,
   mode = 'read_only',
+  profile: providedProfile,
   availableModels = Object.keys(MODEL_CATALOG),
   allowTiers = ['pro', 'ultra'],
   excludeModels = [],
   runtimeState = {},
   now = Date.now(),
 }) {
-  const profile = classifyTask({ prompt, mode });
+  const profile = providedProfile ?? classifyTask({ prompt, mode });
   const available = new Set(availableModels);
   const tiers = new Set(allowTiers);
   const excluded = new Set(excludeModels);
@@ -314,7 +322,7 @@ export function rankModelsForTask({
 
 export function selectModelForTask(options) {
   const profile = classifyTask(options);
-  const ranking = rankModelsForTask(options);
+  const ranking = rankModelsForTask({ ...options, profile });
   if (ranking.length === 0) {
     const error = new Error('Nenhum modelo disponível após aplicar filtros e tiers.');
     error.code = 'MODEL_ROUTE_EMPTY';
