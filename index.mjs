@@ -11,6 +11,10 @@ import {
   resolveAgentExecutor,
   runVerbooAgent,
 } from './agent-runner.mjs';
+import {
+  MODEL_CATALOG,
+  selectModelForTask,
+} from './model-router.mjs';
 const require = createRequire(import.meta.url);
 const { version: VERSION } = require('./package.json');
 import {
@@ -24,15 +28,7 @@ import {
 
 // ── Models ──────────────────────────────────────────────────────────────
 
-const MODELS = {
-  'deepseek-v4-flash': { name: 'DeepSeek V4 Flash', ctx: 1_048_576, out: 65_536, tier: 'pro',   note: 'Melhor CxB para codificacao' },
-  'glm-4.7-flash':     { name: 'GLM 4.7 Flash',     ctx: 200_704,  out: 65_536, tier: 'pro',   note: 'Rapido para tarefas simples' },
-  'glm-5.2':           { name: 'GLM 5.2',            ctx: 524_288,  out: 65_536, tier: 'ultra', note: '#2 WebDev Arena, 62.1% SWE-bench Pro' },
-  'kimi-k2.7':         { name: 'Kimi K2.7',          ctx: 262_144,  out: 65_536, tier: 'ultra', note: 'Bom equilibrio' },
-  'mimo-v2.5':         { name: 'Mimo V2.5',          ctx: 1_048_576, out: 65_536, tier: 'pro',   note: '1M contexto, 63 tok/s' },
-  'minimax-m3':        { name: 'Minimax M3',         ctx: 1_048_576, out: 65_536, tier: 'ultra', note: '1M contexto, 87 tok/s' },
-  'qwen3.6-27b':       { name: 'Qwen 3.6 27B',       ctx: 262_144,  out: 65_536, tier: 'pro',   note: '27B params, leve e rapido' },
-};
+const MODELS = MODEL_CATALOG;
 
 // ── Config ──────────────────────────────────────────────────────────────
 
@@ -169,8 +165,37 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
     },
     {
+      name: 'verboo_route',
+      description: 'Classifica uma tarefa e explica o ranking dos modelos Verboo sem executar nenhum agente.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          prompt: {
+            type: 'string',
+            description: 'Tarefa que será classificada',
+          },
+          mode: {
+            type: 'string',
+            enum: ['read_only', 'write'],
+            default: 'read_only',
+          },
+          tiers: {
+            type: 'array',
+            items: { type: 'string', enum: ['pro', 'ultra'] },
+            default: ['pro', 'ultra'],
+          },
+          exclude_models: {
+            type: 'array',
+            items: { type: 'string', enum: Object.keys(MODELS) },
+            default: [],
+          },
+        },
+        required: ['prompt'],
+      },
+    },
+    {
       name: 'verboo_agent',
-      description: 'Executa um subagente Verboo repo-aware. Quem chama escolhe native para usar o harness Verboo Code/OAuth ou opencode como fallback. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1 e pode somente editar. O orquestrador executa testes e outros comandos.',
+      description: 'Executa um subagente Verboo repo-aware. model=auto classifica a tarefa, distribui concorrência e tenta fallback recuperável; um modelo explícito preserva seleção manual. Quem chama escolhe native para usar o harness Verboo Code/OAuth ou opencode como fallback. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1 e pode somente editar. O orquestrador executa testes e outros comandos.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -190,8 +215,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           model: {
             type: 'string',
-            enum: Object.keys(MODELS),
-            default: 'deepseek-v4-flash',
+            enum: ['auto', ...Object.keys(MODELS)],
+            default: 'auto',
           },
           timeout_seconds: {
             type: 'integer',
@@ -219,7 +244,26 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     let model, messages;
 
-    if (name === 'verboo_agent') {
+    if (name === 'verboo_route') {
+      const route = selectModelForTask({
+        prompt: args.prompt,
+        mode: args.mode ?? 'read_only',
+        availableModels: Object.keys(MODELS),
+        allowTiers: args.tiers ?? ['pro', 'ultra'],
+        excludeModels: args.exclude_models ?? [],
+      });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            selected_model: route.model,
+            reason: route.reason,
+            task_profile: route.profile,
+            ranking: route.ranking,
+          }, null, 2),
+        }],
+      };
+    } else if (name === 'verboo_agent') {
       const result = await runVerbooAgent(args, {
         availableModels: Object.keys(MODELS),
         env: process.env,

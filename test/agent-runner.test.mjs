@@ -28,7 +28,7 @@ test('normaliza request com defaults seguros', () => {
       prompt: 'revise',
       cwd: '/repo',
       mode: 'read_only',
-      model: 'deepseek-v4-flash',
+      model: 'auto',
       timeoutSeconds: 600,
     },
   );
@@ -483,6 +483,104 @@ process.stdout.write(JSON.stringify({
   assert.equal(result.session_id, 'native_run');
   assert.deepEqual(result.tools_used, ['Edit']);
   assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'status.txt')]);
+});
+
+test('model auto tenta fallback recuperável e relata todas as tentativas', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-model-fallback-'));
+  const invokedModels = [];
+  const spawnImpl = (_command, args) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    invokedModels.push(args[args.indexOf('--model') + 1]);
+    setImmediate(() => {
+      if (invokedModels.length === 1) {
+        child.stderr.end('modelo temporariamente indisponível\n');
+        child.stdout.end();
+        child.emit('close', 1);
+        return;
+      }
+      child.stdout.end(`${JSON.stringify({
+        type: 'text',
+        sessionID: 'ses_fallback',
+        part: { text: 'Auditoria concluída pelo fallback.' },
+      })}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const result = await runVerbooAgent(
+    {
+      prompt: 'Faça uma auditoria de segurança complexa da arquitetura.',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      model: 'auto',
+      timeout_seconds: 10,
+    },
+    {
+      availableModels: [
+        'deepseek-v4-flash',
+        'glm-5.2',
+        'mimo-v2.5',
+      ],
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_API_KEY: 'test-key',
+        VERBOO_AGENT_MAX_MODEL_ATTEMPTS: '2',
+        VERBOO_MODEL_COOLDOWN_SECONDS: '30',
+      },
+      spawnImpl,
+    },
+  );
+
+  assert.deepEqual(invokedModels, [
+    'verboo/glm-5.2',
+    'verboo/mimo-v2.5',
+  ]);
+  assert.equal(result.status, 'success');
+  assert.equal(result.model, 'mimo-v2.5');
+  assert.equal(result.routing.strategy, 'auto');
+  assert.equal(result.routing.attempts.length, 2);
+  assert.equal(result.routing.attempts[0].status, 'error');
+  assert.equal(result.routing.attempts[1].status, 'success');
+});
+
+test('modelo manual respeita allowlist e tiers administrativos', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-model-policy-'));
+  const request = {
+    prompt: 'Revise a arquitetura.',
+    cwd: base,
+    executor: 'native',
+    mode: 'read_only',
+    model: 'glm-5.2',
+    timeout_seconds: 10,
+  };
+
+  await assert.rejects(
+    () => runVerbooAgent(request, {
+      availableModels: MODELS,
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+      },
+    }),
+    (error) => error.code === 'MODEL_NOT_ALLOWED' && /ALLOWLIST/.test(error.message),
+  );
+
+  await assert.rejects(
+    () => runVerbooAgent(request, {
+      availableModels: MODELS,
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_MODEL_TIERS: 'pro',
+      },
+    }),
+    (error) => error.code === 'MODEL_NOT_ALLOWED' && /TIERS/.test(error.message),
+  );
 });
 
 test('executor nativo traduz ausência de OAuth em recuperação acionável', async () => {
