@@ -167,6 +167,10 @@ test('invocação nativa usa Verboo Code headless com ferramentas delimitadas', 
   assert.equal(invocation.args[0], '/opt/@verboo/code/dist/cli.mjs');
   assert.ok(invocation.args.includes('stream-json'));
   assert.ok(invocation.args.includes('dontAsk'));
+  assert.equal(
+    invocation.args[invocation.args.indexOf('--model') + 1],
+    'glm-5.2',
+  );
   assert.ok(invocation.args.includes('Read,Glob,Grep,Edit,Write'));
   assert.ok(!invocation.args.includes('--allowedTools'));
   assert.ok(!invocation.args.includes('Bash'));
@@ -681,6 +685,159 @@ test('modelo manual respeita allowlist e tiers administrativos', async () => {
       },
     }),
     (error) => error.code === 'MODEL_NOT_ALLOWED' && /TIERS/.test(error.message),
+  );
+});
+
+test('allowlist por executor impede fallback silencioso do OAuth nativo', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-models-'));
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'Revise a arquitetura.',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'glm-5.2',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+        },
+      },
+    ),
+    (error) => (
+      error.code === 'MODEL_NOT_ALLOWED'
+      && /executor native/.test(error.message)
+    ),
+  );
+});
+
+test('allowlist por executor rejeita modelo desconhecido com recuperação acionável', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-invalid-native-models-'));
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'Revise a arquitetura.',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flahs',
+        },
+      },
+    ),
+    (error) => {
+      assert.equal(error.code, 'MODEL_POLICY_INVALID');
+      assert.match(error.message, /VERBOO_NATIVE_MODEL_ALLOWLIST/);
+      assert.match(formatAgentFailure(error).next_actions[0], /VERBOO_MODEL_/);
+      return true;
+    },
+  );
+});
+
+test('erro manual por executor aponta a allowlist correta na recuperação', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-recovery-'));
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'Revise a arquitetura.',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'glm-5.2',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+        },
+      },
+    ),
+    (error) => {
+      assert.match(
+        formatAgentFailure(error).next_actions[0],
+        /VERBOO_NATIVE_MODEL_ALLOWLIST/,
+      );
+      return true;
+    },
+  );
+});
+
+test('allowlist do OpenCode rejeita modelo indisponível e orienta a política correta', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-opencode-models-'));
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'Revise a arquitetura.',
+        cwd: base,
+        executor: 'opencode',
+        mode: 'read_only',
+        model: 'glm-5.2',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_API_KEY: 'test-key',
+          VERBOO_OPENCODE_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+        },
+      },
+    ),
+    (error) => {
+      assert.equal(error.code, 'MODEL_NOT_ALLOWED');
+      assert.match(
+        formatAgentFailure(error).next_actions[0],
+        /VERBOO_OPENCODE_MODEL_ALLOWLIST/,
+      );
+      return true;
+    },
+  );
+});
+
+test('allowlist por executor sem interseção falha com rota vazia', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-empty-executor-route-'));
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'Revise a arquitetura.',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: ['deepseek-v4-flash'],
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_NATIVE_MODEL_ALLOWLIST: 'glm-5.2',
+        },
+      },
+    ),
+    (error) => {
+      assert.equal(error.code, 'MODEL_ROUTE_EMPTY');
+      assert.match(error.message, /executor native/);
+      assert.match(
+        formatAgentFailure(error).next_actions[0],
+        /VERBOO_NATIVE_MODEL_ALLOWLIST/,
+      );
+      return true;
+    },
   );
 });
 
