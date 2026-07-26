@@ -14,6 +14,8 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
       ...process.env,
       VERBOO_API_KEY: 'test-key',
       VERBOO_AGENT_ALLOWED_ROOTS: repo,
+      VERBOO_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+      VERBOO_MODEL_TIERS: 'pro',
     },
     stderr: 'pipe',
   });
@@ -46,8 +48,11 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   });
   assert.notEqual(routed.isError, true);
   const routePayload = JSON.parse(routed.content[0].text);
-  assert.equal(routePayload.selected_model, 'glm-5.2');
-  assert.ok(routePayload.ranking.length > 1);
+  assert.equal(routePayload.selected_model, 'deepseek-v4-flash');
+  assert.deepEqual(
+    routePayload.ranking.map((candidate) => candidate.model),
+    ['deepseek-v4-flash'],
+  );
 
   const result = await client.callTool({
     name: 'verboo_agent',

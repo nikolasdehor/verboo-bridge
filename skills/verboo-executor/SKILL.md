@@ -39,8 +39,8 @@ security sandbox.
 The auto router classifies coding, security, review, UX/web, analysis, long
 context, and quick tasks. It also considers in-flight work, recent use, failures,
 and cooldown so concurrent calls are distributed without blind round-robin.
-Recoverable model errors can fall back to the next ranked model; explicit model
-choices never rotate silently.
+Recoverable model errors can fall back to a freshly ranked model only in
+`read_only`; `write` and explicit model choices never rotate silently.
 
 The tool returns a stable object with `status`, `summary`, `result`,
 `next_actions`, `artifacts`, `executor`, the executor `session_id`, and

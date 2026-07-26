@@ -5,6 +5,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   AGENT_EXECUTORS,
+  configuredModelPolicy,
   formatAgentFailure,
   MAX_TIMEOUT_SECONDS,
   MIN_TIMEOUT_SECONDS,
@@ -245,11 +246,15 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     let model, messages;
 
     if (name === 'verboo_route') {
+      const policy = configuredModelPolicy(Object.keys(MODELS), process.env);
+      const requestedTiers = args.tiers ?? policy.allowTiers;
       const route = selectModelForTask({
         prompt: args.prompt,
         mode: args.mode ?? 'read_only',
-        availableModels: Object.keys(MODELS),
-        allowTiers: args.tiers ?? ['pro', 'ultra'],
+        availableModels: policy.availableModels,
+        allowTiers: requestedTiers.filter(
+          (tier) => policy.allowTiers.includes(tier),
+        ),
         excludeModels: args.exclude_models ?? [],
       });
       return {

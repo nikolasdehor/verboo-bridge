@@ -288,9 +288,10 @@ No `verboo_agent`, `model: "auto"` e o default. O roteador combina:
 
 Isso distribui chamadas concorrentes sem round-robin cego: o melhor modelo
 continua preferido, mas um segundo modelo adequado pode assumir quando o
-primeiro ja esta ocupado. Em erro recuperavel (`EXIT_ERROR` ou timeout), o modo
-automatico tenta o proximo candidato. Uma escolha manual, como
-`model: "glm-5.2"`, nunca e substituida silenciosamente.
+primeiro ja esta ocupado. Em `read_only`, um erro recuperavel (`EXIT_ERROR` ou
+timeout) recalcula o ranking e tenta outro candidato. `write` nunca faz fallback
+automatico, pois a tentativa que falhou pode ja ter editado arquivos. Uma escolha
+manual, como `model: "glm-5.2"`, nunca e substituida silenciosamente.
 
 Exemplo:
 
@@ -445,11 +446,11 @@ O server tambem expoe **resources** e **prompts**:
 | `VERBOO_AGENT_ALLOWED_ROOTS` | — | Raizes repo-aware separadas pelo delimitador de paths do SO; sem valor, `verboo_agent` falha fechado |
 | `VERBOO_AGENT_WRITE_ENABLED` | — | Defina `1` para habilitar `write`; por padrao somente `read_only` e aceito |
 | `VERBOO_AGENT_MAX_CONCURRENCY` | `1` | Execucoes simultaneas do agente; inteiro entre 1 e 8, valores invalidos usam 1 |
-| `VERBOO_AGENT_MAX_MODEL_ATTEMPTS` | `2` | Tentativas de modelos no modo `auto`; inteiro entre 1 e 3 |
+| `VERBOO_AGENT_MAX_MODEL_ATTEMPTS` | `2` | Tentativas de modelos no modo `auto` + `read_only`; inteiro entre 1 e 3 |
 | `VERBOO_AGENT_EXECUTOR` | `native` | Default administrativo; cada chamada pode substituir por `native` ou `opencode` |
-| `VERBOO_MODEL_ALLOWLIST` | todos | Modelos permitidos no modo `auto`, separados por virgula |
+| `VERBOO_MODEL_ALLOWLIST` | todos | Modelos permitidos no roteamento automatico, preview e selecao manual, separados por virgula |
 | `VERBOO_MODEL_DENYLIST` | — | Modelos bloqueados, separados por virgula |
-| `VERBOO_MODEL_TIERS` | `pro,ultra` | Tiers permitidos no roteamento automatico |
+| `VERBOO_MODEL_TIERS` | `pro,ultra` | Tiers permitidos no roteamento automatico, preview e selecao manual |
 | `VERBOO_MODEL_COOLDOWN_SECONDS` | `60` | Cooldown de um modelo apos falha recuperavel |
 | `VERBOO_CODE_BIN` | `verboo` | Executavel da CLI oficial; pode ser Node quando `VERBOO_CODE_ENTRYPOINT` estiver definido |
 | `VERBOO_CODE_ENTRYPOINT` | — | Caminho opcional para `@verboo/code/dist/cli.mjs` |
