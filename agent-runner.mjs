@@ -787,7 +787,7 @@ function execute(invocation, options) {
           return;
         }
         if (
-          /selected model is at capacity|model(?:o)? (?:is |está )?(?:at )?capacity|rate.?limit|try a different model/i
+          /selected model is at capacity|model(?:o)? (?:is |está )?(?:at )?capacity|rate.?limit/i
             .test(stderr)
         ) {
           finish(

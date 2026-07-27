@@ -665,6 +665,48 @@ test('falha de capacidade explica o fallback quando não há segundo modelo', as
   );
 });
 
+test('sugestão genérica de outro modelo não é confundida com capacidade', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-invalid-model-message-'));
+  let spawnCalls = 0;
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    spawnCalls += 1;
+    setImmediate(() => {
+      child.stderr.end('Selected model is incompatible. Please try a different model.\n');
+      child.stdout.end();
+      child.emit('close', 1);
+    });
+    return child;
+  };
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'Revise a arquitetura.',
+        cwd: base,
+        executor: 'opencode',
+        mode: 'read_only',
+        model: 'glm-5.2',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: ['glm-5.2', 'deepseek-v4-flash'],
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_API_KEY: 'test-key',
+        },
+        spawnImpl,
+      },
+    ),
+    (error) => error.code === 'EXIT_ERROR',
+  );
+  assert.equal(spawnCalls, 1);
+});
+
 test('timeout_seconds é orçamento total da chamada com fallback', async () => {
   resetModelRuntimeState();
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-total-timeout-'));
