@@ -68,6 +68,25 @@ the decision.
 Use `verboo_code`, `verboo_review`, or a model-specific tool only when all required
 context is already in the prompt. They do not read files or run tests.
 
+## CLI fallback
+
+If the MCP process was started before `VERBOO_AGENT_WRITE_ENABLED=1`, keep the
+current orchestration moving with `verboo --dangerously-skip-permissions --no-chrome
+--print` and restart the MCP client later. Pass the prompt as the final CLI
+argument; do not open an interactive session for background delegation.
+
+The OAuth CLI may display models as `pro-old/<model>` in `--list-models` while
+accepting only the unprefixed value in `--model` and `--fallback-model`. Normalize
+that display prefix before execution (for example, use `qwen3.6-27b`, not
+`pro-old/qwen3.6-27b`) and verify an unfamiliar model with a minimal print call.
+
+Give every CLI fallback a wall-clock budget in the parent orchestrator. A print
+call can remain silent while a model is saturated; terminate it when the budget
+expires and, for read-only work, retry once with a different allowed model. Never
+report a silent or terminated process as a completed review. Prefer the MCP tool
+for longer tasks because it already enforces timeout, capacity fallback, cooldown,
+and a stable result contract.
+
 ## Privacy
 
 Do not send `.env`, credentials, private transcripts, production databases, logs,
