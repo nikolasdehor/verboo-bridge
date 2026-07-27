@@ -70,10 +70,16 @@ context is already in the prompt. They do not read files or run tests.
 
 ## CLI fallback
 
-If the MCP process was started before `VERBOO_AGENT_WRITE_ENABLED=1`, keep the
-current orchestration moving with `verboo --dangerously-skip-permissions --no-chrome
---print` and restart the MCP client later. Pass the prompt as the final CLI
-argument; do not open an interactive session for background delegation.
+If the active MCP process is stale, do not bypass its write gate with
+`--dangerously-skip-permissions`. Restart the MCP client before any write task.
+For a read-only fallback, reproduce the constrained native invocation generated
+by `buildVerbooCodeInvocation`: use the executable from `VERBOO_CODE_BIN` plus
+the optional `VERBOO_CODE_ENTRYPOINT`, the validated project directory as
+`cwd`, the `Read,Glob,Grep` tool list, strict MCP configuration, disabled hooks
+and slash commands, the same deny rules for secrets/write/shell/web/task tools,
+and the child-environment allowlist from `buildChildEnv`. Insert `--` before the
+prompt so option-like text remains positional. If those constraints cannot be
+reproduced, restart the MCP client instead of using the fallback.
 
 The OAuth CLI may display models as `pro-old/<model>` in `--list-models` while
 accepting only the unprefixed value in `--model` and `--fallback-model`. Normalize
