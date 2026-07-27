@@ -502,7 +502,7 @@ test('model auto tenta fallback recuperável e relata todas as tentativas', asyn
     invokedModels.push(args[args.indexOf('--model') + 1]);
     setImmediate(() => {
       if (invokedModels.length === 1) {
-        child.stderr.end('modelo temporariamente indisponível\n');
+        child.stderr.end('Selected model is at capacity. Please try a different model.\n');
         child.stdout.end();
         child.emit('close', 1);
         return;
@@ -552,11 +552,117 @@ test('model auto tenta fallback recuperável e relata todas as tentativas', asyn
   assert.equal(result.routing.strategy, 'auto');
   assert.equal(result.routing.attempts.length, 2);
   assert.equal(result.routing.attempts[0].status, 'error');
-  assert.equal(result.routing.attempts[0].code, 'EXIT_ERROR');
+  assert.equal(result.routing.attempts[0].code, 'MODEL_AT_CAPACITY');
   assert.equal(result.routing.attempts[1].status, 'success');
   assert.match(result.routing.reason, /^Fallback após 1 falha/);
   assert.match(result.routing.reason, /segurança 8\/10/);
   assert.doesNotMatch(result.routing.reason, /segurança 10\/10/);
+});
+
+test('modelo manual lotado faz fallback em leitura sem repetir o modelo', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-manual-capacity-'));
+  const invokedModels = [];
+  const spawnImpl = (_command, args) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    invokedModels.push(args[args.indexOf('--model') + 1]);
+    setImmediate(() => {
+      if (invokedModels.length === 1) {
+        child.stderr.end('Selected model is at capacity. Please try a different model.\n');
+        child.stdout.end();
+        child.emit('close', 1);
+        return;
+      }
+      child.stdout.end(`${JSON.stringify({
+        type: 'text',
+        sessionID: 'ses_manual_fallback',
+        part: { text: 'Fallback concluído.' },
+      })}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const result = await runVerbooAgent(
+    {
+      prompt: 'Revise a arquitetura.',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      model: 'glm-5.2',
+      timeout_seconds: 10,
+    },
+    {
+      availableModels: [
+        'deepseek-v4-flash',
+        'glm-5.2',
+        'mimo-v2.5',
+      ],
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_API_KEY: 'test-key',
+        VERBOO_AGENT_MAX_MODEL_ATTEMPTS: '2',
+      },
+      spawnImpl,
+    },
+  );
+
+  assert.equal(invokedModels[0], 'verboo/glm-5.2');
+  assert.notEqual(invokedModels[1], 'verboo/glm-5.2');
+  assert.equal(result.status, 'success');
+  assert.equal(result.routing.attempts[0].code, 'MODEL_AT_CAPACITY');
+  assert.equal(result.routing.attempts[1].status, 'success');
+});
+
+test('falha de capacidade explica o fallback quando não há segundo modelo', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-capacity-message-'));
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stderr.end('Selected model is at capacity. Please try a different model.\n');
+      child.stdout.end();
+      child.emit('close', 1);
+    });
+    return child;
+  };
+
+  let captured;
+  try {
+    await runVerbooAgent(
+      {
+        prompt: 'Revise a arquitetura.',
+        cwd: base,
+        executor: 'opencode',
+        mode: 'read_only',
+        model: 'glm-5.2',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: ['glm-5.2'],
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_API_KEY: 'test-key',
+        },
+        spawnImpl,
+      },
+    );
+  } catch (error) {
+    captured = error;
+  }
+
+  assert.equal(captured?.code, 'MODEL_AT_CAPACITY');
+  assert.match(
+    formatAgentFailure(captured).next_actions.join(' '),
+    /outro modelo elegível automaticamente/,
+  );
 });
 
 test('timeout_seconds é orçamento total da chamada com fallback', async () => {
