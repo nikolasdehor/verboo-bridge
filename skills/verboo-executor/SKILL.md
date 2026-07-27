@@ -72,7 +72,7 @@ context is already in the prompt. They do not read files or run tests.
 
 If the active MCP process is stale, do not bypass its write gate with
 `--dangerously-skip-permissions`. Restart the MCP client before any write task.
-For a read-only fallback, reproduce the constrained native invocation generated
+The CLI fallback is read-only. Reproduce the constrained native invocation generated
 by `buildVerbooCodeInvocation`: use the executable from `VERBOO_CODE_BIN` plus
 the optional `VERBOO_CODE_ENTRYPOINT`, the validated project directory as
 `cwd`, the `Read,Glob,Grep` tool list, strict MCP configuration, disabled hooks
@@ -86,12 +86,16 @@ accepting only the unprefixed value in `--model` and `--fallback-model`. Normali
 that display prefix before execution (for example, use `qwen3.6-27b`, not
 `pro-old/qwen3.6-27b`) and verify an unfamiliar model with a minimal print call.
 
-Give every CLI fallback a wall-clock budget in the parent orchestrator. A print
-call can remain silent while a model is saturated; terminate it when the budget
-expires and, for read-only work, retry once with a different allowed model. Never
-report a silent or terminated process as a completed review. Prefer the MCP tool
-for longer tasks because it already enforces timeout, capacity fallback, cooldown,
-and a stable result contract.
+Give the operation one total wall-clock deadline in the parent orchestrator and
+subtract time consumed by every attempt and its cleanup. Start at most one retry
+with a different allowed model only when enough budget remains for that attempt;
+otherwise return a failure or warning immediately. A print call can remain silent
+while a model is saturated, so launch it in a tracked process group and, on
+timeout, send `SIGTERM` to the whole group, wait a short grace period, then send
+`SIGKILL` to surviving descendants. Capture and drain `stderr` before treating
+cleanup as complete. Never report a silent or terminated process as a completed
+review. Prefer the MCP tool for longer tasks because it already enforces timeout,
+capacity fallback, cooldown, and a stable result contract.
 
 ## Privacy
 
