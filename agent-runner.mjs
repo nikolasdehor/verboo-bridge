@@ -245,7 +245,7 @@ function markModelFinished(model, error, env) {
 }
 
 function recoverableModelFailure(error) {
-  return ['EXIT_ERROR', 'TIMEOUT'].includes(error.code);
+  return ['EXIT_ERROR', 'TIMEOUT', 'MODEL_AT_CAPACITY'].includes(error.code);
 }
 
 function modelRouteFor(request, availableModels, env) {
@@ -636,6 +636,10 @@ function recoveryFor(error) {
     TIMEOUT: [
       'Reduza o escopo da tarefa ou aumente timeout_seconds até o máximo permitido.',
     ],
+    MODEL_AT_CAPACITY: [
+      'O modelo ficou temporariamente lotado; em leitura o bridge tenta outro modelo elegível automaticamente.',
+      'Se todos os modelos falharem, aguarde a capacidade normalizar e tente novamente.',
+    ],
     OUTPUT_LIMIT: ['Reduza o escopo; a execução excedeu o limite de saída do bridge.'],
     EXIT_ERROR: [
       'Confirme a autenticação e a configuração do executor antes de tentar novamente.',
@@ -782,6 +786,19 @@ function execute(invocation, options) {
           );
           return;
         }
+        if (
+          /selected model is at capacity|model(?:o)? (?:is |está )?(?:at )?capacity|rate.?limit/i
+            .test(stderr)
+        ) {
+          finish(
+            reject,
+            agentError(
+              'MODEL_AT_CAPACITY',
+              `${invocation.label} encontrou o modelo temporariamente sem capacidade${suffix}.`,
+            ),
+          );
+          return;
+        }
         finish(
           reject,
           agentError(
@@ -891,16 +908,22 @@ function successfulAgentResult({
   };
 }
 
-function maxAttemptsFor(request, route, env) {
-  if (route.strategy !== 'auto' || request.mode !== 'read_only') return 1;
-  return Math.min(configuredModelAttempts(env), route.ranking.length);
+function maxAttemptsFor(request, route, env, availableModelCount) {
+  if (request.mode !== 'read_only') return 1;
+  if (route.strategy === 'auto') {
+    return Math.min(configuredModelAttempts(env), route.ranking.length);
+  }
+  return Math.min(configuredModelAttempts(env), availableModelCount);
 }
 
 function canRetryAttempt(request, route, error, attempts, maxAttempts) {
   return (
     request.mode === 'read_only'
-    && route.strategy === 'auto'
     && recoverableModelFailure(error)
+    && (
+      route.strategy === 'auto'
+      || error.code === 'MODEL_AT_CAPACITY'
+    )
     && attempts.length < maxAttempts
   );
 }
@@ -923,7 +946,12 @@ async function runRoutedAgent(request, executor, options) {
     options.availableModels,
     options.env,
   );
-  const maxAttempts = maxAttemptsFor(request, initialRoute, options.env);
+  const maxAttempts = maxAttemptsFor(
+    request,
+    initialRoute,
+    options.env,
+    options.availableModels.length,
+  );
   const attempts = [];
   const now = options.now ?? Date.now;
   const deadline = now() + request.timeoutSeconds * 1000;
