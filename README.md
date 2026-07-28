@@ -6,9 +6,12 @@
 </p>
 
 <div align="center">
+  <a href="https://github.com/verbeux-ai">
+    <img src="https://avatars.githubusercontent.com/u/122481543?v=4" alt="Logo da Verboo" width="140">
+  </a>
   <h1>verboo-bridge</h1>
   <p><strong>Use modelos da Verboo como sub-agentes no Claude Code, Codex, OpenCode, Cursor ou qualquer cliente MCP</strong></p>
-  <p>Transforme tokens ilimitados da Verboo em execucao distribuida para seu orquestrador preferido</p>
+  <p>Transforme tokens ilimitados da Verboo em execução distribuída para seu orquestrador preferido</p>
 </div>
 
 ---
@@ -25,8 +28,8 @@ graph TB
     end
 
     subgraph "verboo-bridge"
-        MCP[MCP Server<br/>stdio]
-        CLI[CLI wrapper<br/>bin/vb]
+        MCP[Servidor MCP<br/>stdio]
+        CLI[Wrapper CLI<br/>bin/vb]
         AGENT[verboo_agent<br/>executor por chamada]
         NATIVE[Verboo Code nativo<br/>OAuth]
         HARNESS[OpenCode<br/>fallback]
@@ -50,31 +53,31 @@ graph TB
     NATIVE -->|OAuth| DS
     HARNESS -->|provider verboo| DS
     OPENCODE -->|provider verboo| DS
-    MCP -->|API key| DS
-    MCP -->|API key| GLM
-    MCP -->|API key| MIMO
-    MCP -->|API key| OUTROS
-    CLI -->|API key| DS
-    CLI -->|API key| OUTROS
+    MCP -->|Chave de API| DS
+    MCP -->|Chave de API| GLM
+    MCP -->|Chave de API| MIMO
+    MCP -->|Chave de API| OUTROS
+    CLI -->|Chave de API| DS
+    CLI -->|Chave de API| OUTROS
 ```
 
 ---
 
-## Modelos disponiveis
+## Modelos disponíveis
 
 | Modelo | Contexto | Tier | SWE-bench Pro | Terminal-Bench | WebDev Arena | Ideal para |
 |--------|----------|------|:-:|:-:|:-:|-----------|
-| **DeepSeek V4 Flash** | 1.048.576 | Pro | 82-89% | 56.9 | - | Codificacao geral, **melhor CxB** |
-| **Mimo V2.5** | 1.048.576 | Pro | - | - | - | Analise pesada, 63 tok/s |
-| **GLM 4.7 Flash** | 200.704 | Pro | - | - | - | Tarefas rapidas |
+| **DeepSeek V4 Flash** | 1.048.576 | Pro | 82-89% | 56.9 | - | Codificação geral, **melhor CxB** |
+| **Mimo V2.5** | 1.048.576 | Pro | - | - | - | Análise pesada, 63 tok/s |
+| **GLM 4.7 Flash** | 200.704 | Pro | - | - | - | Tarefas rápidas |
 | **Qwen 3.6 27B** | 262.144 | Pro | - | - | - | Tarefas leves, 27B params |
-| **GLM 5.2** | 524.288 | Ultra | 62.1% | 81.0 | #2 (1.593 Elo) | Raciocinio complexo |
-| **Kimi K2.7** | 262.144 | Ultra | ~60% | - | - | Tarefas gerais, visao |
-| **Minimax M3** | 1.048.576 | Ultra | - | - | - | Codificacao, 87 tok/s, visao |
+| **GLM 5.2** | 524.288 | Ultra | 62.1% | 81.0 | #2 (1.593 Elo) | Raciocínio complexo |
+| **Kimi K2.7** | 262.144 | Ultra | ~60% | - | - | Tarefas gerais, visão |
+| **Minimax M3** | 1.048.576 | Ultra | - | - | - | Codificação, 87 tok/s, visão |
 
 ---
 
-## Instalacao rapida
+## Instalação rápida
 
 ```bash
 git clone https://github.com/nikolasdehor/verboo-bridge.git
@@ -85,19 +88,19 @@ npm install
 Requisitos: Node.js 18+ e, para `verboo_agent`, `@verboo/code` com OAuth
 ou OpenCode 1.17.9+ como fallback.
 
-### Variavel de ambiente
+### Variável de ambiente
 
 ```bash
 export VERBOO_AGENT_ALLOWED_ROOTS="/caminho/para/seus/projetos"
-# Default opcional; cada chamada pode escolher native ou opencode
+# Padrão opcional; cada chamada pode escolher native ou opencode
 export VERBOO_AGENT_EXECUTOR="native"
 export VERBOO_CODE_BIN="/caminho/para/verboo"
-# Opcional e sensivel: habilita edicao (sem shell)
+# Opcional e sensível: habilita edição (sem shell)
 export VERBOO_AGENT_WRITE_ENABLED="1"
-# Memoria tecnica persistente e isolada por projeto
+# Memória técnica persistente e isolada por projeto
 export VERBOO_MEMORY_ENABLED="1"
 export VERBOO_MEMORY_DIR="$HOME/.local/share/verboo-bridge/memory"
-# Indices curados opcionais, somente leitura
+# Índices curados opcionais, somente leitura
 export VERBOO_SHARED_MEMORY_FILES="$HOME/.codex/memories/MEMORY.md:$HOME/ObsidianVaults/ClaudeBrain/MEMORY.md"
 ```
 
@@ -107,8 +110,8 @@ pelo subprocesso via diretório do usuário; a API key não é repassada ao
 executor nativo.
 
 `verboo_agent` aceita `executor: "native"` ou `executor: "opencode"` em cada
-chamada. A escolha da chamada tem precedencia sobre `VERBOO_AGENT_EXECUTOR`.
-Sem nenhuma configuracao, o default e `native`.
+chamada. A escolha da chamada tem precedência sobre `VERBOO_AGENT_EXECUTOR`.
+Sem nenhuma configuração, o padrão é `native`.
 
 Se o comando `verboo` não apontar para a CLI oficial, use Node e o entrypoint:
 
@@ -117,13 +120,13 @@ export VERBOO_CODE_BIN="/caminho/para/node"
 export VERBOO_CODE_ENTRYPOINT="/caminho/para/@verboo/code/dist/cli.mjs"
 ```
 
-`VERBOO_API_KEY` continua opcionalmente disponível para as tools de prompt
-simples (`verboo_code`, `verboo_review` e tools por modelo). Não grave a chave
+`VERBOO_API_KEY` continua opcionalmente disponível para as ferramentas de prompt
+simples (`verboo_code`, `verboo_review` e ferramentas por modelo). Não grave a chave
 no repositório.
 
 ---
 
-## Configuracao por plataforma
+## Configuração por plataforma
 
 ### Claude Code
 
@@ -152,7 +155,7 @@ harness nativo ou o fallback OpenCode sem reiniciar o MCP.
 
 ### OpenCode
 
-**Opcao 1 — MCP server**:
+**Opção 1 — Servidor MCP**:
 
 ```json
 {
@@ -172,11 +175,11 @@ harness nativo ou o fallback OpenCode sem reiniciar o MCP.
 }
 ```
 
-Para habilitar edicao conscientemente, adicione
+Para habilitar edição conscientemente, adicione
 `"VERBOO_AGENT_WRITE_ENABLED": "1"` ao bloco `environment`. Sem isso,
 `verboo_agent` aceita somente `read_only`.
 
-**Opcao 2 — Provider direto** (necessario para `verboo_agent` quando
+**Opção 2 — Provedor direto** (necessário para `verboo_agent` quando
 `executor: "opencode"`):
 
 ```json
@@ -223,11 +226,11 @@ recebe apenas as ferramentas compatíveis com o modo solicitado: leitura no
 `read_only`; leitura e edição no `write`; Bash, web, hooks e MCPs internos ficam
 bloqueados.
 
-Mesmo com `VERBOO_AGENT_EXECUTOR = "native"` como default, uma chamada pode
+Mesmo com `VERBOO_AGENT_EXECUTOR = "native"` como padrão, uma chamada pode
 escolher `executor: "opencode"`. O inverso também funciona.
 
-Reinicie o cliente depois de alterar a configuracao. MCPs novos nao entram em
-uma sessao ja aberta.
+Reinicie o cliente depois de alterar a configuração. MCPs novos não entram em
+uma sessão já aberta.
 
 ### Cursor
 
@@ -255,51 +258,51 @@ Adicione no `.cursor/mcp.json` do projeto:
 
 ### Via MCP (Claude/Codex/Cursor)
 
-Quando o MCP server estiver registrado, o orquestrador tera acesso a estas tools:
+Quando o servidor MCP estiver registrado, o orquestrador terá acesso a estas ferramentas:
 
-| Tool | Descricao |
+| Ferramenta | Descrição |
 |------|-----------|
 | `verboo_route` | Classifica a tarefa e explica o ranking dos modelos sem executar um agente |
-| `verboo_agent` | Subagente repo-aware sincrono; `model: "auto"` escolhe e distribui modelos, com fallback recuperavel |
-| `verboo_agent_start` | Inicia subagente assincrono, mesma validacao de `verboo_agent`, retorna `job_id` imediatamente |
-| `verboo_job` | Gerencia jobs assincronos: `status`, `result`, `list`, `cancel` |
-| `verboo_memory` | Consulta ou registra uma nota tecnica duravel no diario isolado do projeto |
-| `verboo_code` | Codificacao com DeepSeek V4 Flash |
+| `verboo_agent` | Subagente ciente do repositório e síncrono; `model: "auto"` escolhe e distribui modelos, com fallback recuperável |
+| `verboo_agent_start` | Inicia subagente assíncrono, com a mesma validação de `verboo_agent`, e retorna `job_id` imediatamente |
+| `verboo_job` | Gerencia jobs assíncronos: `status`, `result`, `list`, `cancel` |
+| `verboo_memory` | Consulta ou registra uma nota técnica durável no diário isolado do projeto |
+| `verboo_code` | Codificação com DeepSeek V4 Flash |
 | `verboo_review` | Code review |
-| `verboo_deepseek_v4_flash` | Modelo especifico |
-| `verboo_glm_5_2` | Modelo especifico |
-| `verboo_mimo_v2_5` | Modelo especifico |
-| `verboo_kimi_k2_7` | Modelo especifico |
-| `verboo_minimax_m3` | Modelo especifico |
-| `verboo_glm_4_7_flash` | Modelo especifico |
-| `verboo_qwen3_6_27b` | Modelo especifico |
+| `verboo_deepseek_v4_flash` | Modelo específico |
+| `verboo_glm_5_2` | Modelo específico |
+| `verboo_mimo_v2_5` | Modelo específico |
+| `verboo_kimi_k2_7` | Modelo específico |
+| `verboo_minimax_m3` | Modelo específico |
+| `verboo_glm_4_7_flash` | Modelo específico |
+| `verboo_qwen3_6_27b` | Modelo específico |
 
-Exemplo de delegacao nativa:
+Exemplo de delegação nativa:
 
 > _"Use `verboo_agent` com `executor: native`, em modo `write`, com cwd neste
-> repo, para editar os testes deste modulo. Depois revise o diff e rode a suite
+> repo, para editar os testes deste módulo. Depois revise o diff e rode a suíte
 > local no orquestrador."_
 
-### Selecao automatica e rotacao
+### Seleção automática e rotação
 
 Use `verboo_route` quando quiser apenas saber qual modelo combina melhor com a
-tarefa. A resposta inclui perfil detectado, ranking, pontuacao e motivos, sem
-consumir uma execucao de agente.
+tarefa. A resposta inclui perfil detectado, ranking, pontuação e motivos, sem
+consumir uma execução de agente.
 
-No `verboo_agent`, `model: "auto"` e o default. O roteador combina:
+No `verboo_agent`, `model: "auto"` é o padrão. O roteador combina:
 
-- tipo da tarefa: codificacao, seguranca, revisao, UX/web, analise, contexto
-  longo ou resposta rapida;
+- tipo da tarefa: codificação, segurança, revisão, UX/web, análise, contexto
+  longo ou resposta rápida;
 - afinidades declaradas de cada modelo;
 - tier permitido e allowlist/denylist administrativas;
-- execucoes em andamento, uso recente, falhas e cooldown.
+- execuções em andamento, uso recente, falhas e cooldown.
 
 Isso distribui chamadas concorrentes sem round-robin cego: o melhor modelo
 continua preferido, mas um segundo modelo adequado pode assumir quando o
-primeiro ja esta ocupado. Em `read_only`, um erro recuperavel (`EXIT_ERROR` ou
+primeiro já está ocupado. Em `read_only`, um erro recuperável (`EXIT_ERROR` ou
 timeout) recalcula o ranking e tenta outro candidato. `write` nunca faz fallback
-automatico, pois a tentativa que falhou pode ja ter editado arquivos. Uma escolha
-manual, como `model: "glm-5.2"`, nunca e substituida silenciosamente.
+automático, pois a tentativa que falhou pode já ter editado arquivos. Uma escolha
+manual, como `model: "glm-5.2"`, nunca é substituída silenciosamente.
 
 Exemplo:
 
@@ -314,47 +317,47 @@ Exemplo:
 ```
 
 O resultado informa `routing.strategy`, `selected_model`, `reason`, `ranking`
-e todas as `attempts`, para o orquestrador revisar a decisao.
+e todas as `attempts`, para o orquestrador revisar a decisão.
 
 Escolha do harness:
 
 - `native`: usa a CLI oficial e a sessão OAuth, preservando o harness
   Claude Code-style do Verboo.
 - `opencode`: executa o mesmo agente delimitado pelo harness OpenCode e requer
-  o provider Verboo/API key configurado.
+  o provedor Verboo e a chave de API configurados.
 - se `executor` for omitido, vale `VERBOO_AGENT_EXECUTOR`; sem a variável, o
-  default é `native`.
+  padrão é `native`.
 
-`read_only` bloqueia edicao, shell, web, agentes aninhados e acesso fora do
-projeto. `write` libera somente ferramentas de leitura e edicao; shell, web,
-agentes aninhados e diretorios externos permanecem desabilitados. O orquestrador
-continua responsavel por executar testes e outros comandos, revisar o diff,
-commitar e fazer deploy. O subprocesso recebe somente uma allowlist minima de
-variaveis de ambiente; tokens de GitHub, AWS e outros servicos nao sao herdados.
-O modo `write` falha fechado enquanto `VERBOO_AGENT_WRITE_ENABLED` nao for `1`.
+`read_only` bloqueia edição, shell, web, agentes aninhados e acesso fora do
+projeto. `write` libera somente ferramentas de leitura e edição; shell, web,
+agentes aninhados e diretórios externos permanecem desabilitados. O orquestrador
+continua responsável por executar testes e outros comandos, revisar o diff,
+commitar e fazer deploy. O subprocesso recebe somente uma allowlist mínima de
+variáveis de ambiente; tokens de GitHub, AWS e outros serviços não são herdados.
+O modo `write` falha fechado enquanto `VERBOO_AGENT_WRITE_ENABLED` não for `1`.
 
-### Memoria dos subagentes
+### Memória dos subagentes
 
-Com `VERBOO_MEMORY_ENABLED=1`, o bridge mantem um diario JSONL separado para
-cada `cwd` canonico. O nome do arquivo combina o nome do projeto com um hash do
-caminho, impedindo que repositorios homonimos compartilhem contexto.
+Com `VERBOO_MEMORY_ENABLED=1`, o bridge mantém um diário JSONL separado para
+cada `cwd` canônico. O nome do arquivo combina o nome do projeto com um hash do
+caminho, impedindo que repositórios homônimos compartilhem contexto.
 
 Ao finalizar, o agente devolve uma nota curta entre `<memory_note>` e
-`</memory_note>`. O marcador e removido da resposta exibida, e somente a nota
-sanitizada, o modelo, o modo, o executor e os artefatos internos sao
-persistidos. Prompt integral, raciocinio, codigo bruto, credenciais e saida
-completa nao sao gravados. Notas sem marcador nao viram memoria automaticamente.
-Tokens conhecidos, atribuicoes de credenciais, chaves privadas, emails, CPFs e
-telefones tambem sao redigidos novamente no caminho de leitura.
+`</memory_note>`. O marcador é removido da resposta exibida, e somente a nota
+sanitizada, o modelo, o modo, o executor e os artefatos internos são
+persistidos. Prompt integral, raciocínio, código bruto, credenciais e saída
+completa não são gravados. Notas sem marcador não viram memória automaticamente.
+Tokens conhecidos, atribuições de credenciais, chaves privadas, e-mails, CPFs e
+telefones também são redigidos novamente no caminho de leitura.
 
-As ultimas notas do projeto entram na proxima delegacao com a instrucao de
-confirmar tudo no repositorio. `VERBOO_SHARED_MEMORY_FILES` pode adicionar
-indices curados de Codex, Claude ou Obsidian como fontes de leitura. O bridge
-limita quantidade e tamanho dessas fontes; ele nao varre o vault inteiro.
-Os caminhos compartilhados sao uma allowlist administrativa explicita e seu
-conteudo passa pela mesma redacao antes de chegar ao modelo.
+As últimas notas do projeto entram na próxima delegação com a instrução de
+confirmar tudo no repositório. `VERBOO_SHARED_MEMORY_FILES` pode adicionar
+índices curados de Codex, Claude ou Obsidian como fontes de leitura. O bridge
+limita quantidade e tamanho dessas fontes; ele não varre o vault inteiro.
+Os caminhos compartilhados são uma allowlist administrativa explícita e seu
+conteúdo passa pela mesma redação antes de chegar ao modelo.
 
-Gravacoes concorrentes sao serializadas por arquivo dentro do processo do
+Gravações concorrentes são serializadas por arquivo dentro do processo do
 bridge. Para decisões críticas, o orquestrador pode usar `verboo_memory` com
 `action: "remember"`; para auditoria, use `read` ou `status`.
 
@@ -364,11 +367,11 @@ bridge. Para decisões críticas, o orquestrador pode usar `verboo_memory` com
 # Prompt simples
 vb "Explique closures em JavaScript"
 
-# Com modelo especifico e system prompt
-vb -m glm-5.2 -s "Seja conciso e tecnico" "Analise a complexidade deste algoritmo"
+# Com modelo específico e prompt de sistema
+vb -m glm-5.2 -s "Seja conciso e técnico" "Analise a complexidade deste algoritmo"
 
 # Pipe de arquivo
-cat main.py | vb -m mimo-v2.5 "Revise este codigo"
+cat main.py | vb -m mimo-v2.5 "Revise este código"
 
 # Listar modelos
 vb --list
@@ -392,114 +395,115 @@ opencode run -m verboo/glm-5.2 "Resolva este problema complexo"
 
 ## Skill para Claude e Codex
 
-Para ensinar o Claude a delegar automaticamente tarefas de volume para a Verboo, copie o skill file:
+Para ensinar o Claude a delegar automaticamente tarefas de volume para a Verboo, copie o arquivo da skill:
 
 ```bash
 cp -r skills/verboo-executor ~/.claude/skills/
 cp -r skills/verboo-executor ~/.codex/skills/
 ```
 
-O skill ensina o padrao de delegacao:
+A skill ensina o padrão de delegação:
 
 1. Claude recebe a tarefa
-2. Claude separa em **orquestracao** (fica com Claude) + **volume** (delega pra Verboo)
+2. Claude separa em **orquestração** (fica com Claude) + **volume** (delega para a Verboo)
 3. Claude/Codex escolhe `executor: native` ou `executor: opencode`
-4. Claude/Codex chama `verboo_agent` com `cwd`, modo e instrucoes claras
+4. Claude/Codex chama `verboo_agent` com `cwd`, modo e instruções claras
 5. Claude integra e valida o resultado
 
 ---
 
 ## Planos Verboo
 
-| Plano | Preco | Tokens | Conexoes | Modelos |
-|-------|-------|--------|----------|---------|
-| Junior | R$ 75/mes | Ilimitado | 2 | Modelos basicos |
-| **Pro** | **R$ 174/mes** | **Ilimitado** | **4** | **deepseek-v4-flash, mimo-v2.5 (1M ctx)** |
-| Ultra | R$ 900/mes | Ilimitado | 2 | + GLM 5.2, todos |
+| Plano | Preço | Tokens | Limite | Concorrência | Modelos incluídos |
+|-------|-------|--------|--------|--------------|-------------------|
+| Junior | R$ 75/mês | Ilimitados | 30 req/min | 4 | `qwen3.6-27b`, `glm-4.7-flash` |
+| **Pro** | **R$ 119/mês** | **Ilimitados** | **30 req/min** | **2** | Junior + `mimo-v2.5`, `deepseek-v4-flash` |
+| Max | R$ 319/mês | Ilimitados | 30 req/min | 2 | Pro + `minimax-m3`, `deepseek-v4-pro`, `mimo-v2.5-pro` |
+| Ultra | R$ 899/mês | Ilimitados | 30 req/min | 2 | Pro + `glm-5.2`, `kimi-k2.7`, `minimax-m3` |
 
-> **Recomendacao:** Pro (R$ 174/mes) — 4 conexoes concorrentes, 1M de contexto, tokens ilimitados.
-> Unico plano com 4 conexoes simultaneas (Ultra tem apenas 2).
+> Preços e limites consultados em 28/07/2026. Confirme os
+> [planos oficiais do Verboo Code](https://code.verboo.ai/pt) antes de assinar.
 
 ---
 
 ## Exemplos reais
 
-### Code review em lote
+### Revisão de código em lote
 
 ```bash
-# Revisar varios arquivos de uma vez com Verboo
+# Revisar vários arquivos de uma vez com Verboo
 for f in src/**/*.ts; do
   cat "$f" | vb -m mimo-v2.5 -s "Revise este arquivo TypeScript" > "reviews/$(basename $f).review.md"
 done
 ```
 
-### Refatoracao assistida
+### Refatoração assistida
 
 ```mermaid
 sequenceDiagram
-    participant Vc as Voce
+    participant Vc as Você
     participant C as Claude Code
     participant VB as Verboo Bridge
 
-    Vc->>C: Refatore este modulo
-    C->>VB: verboo_code("Extraia a logica de pagamento")
-    VB-->>C: Codigo refatorado
-    C->>VB: verboo_review(codigo)
-    VB-->>C: Review aponta 2 melhorias
+    Vc->>C: Refatore este módulo
+    C->>VB: verboo_code("Extraia a lógica de pagamento")
+    VB-->>C: Código refatorado
+    C->>VB: verboo_review(resultado)
+    VB-->>C: Revisão aponta 2 melhorias
     C->>Vc: Resultado final revisado
 ```
 
-### Geracao de testes
+### Geração de testes
 
-> "Claude, use o `verboo_code` para gerar testes unitarios para cada funcao neste modulo. Depois execute e me diga se passam."
+> "Claude, use o `verboo_code` para gerar testes unitários para cada função neste módulo. Depois execute e me diga se passam."
 
 ---
 
-## Recursos do MCP server
+## Recursos do servidor MCP
 
-O server tambem expoe **resources** e **prompts**:
+O servidor também expõe **recursos** e **prompts**:
 
-| Tipo | URI | Descricao |
+| Tipo | URI | Descrição |
 |------|-----|-----------|
-| Resource | `verboo://models` | Lista de modelos com specs |
-| Resource | `verboo://status` | Status da conexao |
+| Recurso | `verboo://models` | Lista de modelos com especificações |
+| Recurso | `verboo://status` | Status da conexão |
 | Prompt | `revisar-codigo` | Template de code review |
-| Prompt | `refatorar` | Template de refatoracao |
-| Prompt | `explicar` | Template de explicacao |
+| Prompt | `refatorar` | Template de refatoração |
+| Prompt | `explicar` | Template de explicação |
 
 ---
 
-## Variaveis de ambiente
+## Variáveis de ambiente
 
-| Variavel | Default | Descricao |
+| Variável | Padrão | Descrição |
 |----------|---------|-----------|
-| `VERBOO_API_KEY` | — | Necessaria para tools de prompt direto e para `executor: opencode`; nao e repassada ao executor nativo |
+| `VERBOO_API_KEY` | — | Necessária para ferramentas de prompt direto e para `executor: opencode`; não é repassada ao executor nativo |
 | `VERBOO_BASE_URL` | `https://code.verboo.ai/router/v1` | URL base da API |
-| `VERBOO_LOG_LEVEL` | `info` | Nivel de log: `debug`, `info`, `warn`, `error` |
-| `VERBOO_AGENT_ALLOWED_ROOTS` | — | Raizes repo-aware separadas pelo delimitador de paths do SO; sem valor, `verboo_agent` falha fechado |
-| `VERBOO_AGENT_WRITE_ENABLED` | — | Defina `1` para habilitar `write`; por padrao somente `read_only` e aceito |
-| `VERBOO_AGENT_MAX_CONCURRENCY` | `4` | Execucoes simultaneas globais, incluindo jobs assincronos; inteiro entre 1 e 8, valores invalidos usam 4 |
-| `VERBOO_JOB_STORE_DIR` | — | Diretorio opcional 0700/0600 para persistencia somente de metadados seguros; resultados ficam apenas em memoria. Nao grava prompts, raciocinio, segredos ou env e recupera jobs interrompidos ao reiniciar |
+| `VERBOO_LOG_LEVEL` | `info` | Nível de log: `debug`, `info`, `warn`, `error` |
+| `VERBOO_AGENT_ALLOWED_ROOTS` | — | Raízes repo-aware separadas pelo delimitador de paths do SO; sem valor, `verboo_agent` falha fechado |
+| `VERBOO_AGENT_WRITE_ENABLED` | — | Defina `1` para habilitar `write`; por padrão, somente `read_only` é aceito |
+| `VERBOO_AGENT_MAX_CONCURRENCY` | `4` | Execuções simultâneas globais, incluindo jobs assíncronos; inteiro entre 1 e 8, valores inválidos usam 4 |
+| `VERBOO_JOB_STORE_DIR` | — | Diretório opcional 0700/0600 para persistência somente de metadados seguros; resultados ficam apenas em memória. Não grava prompts, raciocínio, segredos ou env e recupera jobs interrompidos ao reiniciar |
 | `VERBOO_JOB_TTL_MS` | `1800000` (30 min) | TTL em ms para jobs finalizados sem resultado |
 | `VERBOO_JOB_RESULT_TTL_MS` | `600000` (10 min) | TTL em ms para resultados de jobs |
-| `VERBOO_JOB_MAX_RESULTS` | `100` | Maximo de resultados mantidos em memoria (ate 500) |
-| `VERBOO_JOB_MAX_QUEUED` | `50` | Maximo de jobs aguardando na fila |
+| `VERBOO_JOB_MAX_RESULTS` | `100` | Máximo de resultados mantidos em memória (até 500) |
+| `VERBOO_JOB_MAX_QUEUED` | `50` | Máximo de jobs aguardando na fila |
 | `VERBOO_AGENT_MAX_MODEL_ATTEMPTS` | `2` | Tentativas de modelos no modo `auto` + `read_only`; inteiro entre 1 e 3 |
-| `VERBOO_AGENT_EXECUTOR` | `native` | Default administrativo; cada chamada pode substituir por `native` ou `opencode` |
-| `VERBOO_MEMORY_ENABLED` | — | Defina `1` para ativar memoria tecnica persistente dos subagentes |
-| `VERBOO_MEMORY_DIR` | `~/.local/share/verboo-bridge/memory` | Diretorio dos diarios JSONL isolados por projeto |
-| `VERBOO_SHARED_MEMORY_FILES` | — | Arquivos de memoria curada, somente leitura, separados pelo delimitador de paths do SO |
-| `VERBOO_MODEL_ALLOWLIST` | todos | Modelos permitidos no roteamento automatico, preview e selecao manual, separados por virgula |
-| `VERBOO_MODEL_DENYLIST` | — | Modelos bloqueados, separados por virgula |
-| `VERBOO_MODEL_TIERS` | `pro,ultra` | Tiers permitidos no roteamento automatico, preview e selecao manual |
-| `VERBOO_MODEL_COOLDOWN_SECONDS` | `60` | Cooldown de um modelo apos falha recuperavel |
-| `VERBOO_CODE_BIN` | `verboo` | Executavel da CLI oficial; pode ser Node quando `VERBOO_CODE_ENTRYPOINT` estiver definido |
+| `VERBOO_AGENT_EXECUTOR` | `native` | Padrão administrativo; cada chamada pode substituir por `native` ou `opencode` |
+| `VERBOO_MEMORY_ENABLED` | — | Defina `1` para ativar memória técnica persistente dos subagentes |
+| `VERBOO_MEMORY_DIR` | `~/.local/share/verboo-bridge/memory` | Diretório dos diários JSONL isolados por projeto |
+| `VERBOO_SHARED_MEMORY_FILES` | — | Arquivos de memória curada, somente leitura, separados pelo delimitador de paths do SO |
+| `VERBOO_MODEL_ALLOWLIST` | todos | Modelos permitidos no roteamento automático, preview e seleção manual, separados por vírgula |
+| `VERBOO_MODEL_DENYLIST` | — | Modelos bloqueados, separados por vírgula |
+| `VERBOO_MODEL_TIERS` | `pro,ultra` | Tiers permitidos no roteamento automático, preview e seleção manual |
+| `VERBOO_MODEL_COOLDOWN_SECONDS` | `60` | Cooldown de um modelo após falha recuperável |
+| `VERBOO_CODE_BIN` | `verboo` | Executável da CLI oficial; pode ser Node quando `VERBOO_CODE_ENTRYPOINT` estiver definido |
 | `VERBOO_CODE_ENTRYPOINT` | — | Caminho opcional para `@verboo/code/dist/cli.mjs` |
 | `VERBOO_NATIVE_MODEL_ALLOWLIST` | todos | Modelos comprovadamente saudáveis no OAuth do executor nativo; impede seleção silenciosa de modelos listados pela CLI, mas indisponíveis na conta |
 | `VERBOO_OPENCODE_MODEL_ALLOWLIST` | todos | Modelos permitidos especificamente no executor OpenCode |
 | `VERBOO_OPENCODE_BIN` | `opencode` | Caminho do OpenCode 1.17.9+ |
 | `VERBOO_ENV_FILE` | — | Arquivo opcional lido por `bin/verboo-mcp` para obter `VERBOO_API_KEY` sem `source` |
-| `VERBOO_NODE_BIN` | `node` | Binario Node usado por `bin/verboo-mcp` |
+| `VERBOO_NODE_BIN` | `node` | Binário Node usado por `bin/verboo-mcp` |
 
 ---
 
@@ -513,15 +517,15 @@ node index.mjs
 npm test
 ```
 
-Testar o MCP server:
+Testar o servidor MCP:
 
 ```bash
-# Inicializar e listar tools
+# Inicializar e listar ferramentas
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | node index.mjs
 ```
 
 ---
 
-## Licenca
+## Licença
 
 MIT — use, modifique, compartilhe.
