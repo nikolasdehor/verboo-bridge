@@ -4,6 +4,7 @@ import {
   access,
   chmod,
   mkdtemp,
+  readFile,
   realpath,
   writeFile,
 } from 'node:fs/promises';
@@ -55,4 +56,45 @@ test('verboo-mcp instalado por npm resolve index.mjs a partir do pacote real', a
     result.stdout.trim(),
     path.join(await realpath(installPrefix), 'node_modules', 'verboo-bridge', 'index.mjs'),
   );
+
+  const instructionsBin = path.join(
+    installPrefix,
+    'node_modules',
+    '.bin',
+    'verboo-install-instructions',
+  );
+  const instructionsHome = path.join(temp, 'instructions-home');
+  const instructionsEnv = {
+    ...process.env,
+    VERBOO_INSTRUCTIONS_HOME: instructionsHome,
+  };
+  await execFileAsync(instructionsBin, [], { env: instructionsEnv });
+  await execFileAsync(instructionsBin, [], { env: instructionsEnv });
+
+  const expectedSkill = await readFile(
+    path.join(installedPackage, 'skills', 'verboo-executor', 'SKILL.md'),
+    'utf8',
+  );
+  for (const clientDir of ['.agents', '.claude', '.cursor']) {
+    const installedSkill = await readFile(
+      path.join(instructionsHome, clientDir, 'skills', 'verboo-executor', 'SKILL.md'),
+      'utf8',
+    );
+    assert.equal(installedSkill, expectedSkill);
+  }
+
+  const agentsSkill = path.join(
+    instructionsHome,
+    '.agents',
+    'skills',
+    'verboo-executor',
+    'SKILL.md',
+  );
+  await writeFile(agentsSkill, 'conteúdo personalizado\n');
+  await assert.rejects(
+    execFileAsync(instructionsBin, [], { env: instructionsEnv }),
+  );
+  assert.equal(await readFile(agentsSkill, 'utf8'), 'conteúdo personalizado\n');
+  await execFileAsync(instructionsBin, ['--force'], { env: instructionsEnv });
+  assert.equal(await readFile(agentsSkill, 'utf8'), expectedSkill);
 });

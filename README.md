@@ -79,14 +79,33 @@ graph TB
 
 ## Instalação rápida
 
+O bridge e a CLI nativa do Verboo são pacotes separados. Para usar
+`verboo_agent` com o executor recomendado:
+
+```bash
+npm install --global @verboo/code
+verboo auth login
+verboo auth status --text
+```
+
+Requisitos:
+
+- Node.js 22+ para o executor nativo com `@verboo/code`;
+- Codex, Claude Code, Cursor ou outro cliente MCP;
+- OAuth ativo na CLI Verboo — nenhuma API key é necessária no modo nativo.
+
+O bridge pode ser executado diretamente pelo pacote publicado, sem clonar este
+repositório: `npx --yes verboo-bridge@latest`. Para desenvolver o bridge
+localmente, use:
+
 ```bash
 git clone https://github.com/nikolasdehor/verboo-bridge.git
 cd verboo-bridge
 npm install
 ```
 
-Requisitos: Node.js 18+ e, para `verboo_agent`, `@verboo/code` com OAuth
-ou OpenCode 1.17.9+ como fallback.
+Somente o bridge e as ferramentas de API continuam compatíveis com Node.js 18+.
+O fallback por OpenCode requer OpenCode 1.17.9+.
 
 ### Variável de ambiente
 
@@ -128,34 +147,175 @@ no repositório.
 
 ## Configuração por plataforma
 
-### Claude Code
+Em qualquer cliente, o Verboo aparece como uma ferramenta MCP. Ao chamar
+`verboo_agent`, o bridge inicia um subagente externo, separado e ciente do
+repositório. Ele não aparece como um subagente nativo da interface.
+`read_only` e `write` são apenas modos de permissão dessa execução.
 
-Adicione no `~/.claude.json`:
+> Para delegação de repositório, o orquestrador deve usar `verboo_agent` pelo
+> MCP. Se a ferramenta não aparecer, corrija ou reinicie a integração. Não
+> substitua a chamada por `verboo -p`, `vb`, `opencode run` ou outro comando de
+> shell.
+
+Antes de configurar, descubra os caminhos absolutos:
+
+```bash
+command -v npx
+command -v verboo
+```
+
+Use esses caminhos nos exemplos abaixo. `$HOME`, `~` e `$(command -v ...)` não
+são expandidos dentro de JSON ou TOML.
+
+| Cliente | Configuração | Como validar |
+|---|---|---|
+| Codex App, CLI e extensão IDE | `~/.codex/config.toml` | App/IDE: `/mcp`; CLI: `codex mcp get verboo-bridge` |
+| Claude Desktop | Settings → Developer → Edit Config | Chat: **Connectors**; logs em `~/Library/Logs/Claude` |
+| Claude Code | `claude mcp add` ou `.mcp.json` | `claude mcp get verboo-bridge` e `/mcp` |
+| Cursor IDE e CLI | `~/.cursor/mcp.json` ou `.cursor/mcp.json` | **Available Tools** ou `cursor-agent mcp list-tools verboo-bridge` |
+| OpenCode | `opencode.json` | `opencode mcp list` |
+
+### Codex App, CLI e extensão IDE
+
+O App, a CLI e a extensão compartilham a mesma configuração. Adicione a
+`~/.codex/config.toml`:
+
+```toml
+[mcp_servers.verboo-bridge]
+command = "/caminho/absoluto/para/npx"
+args = ["--yes", "verboo-bridge@latest"]
+startup_timeout_sec = 60
+tool_timeout_sec = 1800
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.verboo-bridge.env]
+VERBOO_AGENT_ALLOWED_ROOTS = "/caminho/absoluto/para/seus/projetos"
+VERBOO_AGENT_EXECUTOR = "native"
+VERBOO_CODE_BIN = "/caminho/absoluto/para/verboo"
+```
+
+No Codex App, também é possível abrir **Settings → MCP servers → Add server**,
+escolher **STDIO** e preencher os mesmos valores. Salve e reinicie o App. Na
+extensão IDE, reinicie a extensão. Consulte a
+[documentação oficial de MCP do Codex](https://developers.openai.com/codex/mcp).
+
+Alternativa pela CLI no macOS ou Linux:
+
+```bash
+VERBOO_PROJECTS_ROOT="$HOME/Projects"
+
+codex mcp add verboo-bridge \
+  --env "VERBOO_AGENT_ALLOWED_ROOTS=$VERBOO_PROJECTS_ROOT" \
+  --env "VERBOO_AGENT_EXECUTOR=native" \
+  --env "VERBOO_CODE_BIN=$(command -v verboo)" \
+  -- "$(command -v npx)" --yes verboo-bridge@latest
+
+codex mcp get verboo-bridge
+```
+
+O comando não adiciona os timeouts e a política de aprovação; complete esses
+campos no TOML. Se o servidor já existir, não repita o `add`: edite o bloco
+existente.
+
+O Codex controla a aprovação da chamada MCP. Para automação não interativa com
+`codex exec`, aprove somente as ferramentas necessárias:
+
+```toml
+[mcp_servers.verboo-bridge.tools.verboo_route]
+approval_mode = "approve"
+
+[mcp_servers.verboo-bridge.tools.verboo_agent]
+approval_mode = "approve"
+```
+
+Isso evita `user cancelled MCP tool call` quando não há interface para responder
+ao prompt. Não use aprovação global irrestrita como atalho.
+
+### Claude Desktop
+
+O Claude Desktop está disponível para macOS e Windows. Abra
+**Settings → Developer → Edit Config** e edite:
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`;
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`.
 
 ```json
 {
   "mcpServers": {
     "verboo-bridge": {
-      "command": "node",
-      "args": ["/caminho/para/verboo-bridge/index.mjs"],
+      "command": "/caminho/absoluto/para/npx",
+      "args": ["--yes", "verboo-bridge@latest"],
       "env": {
-        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/para/seus/projetos",
+        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/absoluto/para/seus/projetos",
         "VERBOO_AGENT_EXECUTOR": "native",
-        "VERBOO_CODE_BIN": "/caminho/para/verboo"
+        "VERBOO_CODE_BIN": "/caminho/absoluto/para/verboo"
       }
     }
   }
 }
 ```
 
-O Claude Code ainda pode pedir aprovação para a chamada MCP. Essa aprovação é
-do orquestrador e é separada do OAuth e das permissões internas do Verboo Code.
-O campo `executor` da chamada permite ao usuário ou ao orquestrador escolher o
-harness nativo ou o fallback OpenCode sem reiniciar o MCP.
+Feche completamente o Claude Desktop e abra novamente. No chat, clique em
+**Add files, connectors, and more → Connectors → Manage connectors** e confirme
+que `verboo-bridge` está conectado. A configuração segue o
+[guia oficial de servidores MCP locais](https://modelcontextprotocol.io/docs/develop/connect-local-servers).
+
+### Claude Code CLI
+
+Para disponibilizar o bridge em todos os projetos no macOS ou Linux:
+
+```bash
+VERBOO_PROJECTS_ROOT="$HOME/Projects"
+
+claude mcp add --transport stdio --scope user \
+  -e "VERBOO_AGENT_ALLOWED_ROOTS=$VERBOO_PROJECTS_ROOT" \
+  -e "VERBOO_AGENT_EXECUTOR=native" \
+  -e "VERBOO_CODE_BIN=$(command -v verboo)" \
+  verboo-bridge -- "$(command -v npx)" --yes verboo-bridge@latest
+
+claude mcp get verboo-bridge
+```
+
+Se o bridge já estiver configurado no Claude Desktop, também é possível executar
+`claude mcp add-from-claude-desktop` e selecionar `verboo-bridge`. No Claude
+Code, use `/mcp` para conferir e aprovar o servidor. Veja a
+[documentação oficial do Claude Code](https://code.claude.com/docs/en/mcp).
+
+### Cursor IDE e CLI
+
+Use `~/.cursor/mcp.json` para todos os projetos ou `.cursor/mcp.json` apenas no
+repositório atual:
+
+```json
+{
+  "mcpServers": {
+    "verboo-bridge": {
+      "command": "/caminho/absoluto/para/npx",
+      "args": ["--yes", "verboo-bridge@latest"],
+      "env": {
+        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/absoluto/para/seus/projetos",
+        "VERBOO_AGENT_EXECUTOR": "native",
+        "VERBOO_CODE_BIN": "/caminho/absoluto/para/verboo"
+      }
+    }
+  }
+}
+```
+
+Reinicie o Cursor. No Agent/Composer, abra **Available Tools**, habilite
+`verboo-bridge` e aprove a chamada quando solicitado. Pela CLI:
+
+```bash
+cursor-agent mcp list
+cursor-agent mcp list-tools verboo-bridge
+```
+
+O IDE e o `cursor-agent` leem o mesmo formato, conforme a
+[documentação oficial do Cursor](https://docs.cursor.com/context/model-context-protocol).
 
 ### OpenCode
 
-**Opção 1 — Servidor MCP**:
+Adicione o servidor local ao `opencode.json`:
 
 ```json
 {
@@ -163,24 +323,29 @@ harness nativo ou o fallback OpenCode sem reiniciar o MCP.
   "mcp": {
     "verboo-bridge": {
       "type": "local",
-      "command": ["node", "/caminho/para/verboo-bridge/index.mjs"],
+      "command": [
+        "/caminho/absoluto/para/npx",
+        "--yes",
+        "verboo-bridge@latest"
+      ],
       "environment": {
-        "VERBOO_API_KEY": "{env:VERBOO_API_KEY}",
-        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/para/seus/projetos",
-        "VERBOO_OPENCODE_BIN": "/caminho/para/opencode"
+        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/absoluto/para/seus/projetos",
+        "VERBOO_AGENT_EXECUTOR": "native",
+        "VERBOO_CODE_BIN": "/caminho/absoluto/para/verboo"
       },
-      "enabled": true
+      "enabled": true,
+      "timeout": 60000
     }
   }
 }
 ```
 
-Para habilitar edição conscientemente, adicione
-`"VERBOO_AGENT_WRITE_ENABLED": "1"` ao bloco `environment`. Sem isso,
-`verboo_agent` aceita somente `read_only`.
+Valide com `opencode mcp list`. O OpenCode prefixa as ferramentas com o nome do
+servidor; no prompt, peça explicitamente para usar o MCP `verboo-bridge`. Veja a
+[documentação oficial do OpenCode](https://opencode.ai/docs/mcp-servers).
 
-**Opção 2 — Provedor direto** (necessário para `verboo_agent` quando
-`executor: "opencode"`):
+O provedor direto abaixo só é necessário para usar `executor: "opencode"` como
+fallback, em vez do executor nativo:
 
 ```json
 {
@@ -206,51 +371,32 @@ Para habilitar edição conscientemente, adicione
 }
 ```
 
-### Codex
+### Habilitar edição em qualquer cliente
 
-Adicione no `~/.codex/config.toml`:
+Sem configuração adicional, o subagente permanece em `read_only`. Para permitir
+edição, adicione ao bloco de ambiente do cliente:
 
-```toml
-[mcp_servers.verboo-bridge]
-command = "node"
-args = ["/caminho/para/verboo-bridge/index.mjs"]
-
-[mcp_servers.verboo-bridge.env]
-VERBOO_AGENT_ALLOWED_ROOTS = "/caminho/para/seus/projetos"
-VERBOO_AGENT_EXECUTOR = "native"
-VERBOO_CODE_BIN = "/caminho/para/verboo"
+```text
+VERBOO_AGENT_WRITE_ENABLED=1
 ```
 
-O Codex ainda controla a aprovação da chamada `verboo_agent`. O executor nativo
-recebe apenas as ferramentas compatíveis com o modo solicitado: leitura no
-`read_only`; leitura e edição no `write`; Bash, web, hooks e MCPs internos ficam
-bloqueados.
+Na chamada, use também `mode: write`. Os dois opt-ins são obrigatórios. Mesmo
+nesse modo, o subagente não recebe shell, não executa testes e não faz commit,
+push ou deploy; essas etapas continuam com o orquestrador.
 
-Mesmo com `VERBOO_AGENT_EXECUTOR = "native"` como padrão, uma chamada pode
-escolher `executor: "opencode"`. O inverso também funciona.
+### Smoke test comum
 
-Reinicie o cliente depois de alterar a configuração. MCPs novos não entram em
-uma sessão já aberta.
+Depois de reiniciar o cliente, execute em ordem:
 
-### Cursor
+> Use `verboo_route` para classificar “Revise este repositório”, sem executar
+> agente.
 
-Adicione no `.cursor/mcp.json` do projeto:
+> Use o subagente MCP `verboo_agent` com `executor: native`,
+> `mode: read_only`, `model: auto` e `cwd` apontando para o caminho absoluto
+> deste repositório. Apenas analise; não edite.
 
-```json
-{
-  "mcpServers": {
-    "verboo-bridge": {
-      "command": "node",
-      "args": ["/caminho/para/verboo-bridge/index.mjs"],
-      "env": {
-        "VERBOO_API_KEY": "${VERBOO_API_KEY}",
-        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/para/seus/projetos",
-        "VERBOO_OPENCODE_BIN": "/caminho/para/opencode"
-      }
-    }
-  }
-}
-```
+Para uma tarefa longa, use `verboo_agent_start` e consulte o resultado com
+`verboo_job`.
 
 ---
 
@@ -361,7 +507,10 @@ Gravações concorrentes são serializadas por arquivo dentro do processo do
 bridge. Para decisões críticas, o orquestrador pode usar `verboo_memory` com
 `action: "remember"`; para auditoria, use `read` ou `status`.
 
-### Via CLI direta
+### Uso manual fora dos orquestradores MCP
+
+Os comandos abaixo são utilitários manuais. Claude, Codex, Cursor e OpenCode não
+devem usá-los como fallback para `verboo_agent`.
 
 ```bash
 # Prompt simples
@@ -377,30 +526,41 @@ cat main.py | vb -m mimo-v2.5 "Revise este código"
 vb --list
 ```
 
-### Via Verboo Code nativo
-
-```bash
-verboo auth login
-verboo -p --output-format stream-json "Revise este projeto"
-```
-
-### Via OpenCode (fallback)
-
-```bash
-opencode run -m verboo/deepseek-v4-flash "Refatore este componente"
-opencode run -m verboo/glm-5.2 "Resolva este problema complexo"
-```
-
 ---
 
-## Skill para Claude e Codex
+## Orientação automática e skill
 
-Para ensinar o Claude a delegar automaticamente tarefas de volume para a Verboo, copie o arquivo da skill:
+O bridge não modifica `CLAUDE.md`, `AGENTS.md` nem regras do Cursor. Ao conectar,
+ele já envia `instructions` pelo próprio protocolo MCP para Codex, Claude,
+Cursor, OpenCode e outros hosts compatíveis. Essa orientação explica que
+`verboo_agent` é um subagente externo, recomenda `executor: native` e
+`model: auto`, separa `read_only` de `write` e mantém testes, Git e deploy com o
+orquestrador. Ela também proíbe fallback direto para a CLI.
+
+Para reforçar a descoberta antes mesmo da primeira chamada MCP, instale também a
+skill empacotada:
 
 ```bash
-cp -r skills/verboo-executor ~/.claude/skills/
-cp -r skills/verboo-executor ~/.codex/skills/
+npx --yes --package verboo-bridge@latest verboo-install-instructions
 ```
+
+Se já houver uma versão antiga da skill — especialmente uma que mencione
+fallback pela CLI — atualize-a conscientemente:
+
+```bash
+npx --yes --package verboo-bridge@latest verboo-install-instructions --force
+```
+
+O instalador cria a mesma skill nestes locais:
+
+- `~/.agents/skills/verboo-executor` — Codex e hosts compatíveis com Agent Skills;
+- `~/.claude/skills/verboo-executor` — Claude Code;
+- `~/.cursor/skills/verboo-executor` — Cursor IDE e CLI.
+
+O OpenCode também descobre `~/.agents/skills`. O Claude Desktop recebe a
+orientação pelo MCP; ele não usa `CLAUDE.md` para conectores locais. Sem
+`--force`, o instalador falha quando encontra uma skill diferente e não a
+sobrescreve.
 
 A skill ensina o padrão de delegação:
 
@@ -504,6 +664,21 @@ O servidor também expõe **recursos** e **prompts**:
 | `VERBOO_OPENCODE_BIN` | `opencode` | Caminho do OpenCode 1.17.9+ |
 | `VERBOO_ENV_FILE` | — | Arquivo opcional lido por `bin/verboo-mcp` para obter `VERBOO_API_KEY` sem `source` |
 | `VERBOO_NODE_BIN` | `node` | Binário Node usado por `bin/verboo-mcp` |
+
+---
+
+## Solução de problemas
+
+| Sintoma | Verificação e correção |
+|---|---|
+| `verboo: command not found` | Rode `npm install --global @verboo/code` e configure `VERBOO_CODE_BIN` com a saída de `command -v verboo`. |
+| `VERBOO_AUTH_REQUIRED` | Rode `verboo auth login`, confirme com `verboo auth status --text` e reinicie o cliente MCP. |
+| `CWD_NOT_ALLOWED` ou `ALLOWED_ROOTS_MISSING` | Use caminhos absolutos e inclua a raiz do projeto em `VERBOO_AGENT_ALLOWED_ROOTS`. |
+| O bridge não aparece no Codex | Rode `codex mcp get verboo-bridge`, abra uma nova sessão e confira `/mcp`. |
+| `user cancelled MCP tool call` no `codex exec` | A chamada aguardava aprovação sem terminal interativo. Use o Codex interativo ou aprove somente a ferramenta necessária no TOML. |
+| O cliente abriu **Shell** e executou `verboo -p` | O MCP não foi usado. Confirme `verboo_agent` na lista de ferramentas, atualize a skill com `verboo-install-instructions --force`, remova orientações antigas de fallback por CLI e reinicie o cliente. |
+| A chamada termina perto de 60 segundos | Defina `tool_timeout_sec = 1800` ou use `verboo_agent_start` com `verboo_job`. |
+| Aviso sobre `VERBOO_API_KEY` no modo nativo | A chave não é necessária para `verboo_agent` com OAuth; ela serve apenas às ferramentas de API. |
 
 ---
 

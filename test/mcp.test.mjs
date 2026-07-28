@@ -33,6 +33,10 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   t.after(async () => { try { await client.close(); } catch {} });
   await client.connect(transport);
 
+  assert.match(client.getInstructions() ?? '', /subagente externo/);
+  assert.match(client.getInstructions() ?? '', /read_only e write são modos de permissão/);
+  assert.match(client.getInstructions() ?? '', /nunca execute a CLI verboo diretamente/);
+
   const listed = await client.listTools();
   const routeTool = listed.tools.find((tool) => tool.name === 'verboo_route');
   const agentTool = listed.tools.find((tool) => tool.name === 'verboo_agent');
@@ -40,6 +44,7 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   assert.ok(routeTool);
   assert.ok(agentTool);
   assert.ok(memoryTool);
+  assert.match(agentTool.description, /pelo MCP, sem chamar a CLI diretamente/);
   assert.deepEqual(routeTool.inputSchema.properties.executor.enum, [
     'opencode',
     'native',

@@ -68,34 +68,16 @@ the decision.
 Use `verboo_code`, `verboo_review`, or a model-specific tool only when all required
 context is already in the prompt. They do not read files or run tests.
 
-## CLI fallback
+## No direct CLI fallback
 
-If the active MCP process is stale, do not bypass its write gate with
-`--dangerously-skip-permissions`. Restart the MCP client before any write task.
-The CLI fallback is read-only. Reproduce the constrained native invocation generated
-by `buildVerbooCodeInvocation`: use the executable from `VERBOO_CODE_BIN` plus
-the optional `VERBOO_CODE_ENTRYPOINT`, the validated project directory as
-`cwd`, the `Read,Glob,Grep` tool list, strict MCP configuration, disabled hooks
-and slash commands, the same deny rules for secrets/write/shell/web/task tools,
-and the child-environment allowlist from `buildChildEnv`. Insert `--` before the
-prompt so option-like text remains positional. If those constraints cannot be
-reproduced, restart the MCP client instead of using the fallback.
+Never invoke `verboo`, `vb`, `opencode`, or any equivalent Verboo command through
+the shell for repository delegation. Do not reproduce the bridge's internal
+arguments, use `--permission-mode bypassPermissions`, or treat a shell command as
+an MCP call.
 
-The OAuth CLI may display models as `pro-old/<model>` in `--list-models` while
-accepting only the unprefixed value in `--model` and `--fallback-model`. Normalize
-that display prefix before execution (for example, use `qwen3.6-27b`, not
-`pro-old/qwen3.6-27b`) and verify an unfamiliar model with a minimal print call.
-
-Give the operation one total wall-clock deadline in the parent orchestrator and
-subtract time consumed by every attempt and its cleanup. Start at most one retry
-with a different allowed model only when enough budget remains for that attempt;
-otherwise return a failure or warning immediately. A print call can remain silent
-while a model is saturated, so launch it in a tracked process group and, on
-timeout, send `SIGTERM` to the whole group, wait a short grace period, then send
-`SIGKILL` to surviving descendants. Capture and drain `stderr` before treating
-cleanup as complete. Never report a silent or terminated process as a completed
-review. Prefer the MCP tool for longer tasks because it already enforces timeout,
-capacity fallback, cooldown, and a stable result contract.
+If `verboo_agent` is missing or the MCP server is stale, stop and report the
+configuration problem. Ask the user to configure or restart the MCP client. Do
+not silently fall back to the CLI.
 
 ## Privacy
 

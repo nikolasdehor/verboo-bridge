@@ -176,6 +176,7 @@ const server = new Server(
       prompts: {},
       resources: {},
     },
+    instructions: 'Use somente as ferramentas MCP verboo_agent, verboo_agent_start, verboo_job e verboo_route para delegar à Verboo; nunca execute a CLI verboo diretamente pelo shell. verboo_agent é um subagente externo e repo-aware. read_only e write são modos de permissão. Prefira executor=native e model=auto. Use write apenas com autorização e opt-in. Se as ferramentas MCP não estiverem disponíveis, informe erro de configuração em vez de improvisar. O orquestrador revisa o diff e executa testes, Git e deploy.',
   },
 );
 
@@ -246,7 +247,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'verboo_agent',
-      description: 'Executa um subagente Verboo repo-aware. model=auto classifica a tarefa, distribui concorrência e tenta fallback recuperável; um modelo explícito preserva seleção manual. Quem chama escolhe native para usar o harness Verboo Code/OAuth ou opencode como fallback. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1 e pode somente editar. O orquestrador executa testes e outros comandos.',
+      description: 'Executa um subagente Verboo repo-aware pelo MCP, sem chamar a CLI diretamente. model=auto classifica a tarefa, distribui concorrência e tenta fallback recuperável; um modelo explícito preserva seleção manual. Quem chama escolhe native para usar o harness Verboo Code/OAuth ou opencode como fallback. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1 e pode somente editar. O orquestrador executa testes e outros comandos.',
       inputSchema: {
         type: 'object',
         properties: {
