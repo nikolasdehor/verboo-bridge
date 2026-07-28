@@ -144,13 +144,13 @@ test('JobQueue: result retorna resultado completo', () => {
   });
 });
 
-test('JobQueue: cancel de job na fila remove da fila', () => {
+test('JobQueue: cancel de job na fila remove da fila', async () => {
   const q = new JobQueue({ concurrency: 1 });
   const r1 = q.enqueue({ runnerData: { prompt: 'slow' } });
   const r2 = q.enqueue({ runnerData: { prompt: 'queued' } });
 
   // Cancel the queued one
-  const cancelResult = q.cancel(r2.job_id);
+  const cancelResult = await q.cancel(r2.job_id);
   assert.equal(cancelResult.status, 'cancelled');
 
   const job = q.getJob(r2.job_id);
@@ -180,7 +180,7 @@ test('JobQueue: cancel de job running aborta execucao', () => {
 
   // Cancel as soon as it starts
   q.on('started', () => {
-    setImmediate(() => q.cancel(job_id));
+    setImmediate(() => { void q.cancel(job_id); });
   });
 
   return new Promise((resolve) => {
@@ -282,18 +282,13 @@ test('JobQueue: capacidade exposta no status', () => {
   assert.equal(q.status.concurrency, 4);
 });
 
-test('JobQueue: estados terminal nao pode ser cancelado', () => {
+test('JobQueue: estados terminal nao pode ser cancelado', async () => {
   const q = new JobQueue({ concurrency: 1 });
   q.setRunner(async () => fakeResult({ summary: 'ok' }));
   const { job_id } = q.enqueue({ runnerData: { prompt: 'fast' } });
-  // Wait for it to complete
-  return new Promise((resolve) => {
-    q.on('completed', () => {
-      const result = q.cancel(job_id);
-      assert.equal(result.error, 'ALREADY_FINISHED');
-      resolve();
-    });
-  });
+  await new Promise((resolve) => q.on('completed', resolve));
+  const result = await q.cancel(job_id);
+  assert.equal(result.error, 'ALREADY_FINISHED');
 });
 
 test('JobQueue: status resource sem dados sensiveis', () => {
@@ -321,7 +316,7 @@ test('JobQueue: late-result guard nao sobrescreve cancelled', async () => {
   await new Promise((resolve) => q.on('started', resolve));
 
   // Cancela enquanto runner ainda executa
-  q.cancel(job_id);
+  await q.cancel(job_id);
   assert.equal(q.getJob(job_id).status, 'cancelled');
 
   // Runner termina tarde — não deve sobrescrever cancelled
@@ -335,7 +330,7 @@ test('JobQueue: cancel de running seta finished_at', async () => {
   q.setRunner(async () => new Promise(() => {}));
   const { job_id } = q.enqueue({ runnerData: { prompt: 'hang' } });
   await new Promise((resolve) => q.on('started', resolve));
-  q.cancel(job_id);
+  await q.cancel(job_id);
   const job = q.getJob(job_id);
   assert.equal(job.status, 'cancelled');
   assert.ok(job.finished_at, 'cancelled deve ter finished_at');
@@ -417,6 +412,182 @@ test('JobQueue: persistencia armazena apenas metadados seguros', async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+test('JobQueue: resultado duravel exige opt-in na escrita e recuperacao', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-result-'));
+  const { readFile, rm } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  q.setRunner(async () => ({
+    ...fakeResult({ output: 'Resultado proprietário.' }),
+    memory: {
+      injected_project_entries: 2,
+      injected_shared_files: 1,
+      persisted: true,
+      memory_note: 'nunca persistir esta nota',
+    },
+    warnings: [{ code: 'SAFE_WARNING', message: 'Aviso público.' }],
+  }));
+  await q.initStore(dir);
+
+  const { job_id } = await q.enqueuePersisted({
+    cwd: '/repo-secreto',
+    runnerData: { prompt: 'prompt secreto', env: { TOKEN: 'segredo' } },
+  });
+  await new Promise((resolve) => q.on('completed', resolve));
+  await q.waitForPersistence(job_id);
+
+  const file = path.join(dir, `${job_id}.json`);
+  let stored = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(stored.schema_version, 2);
+  assert.equal(stored.result.output, 'Resultado proprietário.');
+  assert.equal(stored.result.memory.persisted, true);
+  assert.equal(stored.result.memory.memory_note, undefined);
+  assert.equal(stored.result.warnings[0].code, 'SAFE_WARNING');
+  assert.equal(stored.result.warnings[0].message, undefined);
+  assert.equal(stored.cwd, undefined);
+  assert.equal(stored.prompt, undefined);
+  assert.equal(stored.runnerData, undefined);
+  assert.equal(stored.env, undefined);
+
+  const recoveredEnabled = new JobQueue({ concurrency: 1, persistResults: true });
+  await recoveredEnabled.initStore(dir);
+  assert.equal(
+    recoveredEnabled.getJobResult(job_id).result.output,
+    'Resultado proprietário.',
+  );
+
+  const recoveredDisabled = new JobQueue({ concurrency: 1, persistResults: false });
+  await recoveredDisabled.initStore(dir);
+  assert.equal(recoveredDisabled.getJobResult(job_id).result, null);
+  stored = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(stored.result, undefined);
+
+  q.dispose();
+  recoveredEnabled.dispose();
+  recoveredDisabled.dispose();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test('JobQueue: resultado duravel recupera warning failed e cancelled', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-states-'));
+  const { readFile, rm } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  await q.initStore(dir);
+  q.setRunner(async (_job, signal, data) => {
+    if (data.kind === 'warning') {
+      return { ...fakeResult({ output: 'parcial' }), status: 'warning' };
+    }
+    if (data.kind === 'failed') {
+      throw Object.assign(new Error('falha pública'), { code: 'TEST_FAILURE' });
+    }
+    await new Promise((resolve, reject) => {
+      signal.addEventListener(
+        'abort',
+        () => reject(Object.assign(new Error('cancelado'), { code: 'CANCELLED' })),
+        { once: true },
+      );
+    });
+    return fakeResult();
+  });
+
+  const warningCompleted = new Promise((resolve) => q.once('completed', resolve));
+  const warning = q.enqueue({ runnerData: { kind: 'warning' } });
+  await warningCompleted;
+  await q.waitForPersistence(warning.job_id);
+
+  const failedCompleted = new Promise((resolve) => q.once('completed', resolve));
+  const failed = q.enqueue({ runnerData: { kind: 'failed' } });
+  await failedCompleted;
+  await q.waitForPersistence(failed.job_id);
+
+  const cancelledStarted = new Promise((resolve) => q.once('started', resolve));
+  const cancelled = q.enqueue({ runnerData: { kind: 'cancelled' } });
+  await cancelledStarted;
+  await q.cancel(cancelled.job_id);
+  const cancelledStored = JSON.parse(
+    await readFile(path.join(dir, `${cancelled.job_id}.json`), 'utf8'),
+  );
+  assert.equal(
+    cancelledStored.status,
+    'cancelled',
+    'cancel só confirma depois de persistir o estado terminal',
+  );
+
+  const recovered = new JobQueue({ concurrency: 1, persistResults: true });
+  await recovered.initStore(dir);
+  assert.equal(recovered.getJobResult(warning.job_id).status, 'warning');
+  assert.equal(recovered.getJobResult(warning.job_id).result.output, 'parcial');
+  assert.equal(recovered.getJobResult(failed.job_id).status, 'failed');
+  assert.equal(recovered.getJobResult(failed.job_id).error.code, 'TEST_FAILURE');
+  assert.equal(recovered.getJobResult(failed.job_id).error.message, undefined);
+  assert.equal(recovered.getJobResult(cancelled.job_id).status, 'cancelled');
+  assert.equal(recovered.getJobResult(cancelled.job_id).result, null);
+
+  q.dispose();
+  recovered.dispose();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test('JobQueue: schema desconhecido e legado nunca recuperam resultado', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-schema-'));
+  const { randomUUID } = await import('node:crypto');
+  const { access, rm, writeFile } = await import('node:fs/promises');
+  const unknownId = randomUUID();
+  const legacyId = randomUUID();
+  const terminal = {
+    status: 'succeeded',
+    created_at: new Date().toISOString(),
+    finished_at: new Date().toISOString(),
+    result: { output: 'não recuperar' },
+  };
+  await writeFile(path.join(dir, `${unknownId}.json`), JSON.stringify({
+    app: 'verboo-bridge-job-v1',
+    schema_version: 999,
+    job_id: unknownId,
+    ...terminal,
+  }));
+  await writeFile(path.join(dir, `${legacyId}.json`), JSON.stringify({
+    job_id: legacyId,
+    ...terminal,
+  }));
+
+  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  await q.initStore(dir);
+  assert.equal(q.getJob(unknownId), null);
+  assert.equal(q.getJobResult(legacyId).result, null);
+  await access(path.join(dir, `${unknownId}.json`));
+
+  q.dispose();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test('JobQueue: falha ao gravar resultado nunca publica sucesso falso', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-failure-'));
+  const { rm } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  let release;
+  q.setRunner(async () => {
+    await new Promise((resolve) => { release = resolve; });
+    return fakeResult({ output: 'não pode virar sucesso' });
+  });
+  await q.initStore(dir);
+  const { job_id } = await q.enqueuePersisted({ runnerData: { prompt: 'x' } });
+  await new Promise((resolve) => q.once('started', resolve));
+  await chmod(dir, 0o500);
+  release();
+  await new Promise((resolve) => q.once('completed', resolve));
+
+  const result = q.getJobResult(job_id);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.result, null);
+  assert.equal(result.error.code, 'RESULT_STORE_WRITE_FAILED');
+
+  q.dispose();
+  await chmod(dir, 0o700);
+  await rm(dir, { recursive: true, force: true });
+});
+
 test('JobQueue: enqueuePersisted grava estado queued antes de responder', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-queued-store-'));
   const q = new JobQueue({ concurrency: 1 });
@@ -441,8 +612,8 @@ test('JobQueue: enqueuePersisted grava estado queued antes de responder', async 
   assert.equal(stored.status, 'queued');
   assert.equal(q.getJob(second.job_id).status, 'queued');
 
-  q.cancel(second.job_id);
-  q.cancel(first.job_id);
+  await q.cancel(second.job_id);
+  await q.cancel(first.job_id);
   q.dispose();
   await Promise.all([
     q.waitForPersistence(first.job_id),
@@ -556,4 +727,221 @@ test('JobQueue: listJobs nao expoe cwd', async () => {
   await new Promise((resolve) => q.on('completed', resolve));
   const jobs = q.listJobs();
   assert.equal(jobs[0].cwd, undefined, 'listJobs nao deve expor cwd');
+});
+
+// ── Progress / Heartbeat ────────────────────────────────────────────────
+
+test('JobQueue: getJob inclui campos de progresso para job ativo', async () => {
+  const q = new JobQueue({ concurrency: 1 });
+  let resolveRunner;
+  q.setRunner(async () => new Promise((r) => { resolveRunner = r; }));
+  const { job_id } = q.enqueue({ runnerData: { prompt: 'progress' } });
+
+  // Job ainda na fila
+  let status = q.getJob(job_id);
+  assert.equal(status.phase, 'queued');
+  assert.equal(typeof status.elapsed_ms, 'number');
+  assert.equal(status.last_activity_at, status.updated_at);
+  assert.ok(status.queue_position > 0);
+  assert.deepEqual(status.attempts, { current: 0, total: 1 });
+  assert.equal(typeof status.progress_summary, 'string');
+
+  // Deixa executar e verifica fase 'routing'
+  await new Promise((resolve) => q.on('started', resolve));
+  status = q.getJob(job_id);
+  assert.equal(status.phase, 'routing');
+  assert.equal(status.queue_position, 0);
+
+  resolveRunner();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+});
+
+test('JobQueue: progresso tem tool_counts enquanto ativo e limpa no terminal', async () => {
+  const q = new JobQueue({ concurrency: 1 });
+  let release;
+  q.setRunner(async (_job, _signal, _data, onProgress) => {
+    onProgress({
+      tool_counts: {
+        Read: { total: 1, succeeded: 0, failed: 0 },
+        Edit: { total: 1, succeeded: 0, failed: 0 },
+        Glob: { total: 1, succeeded: 0, failed: 0 },
+        total: { total: 3, succeeded: 0, failed: 0 },
+      },
+    });
+    await new Promise((resolve) => { release = resolve; });
+    return {
+    status: 'succeeded',
+    finished_at: new Date().toISOString(),
+    summary: 'Done',
+    result: 'ok',
+    tools_used: ['read', 'edit', 'glob'],
+    };
+  });
+  const { job_id } = q.enqueue({ runnerData: { prompt: 'tools' } });
+  await new Promise((resolve) => q.on('started', resolve));
+  const active = q.getJob(job_id);
+  assert.equal(active.tool_counts.total.total, 3);
+  assert.equal(active.tool_counts.Read.total, 1);
+  assert.equal(active.tool_counts.Edit.total, 1);
+  assert.equal(active.tool_counts.Glob.total, 1);
+  release();
+  await new Promise((resolve) => q.on('completed', resolve));
+  const result = q.getJobResult(job_id);
+  assert.equal(result.tool_counts, undefined);
+  assert.equal(result.phase, undefined);
+  assert.equal(result.queue_position, null);
+});
+
+test('JobQueue: queue_position 0 running positivo queued null terminal', async () => {
+  const q = new JobQueue({ concurrency: 1 });
+  let release;
+  q.setRunner(async () => new Promise((r) => { release = r; }));
+  const r1 = q.enqueue({ runnerData: { prompt: 'a' } });
+  const r2 = q.enqueue({ runnerData: { prompt: 'b' } });
+
+  await new Promise((resolve) => q.on('started', resolve));
+  assert.equal(q.getJob(r1.job_id).queue_position, 0);
+  assert.equal(q.getJob(r2.job_id).queue_position, 1);
+
+  release?.();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(q.getJob(r1.job_id).queue_position, null);
+});
+
+test('JobQueue: listJobs nao expoe campos de progresso', async () => {
+  const q = new JobQueue({ concurrency: 1 });
+  q.setRunner(async () => ({
+    status: 'succeeded',
+    finished_at: new Date().toISOString(),
+    summary: 'ok',
+    result: 'ok',
+    tools_used: ['read'],
+  }));
+  const { job_id } = q.enqueue({ runnerData: { prompt: 'list-no-progress' } });
+  await new Promise((resolve) => q.on('completed', resolve));
+  const jobs = q.listJobs();
+  const j = jobs.find((x) => x.job_id === job_id);
+  assert.ok(j);
+  assert.equal(j.phase, undefined);
+  assert.equal(j.elapsed_ms, undefined);
+  assert.equal(j.tool_counts, undefined);
+  assert.equal(j.progress_summary, undefined);
+});
+
+test('JobQueue: progresso limpo ao cancelar', async () => {
+  const q = new JobQueue({ concurrency: 1 });
+  q.setRunner(async () => new Promise(() => {}));
+  const { job_id } = q.enqueue({ runnerData: { prompt: 'cancel-progress' } });
+  await new Promise((resolve) => q.on('started', resolve));
+  assert.ok(q.getJob(job_id).phase);
+  await q.cancel(job_id);
+  assert.equal(q.getJob(job_id).phase, undefined);
+});
+
+test('JobQueue: progresso limpo ao fazer dispose', async () => {
+  const q = new JobQueue({ concurrency: 1 });
+  q.setRunner(async () => new Promise(() => {}));
+  const { job_id } = q.enqueue({ runnerData: { prompt: 'dispose-progress' } });
+  await new Promise((resolve) => q.on('started', resolve));
+  q.dispose();
+  assert.equal(q.getJob(job_id).phase, undefined);
+});
+
+test('JobQueue: progress_summary gerado a partir da fase e contadores', async () => {
+  const q = new JobQueue({ concurrency: 1 });
+  let release;
+  q.setRunner(async (_job, _signal, _data, onProgress) => {
+    onProgress({
+      phase: 'generating',
+      model: 'glm-5.2',
+      tool_counts: {
+        Read: { total: 2, succeeded: 0, failed: 0 },
+        Edit: { total: 1, succeeded: 0, failed: 0 },
+        Glob: { total: 1, succeeded: 0, failed: 0 },
+        Bash: { total: 1, succeeded: 0, failed: 0 },
+        total: { total: 5, succeeded: 0, failed: 0 },
+      },
+    });
+    await new Promise((resolve) => { release = resolve; });
+    return {
+      status: 'succeeded',
+      finished_at: new Date().toISOString(),
+      summary: 'Done',
+      result: 'ok',
+      tools_used: ['read', 'read', 'edit', 'glob', 'bash'],
+    };
+  });
+  const { job_id } = q.enqueue({ model: 'glm-5.2', runnerData: { prompt: 'summary' } });
+  await new Promise((resolve) => q.on('started', resolve));
+  const status = q.getJob(job_id);
+  assert.ok(typeof status.progress_summary === 'string');
+  assert.ok(status.progress_summary.length > 0);
+  assert.ok(status.progress_summary.length <= 200);
+  assert.match(status.progress_summary, /Modelo: glm-5\.2/);
+  assert.match(status.progress_summary, /Ferramentas: 0\/5 sucesso/);
+  release();
+  await new Promise((resolve) => q.on('completed', resolve));
+  assert.equal(q.getJob(job_id).progress_summary, undefined);
+});
+
+test('JobQueue: getJob expoe updated_at no progresso', async () => {
+  const q = new JobQueue({ concurrency: 1 });
+  q.setRunner(async () => ({ status: 'succeeded', finished_at: new Date().toISOString(), summary: 'ok' }));
+  const { job_id } = q.enqueue({ runnerData: { prompt: 'updated_at' } });
+  const status = q.getJob(job_id);
+  assert.ok(status.updated_at, 'deve expor updated_at');
+  assert.equal(status.updated_at, status.last_activity_at);
+  await new Promise((resolve) => q.on('completed', resolve));
+});
+
+test('JobQueue: runnerData original nao contem __onProgress apos enqueue', () => {
+  const q = new JobQueue({ concurrency: 1 });
+  const original = { prompt: 'segredo' };
+  const { job_id } = q.enqueue({ runnerData: original });
+  assert.equal(original.__onProgress, undefined, 'runnerData original nao deve conter __onProgress');
+});
+
+test('JobQueue: heartbeat relata silencio como idle e atividade restaura fase', async () => {
+  const q = new JobQueue({ concurrency: 1, heartbeatMs: 10 });
+  let release;
+  let report;
+  q.setRunner(async (_job, _signal, _data, onProgress) => {
+    report = onProgress;
+    onProgress({ phase: 'generating' });
+    return new Promise((r) => { release = r; });
+  });
+  const { job_id } = q.enqueue({ runnerData: { prompt: 'idle-guard' } });
+  await new Promise((resolve) => q.on('started', resolve));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  let progress = q.getJob(job_id);
+  assert.equal(progress.phase, 'idle');
+  assert.ok(progress.idle_for_ms >= 10);
+
+  report({ phase: 'executing_tool' });
+  progress = q.getJob(job_id);
+  assert.equal(progress.phase, 'executing_tool');
+  assert.equal(progress.idle_for_ms, null);
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+});
+
+test('JobQueue: cancelamento com falha de persistência não expõe status de cancelado confirmado', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-cancel-write-fail-'));
+  const { rm } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1 });
+  q.setRunner(async () => new Promise(() => {}));
+  await q.initStore(dir);
+  const { job_id } = q.enqueue({ runnerData: { prompt: 'cancel-fail' } });
+  await chmod(dir, 0o500);
+
+  const res = await q.cancel(job_id);
+  assert.equal(res.status, undefined, 'não deve confirmar status cancelled');
+  assert.equal(res.error, 'JOB_STORE_WRITE_FAILED');
+  assert.match(res.message, /não pôde ser persistido/);
+
+  q.dispose();
+  await chmod(dir, 0o700);
+  await rm(dir, { recursive: true, force: true });
 });

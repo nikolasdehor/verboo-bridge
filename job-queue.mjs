@@ -21,12 +21,60 @@ const MAX_RESULTS_HARD = 500;
 const MAX_QUEUED_HARD = 500;
 const DEFAULT_PRUNE_INTERVAL_MS = 60_000;
 const STORE_MARKER = 'verboo-bridge-job-v1';
+const STORE_SCHEMA_VERSION = 2;
 const VALID_STATUSES = new Set([
   'queued', 'running', 'succeeded', 'warning', 'failed', 'cancelled',
 ]);
 const TERMINAL_STATUSES = new Set([
   'succeeded', 'warning', 'failed', 'cancelled',
 ]);
+
+const PROGRESS_PHASES = new Set([
+  'queued', 'routing', 'generating', 'executing_tool', 'processing_result', 'idle',
+]);
+const HEARTBEAT_MS = 5000;
+const PROGRESS_SUMMARY_MAX = 200;
+const TOOL_CATEGORIES = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', 'Other'];
+
+function createToolCounts() {
+  const cats = {};
+  for (const cat of TOOL_CATEGORIES) {
+    cats[cat] = { total: 0, succeeded: 0, failed: 0 };
+  }
+  cats.total = { total: 0, succeeded: 0, failed: 0 };
+  return cats;
+}
+
+function mergeToolCounts(target, update) {
+  for (const cat of [...TOOL_CATEGORIES, 'total']) {
+    for (const key of ['total', 'succeeded', 'failed']) {
+      if (update[cat]?.[key] !== undefined) {
+        target[cat][key] = update[cat][key];
+      }
+    }
+  }
+}
+
+function generateSummary(progress) {
+  const parts = [];
+  switch (progress.phase) {
+    case 'queued': parts.push('Aguardando na fila.'); break;
+    case 'routing': parts.push('Selecionando modelo.'); break;
+    case 'generating': parts.push('Gerando resposta.'); break;
+    case 'executing_tool': parts.push('Executando ferramentas.'); break;
+    case 'processing_result': parts.push('Processando resultado.'); break;
+    case 'idle': parts.push('Sem atividade.'); break;
+    default: parts.push(`Fase: ${progress.phase}.`);
+  }
+  if (progress.model) parts.push(`Modelo: ${progress.model}.`);
+  if (progress.attempts?.total > 0) {
+    parts.push(`Tentativa ${progress.attempts.current}/${progress.attempts.total}.`);
+  }
+  const tc = progress.tool_counts.total;
+  if (tc.total > 0) parts.push(`Ferramentas: ${tc.succeeded}/${tc.total} sucesso.`);
+  const summary = parts.join(' ');
+  return summary.length <= PROGRESS_SUMMARY_MAX ? summary : summary.slice(0, PROGRESS_SUMMARY_MAX - 3) + '...';
+}
 
 function nowISO() { return new Date().toISOString(); }
 
@@ -48,6 +96,51 @@ function configuredTTL(envVar, fallback) {
 
 function safeJSON(val, fallback) {
   try { return JSON.parse(val); } catch { return fallback; }
+}
+
+async function enforcePrivateMode(target, mode) {
+  if (process.platform !== 'win32') await chmod(target, mode);
+}
+
+function safeError(error) {
+  if (!error || typeof error !== 'object') return null;
+  return {
+    code: typeof error.code === 'string' ? error.code : 'UNKNOWN',
+  };
+}
+
+function safeStringList(value) {
+  return Array.isArray(value)
+    ? value.filter((item) => typeof item === 'string')
+    : [];
+}
+
+function safeTerminalResult(result) {
+  if (!result || typeof result !== 'object') return null;
+  const memory = result.memory && typeof result.memory === 'object'
+    ? {
+        injected_project_entries: Number(result.memory.injected_project_entries) || 0,
+        injected_shared_files: Number(result.memory.injected_shared_files) || 0,
+        persisted: result.memory.persisted === true,
+        ...(result.memory.warning
+          ? { warning: safeError(result.memory.warning) }
+          : {}),
+      }
+    : null;
+  return {
+    summary: typeof result.summary === 'string' ? result.summary : '',
+    output: typeof result.output === 'string' ? result.output : '',
+    next_actions: safeStringList(result.next_actions),
+    artifacts: safeStringList(result.artifacts),
+    tools_used: safeStringList(result.tools_used),
+    session_id: typeof result.session_id === 'string' ? result.session_id : null,
+    memory,
+    warnings: Array.isArray(result.warnings)
+      ? result.warnings
+          .map((warning) => safeError(warning))
+          .filter(Boolean)
+      : [],
+  };
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -76,18 +169,30 @@ async function loadStoredRecord(storeDir, file) {
     return null;
   }
   if (!VALID_STATUSES.has(record.status)) return null;
+  if (
+    record.schema_version !== undefined
+    && (
+      record.schema_version !== STORE_SCHEMA_VERSION
+      || record.app !== STORE_MARKER
+    )
+  ) {
+    return null;
+  }
   return record;
 }
 
-function recoverStoredRecord(record) {
+function recoverStoredRecord(record, persistResults) {
   const timestamp = nowISO();
   const isPending = record.status === 'queued' || record.status === 'running';
-  let error = null;
-  if (isPending) {
-    error = { code: 'RESTART' };
-  } else if (record.status === 'failed' && record.error?.code) {
-    error = { code: record.error.code };
-  }
+  const canRecoverTerminal = (
+    persistResults
+    && record.schema_version === STORE_SCHEMA_VERSION
+    && record.app === STORE_MARKER
+    && !isPending
+  );
+  const error = isPending
+    ? { code: 'RESTART' }
+    : safeError(record.error);
 
   return {
     job_id: record.job_id,
@@ -100,7 +205,7 @@ function recoverStoredRecord(record) {
       : validTimestamp(record.finished_at, timestamp),
     model: record.model ?? null,
     executor: record.executor ?? null,
-    result: null,
+    result: canRecoverTerminal ? safeTerminalResult(record.result) : null,
     error,
   };
 }
@@ -131,10 +236,14 @@ export class JobQueue extends EventEmitter {
   #maxResults;
   #maxQueued;
   #storeDir;
+  #persistResults;
   #runnerData = new Map();
   #storeTails = new Map();
   #pruneTimer;
   #disposed = false;
+  #progress = new Map();
+  #heartbeats = new Map();
+  #heartbeatMs;
 
   constructor(options = {}) {
     super();
@@ -147,6 +256,9 @@ export class JobQueue extends EventEmitter {
     this.#resultTtl = options.resultTtl ?? configuredTTL('VERBOO_JOB_RESULT_TTL_MS', DEFAULT_RESULT_TTL_MS);
     this.#maxResults = options.maxResults ?? configuredMax('VERBOO_JOB_MAX_RESULTS', 100, MAX_RESULTS_HARD);
     this.#maxQueued = options.maxQueued ?? configuredMax('VERBOO_JOB_MAX_QUEUED', 50, MAX_QUEUED_HARD);
+    this.#persistResults = options.persistResults
+      ?? process.env.VERBOO_JOB_PERSIST_RESULTS === '1';
+    this.#heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS;
     this.#startPruneTimer(options.pruneIntervalMs ?? DEFAULT_PRUNE_INTERVAL_MS);
   }
 
@@ -184,6 +296,7 @@ export class JobQueue extends EventEmitter {
     this.#running.clear();
     this.#queue = [];
     this.#runnerData.clear();
+    for (const jobId of this.#progress.keys()) this.#clearProgress(jobId);
   }
 
   get capacity() {
@@ -207,6 +320,7 @@ export class JobQueue extends EventEmitter {
       ttl_ms: this.#ttl,
       result_ttl_ms: this.#resultTtl,
       store_dir: this.#storeDir ?? false,
+      persist_results: Boolean(this.#storeDir && this.#persistResults),
       runner_data_retained: this.#runnerData.size,
       disposed: this.#disposed,
     };
@@ -235,6 +349,7 @@ export class JobQueue extends EventEmitter {
     this.#prune();
     const job = this.#jobs.get(jobId);
     if (!job) return null;
+    const terminal = TERMINAL_STATUSES.has(job.status);
     return {
       job_id: job.job_id,
       status: job.status,
@@ -244,6 +359,8 @@ export class JobQueue extends EventEmitter {
       finished_at: job.finished_at,
       model: job.model,
       executor: job.executor,
+      ...this.#progressFields(jobId),
+      ...(terminal ? { queue_position: null } : {}),
     };
   }
 
@@ -251,6 +368,7 @@ export class JobQueue extends EventEmitter {
     this.#prune();
     const job = this.#jobs.get(jobId);
     if (!job) return null;
+    const terminal = TERMINAL_STATUSES.has(job.status);
     return {
       job_id: job.job_id,
       status: job.status,
@@ -262,6 +380,8 @@ export class JobQueue extends EventEmitter {
       executor: job.executor,
       result: job.result,
       error: job.error,
+      ...this.#progressFields(jobId),
+      ...(terminal ? { queue_position: null } : {}),
     };
   }
 
@@ -278,6 +398,7 @@ export class JobQueue extends EventEmitter {
     this.#jobs.set(job.job_id, job);
     this.#queue.push(job.job_id);
     if (runnerData) this.#runnerData.set(job.job_id, runnerData);
+    this.#initProgress(job.job_id, { queuePosition: this.#queue.length, model: job.model });
     this.emit('enqueued', job.job_id);
 
     const persistence = this.#persistJob(job);
@@ -295,6 +416,7 @@ export class JobQueue extends EventEmitter {
         };
         this.#queue = this.#queue.filter((id) => id !== job.job_id);
         this.#runnerData.delete(job.job_id);
+        this.#clearProgress(job.job_id);
         this.emit('completed', job.job_id);
       });
 
@@ -320,7 +442,7 @@ export class JobQueue extends EventEmitter {
     await (this.#storeTails.get(jobId) ?? Promise.resolve());
   }
 
-  cancel(jobId) {
+  async cancel(jobId) {
     const job = this.#jobs.get(jobId);
     if (!job) return { error: 'NOT_FOUND', message: 'Job não encontrado.' };
     if (job.status === 'cancelled' || job.status === 'failed' || job.status === 'succeeded' || job.status === 'warning') {
@@ -339,7 +461,18 @@ export class JobQueue extends EventEmitter {
       this.#queue = this.#queue.filter((id) => id !== jobId);
     }
 
-    this.#persistJob(job).catch(() => {});
+    this.#clearProgress(jobId);
+    try {
+      // Só confirma cancelamento ao chamador depois do rename atômico. Assim,
+      // um crash nunca recupera sucesso após um cancelamento já confirmado.
+      await this.#persistJob(job);
+    } catch {
+      return {
+        job_id: jobId,
+        error: 'JOB_STORE_WRITE_FAILED',
+        message: 'Cancelado em memória, mas o estado não pôde ser persistido.',
+      };
+    }
     this.emit('cancelled', jobId);
     return { job_id: jobId, status: 'cancelled' };
   }
@@ -359,10 +492,12 @@ export class JobQueue extends EventEmitter {
       this.#running.set(jobId, { controller });
 
       this.#persistJob(job).catch(() => {});
+      this.#updateProgress(jobId, { phase: 'routing' });
+      this.#startHeartbeat(jobId);
 
       this.emit('started', jobId);
 
-      this.#executeJob(job, controller.signal).then((result) => {
+      this.#executeJob(job, controller.signal).then(async (result) => {
         this.#running.delete(jobId);
 
         // Late-result guard: cancel() externo já marcou cancelled —
@@ -372,12 +507,40 @@ export class JobQueue extends EventEmitter {
           return;
         }
 
-        Object.assign(job, result);
-        job.updated_at = nowISO();
-
         this.#runnerData.delete(jobId);
 
-        this.#persistJob(job).catch(() => {});
+        this.#updateProgress(jobId, {
+          phase: 'processing_result',
+          model: result.model ?? job.model,
+          queue_position: null,
+        });
+        this.#stopHeartbeat(jobId);
+
+        const completed = { ...job, ...result, updated_at: nowISO() };
+        try {
+          // Com resultados duráveis, o job continua "running" e não emite
+          // completed até o rename atômico confirmar o estado terminal.
+          await this.#persistJob(completed);
+        } catch {
+          if (this.#storeDir && this.#persistResults) {
+            Object.assign(completed, {
+              status: 'failed',
+              result: null,
+              finished_at: nowISO(),
+              updated_at: nowISO(),
+              error: {
+                code: 'RESULT_STORE_WRITE_FAILED',
+                message: 'O resultado terminal não pôde ser persistido.',
+              },
+            });
+            await this.#persistJob(completed).catch(() => {});
+          }
+        }
+
+        // cancel() pode vencer a corrida enquanto o resultado era persistido.
+        if (job.status === 'cancelled') return;
+        Object.assign(job, completed);
+        this.#clearProgress(jobId);
         this.emit('completed', jobId);
         if (!this.#disposed) this.#drain();
       });
@@ -386,8 +549,12 @@ export class JobQueue extends EventEmitter {
 
   async #executeJob(job, signal) {
     const runnerData = this.#runnerData.get(job.job_id) ?? {};
+    const onProgress = (update) => this.#updateProgress(job.job_id, update);
+    const progressRunnerData = (typeof runnerData === 'object' && runnerData !== null)
+      ? { ...runnerData, __onProgress: onProgress }
+      : runnerData;
     try {
-      const result = await this.#runFn(job, signal, runnerData);
+      const result = await this.#runFn(job, signal, progressRunnerData, onProgress);
       if (signal.aborted) {
         throw Object.assign(new Error('Job cancelado.'), { code: 'CANCELLED' });
       }
@@ -426,16 +593,16 @@ export class JobQueue extends EventEmitter {
     if (!storeDir) return;
     this.#storeDir = storeDir;
     await mkdir(storeDir, { recursive: true, mode: 0o700 });
-    await chmod(storeDir, 0o700);
+    await enforcePrivateMode(storeDir, 0o700);
 
     const files = await readdir(storeDir).catch(() => []);
     for (const file of files) {
       const record = await loadStoredRecord(storeDir, file);
       if (!record) continue;
 
-      const safe = recoverStoredRecord(record);
+      const safe = recoverStoredRecord(record, this.#persistResults);
       this.#jobs.set(safe.job_id, safe);
-      // Reescreve imediatamente usando o mesmo schema mínimo da persistência normal.
+      // Reescreve no schema atual; com opt-in desligado, remove qualquer resultado.
       await this.#persistJob(safe);
     }
   }
@@ -444,6 +611,7 @@ export class JobQueue extends EventEmitter {
     if (!this.#storeDir) return;
     const safe = {
       app: STORE_MARKER,
+      schema_version: STORE_SCHEMA_VERSION,
       job_id: job.job_id,
       status: job.status,
       created_at: job.created_at,
@@ -452,7 +620,12 @@ export class JobQueue extends EventEmitter {
       finished_at: job.finished_at,
       model: job.model,
       executor: job.executor,
-      error: job.error ? { code: job.error.code } : null,
+      error: safeError(job.error),
+      ...(
+        this.#persistResults && TERMINAL_STATUSES.has(job.status)
+          ? { result: safeTerminalResult(job.result) }
+          : {}
+      ),
     };
     await this.#serializeStore(job.job_id, async () => {
       const filePath = path.join(this.#storeDir, `${job.job_id}.json`);
@@ -462,7 +635,7 @@ export class JobQueue extends EventEmitter {
       );
       try {
         await writeFile(temporaryPath, JSON.stringify(safe), { mode: 0o600 });
-        await chmod(temporaryPath, 0o600);
+        await enforcePrivateMode(temporaryPath, 0o600);
         await rename(temporaryPath, filePath);
       } finally {
         await unlink(temporaryPath).catch(() => {});
@@ -515,6 +688,7 @@ export class JobQueue extends EventEmitter {
   #deleteJob(jobId) {
     this.#jobs.delete(jobId);
     this.#runnerData.delete(jobId);
+    this.#clearProgress(jobId);
     this.#removeStore(jobId).catch(() => {});
   }
 
@@ -524,6 +698,100 @@ export class JobQueue extends EventEmitter {
       const filePath = path.join(this.#storeDir, `${jobId}.json`);
       await unlink(filePath).catch(() => {});
     });
+  }
+
+  #initProgress(jobId, opts = {}) {
+    const now = Date.now();
+    const progress = {
+      phase: 'queued',
+      updated_at: new Date(now).toISOString(),
+      elapsed_ms: 0,
+      last_activity_at: new Date(now).toISOString(),
+      idle_for_ms: null,
+      queue_position: opts.queuePosition ?? null,
+      attempts: { current: 0, total: opts.totalAttempts ?? 1 },
+      model: opts.model ?? null,
+      tool_counts: createToolCounts(),
+      progress_summary: 'Aguardando na fila.',
+      _started_at: now,
+    };
+    this.#progress.set(jobId, progress);
+  }
+
+  #updateProgress(jobId, update) {
+    const p = this.#progress.get(jobId);
+    if (!p) return;
+    const now = Date.now();
+    if (update.phase !== undefined) p.phase = update.phase;
+    if (update.model !== undefined) p.model = update.model;
+    if (update.attempts !== undefined) Object.assign(p.attempts, update.attempts);
+    if (update.tool_counts !== undefined) mergeToolCounts(p.tool_counts, update.tool_counts);
+    if (update.queue_position !== undefined) p.queue_position = update.queue_position;
+    p.updated_at = new Date(now).toISOString();
+    p.last_activity_at = p.updated_at;
+    if (p.phase !== 'idle') p.idle_for_ms = null;
+    p.elapsed_ms = now - p._started_at;
+    p.progress_summary = generateSummary(p);
+  }
+
+  #heartbeatTick(jobId) {
+    const p = this.#progress.get(jobId);
+    if (!p) return;
+    const now = Date.now();
+    p.updated_at = new Date(now).toISOString();
+    p.elapsed_ms = now - p._started_at;
+    if (p.last_activity_at) {
+      const idleMs = now - new Date(p.last_activity_at).getTime();
+      if (idleMs >= this.#heartbeatMs) {
+        p.idle_for_ms = idleMs;
+        p.phase = 'idle';
+        p.progress_summary = generateSummary(p);
+      }
+    }
+  }
+
+  #startHeartbeat(jobId) {
+    this.#stopHeartbeat(jobId);
+    const timer = setInterval(() => this.#heartbeatTick(jobId), this.#heartbeatMs);
+    timer.unref();
+    this.#heartbeats.set(jobId, timer);
+  }
+
+  #stopHeartbeat(jobId) {
+    const timer = this.#heartbeats.get(jobId);
+    if (timer) clearInterval(timer);
+    this.#heartbeats.delete(jobId);
+  }
+
+  #clearProgress(jobId) {
+    this.#stopHeartbeat(jobId);
+    this.#progress.delete(jobId);
+  }
+
+  #queuePosition(jobId) {
+    const job = this.#jobs.get(jobId);
+    if (!job) return null;
+    if (TERMINAL_STATUSES.has(job.status)) return null;
+    if (this.#running.has(jobId)) return 0;
+    const idx = this.#queue.indexOf(jobId);
+    return idx >= 0 ? idx + 1 : null;
+  }
+
+  #progressFields(jobId) {
+    if (!this.#progress.has(jobId)) return {};
+    const p = this.#progress.get(jobId);
+    return {
+      phase: p.phase,
+      elapsed_ms: p.elapsed_ms,
+      updated_at: p.updated_at,
+      last_activity_at: p.last_activity_at,
+      idle_for_ms: p.idle_for_ms,
+      queue_position: this.#queuePosition(jobId),
+      attempts: p.attempts,
+      tool_counts: p.tool_counts,
+      progress_summary: p.progress_summary,
+      ...(p.model ? { model: p.model } : {}),
+    };
   }
 
   #runFn = async () => ({ status: 'succeeded', summary: 'No runner set.' });

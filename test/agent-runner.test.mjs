@@ -7,10 +7,13 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import {
+  assertGlobalModelAllowed,
   buildOpenCodeInvocation,
+  buildProgressOnLine,
   buildVerbooCodeInvocation,
   buildChildEnv,
   formatAgentFailure,
+  globallyAllowedModels,
   normalizeAgentRequest,
   parseOpenCodeEvents,
   parseVerbooCodeEvents,
@@ -968,6 +971,24 @@ test('modelo manual respeita allowlist e tiers administrativos', async () => {
   );
 });
 
+test('denylist global filtra seleção automática e rejeita seleção manual', () => {
+  const env = {
+    VERBOO_MODEL_DENYLIST: 'qwen3.6-27b,glm-4.7-flash',
+  };
+
+  assert.deepEqual(
+    globallyAllowedModels(
+      ['deepseek-v4-flash', 'qwen3.6-27b', 'glm-4.7-flash'],
+      env,
+    ),
+    ['deepseek-v4-flash'],
+  );
+  assert.throws(
+    () => assertGlobalModelAllowed('qwen3.6-27b', env),
+    (error) => error.code === 'MODEL_NOT_ALLOWED' && /DENYLIST/.test(error.message),
+  );
+});
+
 test('allowlist por executor impede fallback silencioso do OAuth nativo', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-models-'));
 
@@ -1411,6 +1432,8 @@ test('fechamento do processo direto após TERM não cancela KILL do grupo POSIX'
 }, async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-orphan-group-'));
   const signals = [];
+  let forceKilled;
+  const didForceKill = new Promise((resolve) => { forceKilled = resolve; });
   let child;
   const spawnImpl = () => {
     child = new EventEmitter();
@@ -1424,6 +1447,7 @@ test('fechamento do processo direto após TERM não cancela KILL do grupo POSIX'
   const killImpl = (pid, signal) => {
     signals.push([pid, signal]);
     if (signal === 'SIGTERM') setImmediate(() => child.emit('close', null));
+    if (signal === 'SIGKILL') forceKilled();
   };
 
   await assert.rejects(
@@ -1449,6 +1473,8 @@ test('fechamento do processo direto após TERM não cancela KILL do grupo POSIX'
     (error) => error.code === 'OUTPUT_LIMIT',
   );
 
+  assert.deepEqual(signals, [[-54321, 'SIGTERM']]);
+  await didForceKill;
   assert.deepEqual(signals, [
     [-54321, 'SIGTERM'],
     [-54321, 'SIGKILL'],
@@ -1610,4 +1636,527 @@ test('runVerbooAgent propaga cancelamento ao subprocesso', {
     [-65432, 'SIGTERM'],
     [-65432, 'SIGKILL'],
   ]);
+});
+
+test('cancelamento fecha a execução mesmo quando child nunca emite close', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-hard-settle-'));
+  const controller = new AbortController();
+  const signals = [];
+  let started;
+  const didStart = new Promise((resolve) => { started = resolve; });
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.pid = 76543;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    started();
+    return child;
+  };
+
+  const running = runVerbooAgent(
+    {
+      prompt: 'aguarde', cwd: base, executor: 'opencode', mode: 'read_only', model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base, VERBOO_API_KEY: 'test-key' },
+      spawnImpl,
+      killImpl: (pid, signal) => { signals.push([pid, signal]); },
+      killGraceMs: 0,
+      signal: controller.signal,
+    },
+  );
+
+  await didStart;
+  controller.abort();
+  await assert.rejects(running, (error) => error.code === 'CANCELLED');
+  assert.deepEqual(signals, [[-76543, 'SIGTERM'], [-76543, 'SIGKILL']]);
+});
+
+test('close após SIGTERM rejeita sem aguardar SIGKILL', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-term-close-'));
+  const controller = new AbortController();
+  const signals = [];
+  let started;
+  const didStart = new Promise((resolve) => { started = resolve; });
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === 'SIGTERM') child.emit('close', null);
+      return true;
+    };
+    started();
+    return child;
+  };
+
+  const running = runVerbooAgent(
+    {
+      prompt: 'aguarde', cwd: base, executor: 'opencode', mode: 'read_only', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base, VERBOO_API_KEY: 'test-key' },
+      spawnImpl,
+      killGraceMs: 0,
+      signal: controller.signal,
+    },
+  );
+
+  await didStart;
+  controller.abort();
+  await assert.rejects(running, (error) => error.code === 'CANCELLED');
+  assert.deepEqual(signals, ['SIGTERM']);
+});
+
+test('close tardio não altera o resultado já encerrado', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-late-close-'));
+  const controller = new AbortController();
+  const signals = [];
+  let child;
+  let started;
+  const didStart = new Promise((resolve) => { started = resolve; });
+  const spawnImpl = () => {
+    child = new EventEmitter();
+    child.pid = 87654;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    started();
+    return child;
+  };
+
+  const running = runVerbooAgent(
+    {
+      prompt: 'aguarde', cwd: base, executor: 'opencode', mode: 'read_only', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base, VERBOO_API_KEY: 'test-key' },
+      spawnImpl,
+      killImpl: (pid, signal) => { signals.push([pid, signal]); },
+      killGraceMs: 0,
+      signal: controller.signal,
+    },
+  );
+
+  await didStart;
+  controller.abort();
+  await assert.rejects(running, (error) => error.code === 'CANCELLED');
+  child.emit('close', 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(signals, [[-87654, 'SIGTERM'], [-87654, 'SIGKILL']]);
+});
+
+test('timeout seguido de abort antes do hard-settle encerra uma única vez', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-abort-timeout-race-'));
+  const controller = new AbortController();
+  const signals = [];
+  let abortFired = false;
+  let started;
+  const didStart = new Promise((resolve) => { started = resolve; });
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.pid = 98765;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    started();
+    return child;
+  };
+
+  const running = runVerbooAgent(
+    {
+      prompt: 'aguarde', cwd: base, executor: 'opencode', mode: 'read_only', model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base, VERBOO_API_KEY: 'test-key' },
+      spawnImpl,
+      killImpl: (pid, signal) => { signals.push([pid, signal]); },
+      killGraceMs: 0,
+      timeoutMs: 0,
+      signal: controller.signal,
+    },
+  );
+
+  await didStart;
+  setTimeout(() => {
+    abortFired = true;
+    controller.abort();
+  }, 0);
+  await assert.rejects(running, (error) => error.code === 'TIMEOUT');
+  assert.equal(abortFired, true);
+  assert.deepEqual(signals, [[-98765, 'SIGTERM'], [-98765, 'SIGKILL']]);
+});
+
+// ── Progress / onProgress ───────────────────────────────────────────────
+
+test('onProgress recebe routing e generating em execucao bem-sucedida', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-onprogress-ok-'));
+  const phases = [];
+  let spawned = false;
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    spawned = true;
+    setImmediate(() => {
+      child.stdout.end(`${JSON.stringify({
+        type: 'text',
+        sessionID: 'ses_progress',
+        part: { text: 'Concluído.' },
+      })}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  await runVerbooAgent(
+    {
+      prompt: 'Revise o código.',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      model: 'auto',
+      timeout_seconds: 10,
+      // Simula o __onProgress que JobQueue injeta via #executeJob
+      get __onProgress() {
+        return (update) => { phases.push(update); };
+      },
+    },
+    {
+      availableModels: ['deepseek-v4-flash', 'glm-5.2'],
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_API_KEY: 'test-key',
+        VERBOO_AGENT_MAX_MODEL_ATTEMPTS: '1',
+      },
+      spawnImpl,
+    },
+  );
+
+  assert.ok(phases.length >= 2, 'deve ter pelo menos 2 chamadas onProgress');
+  assert.equal(phases[0].phase, 'routing');
+  const generating = phases.find((p) => p.phase === 'generating');
+  assert.ok(generating, 'deve ter fase generating');
+  assert.ok(generating.model, 'generating deve ter model');
+  assert.ok(generating.attempts, 'generating deve ter attempts');
+  assert.equal(generating.attempts.current, 1);
+  assert.equal(generating.attempts.total, 1);
+});
+
+test('onProgress nao afeta execucao quando ausente', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-onprogress-missing-'));
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.end(`${JSON.stringify({
+        type: 'text',
+        sessionID: 'ses_no_op',
+        part: { text: 'Ok.' },
+      })}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const result = await runVerbooAgent(
+    { prompt: 'Ok.', cwd: base, executor: 'opencode', mode: 'read_only', timeout_seconds: 10 },
+    {
+      availableModels: ['deepseek-v4-flash', 'glm-5.2'],
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base, VERBOO_API_KEY: 'test-key' },
+      spawnImpl,
+    },
+  );
+  assert.equal(result.status, 'success');
+});
+
+test('onProgress recebe executing_tool e processing_result', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-onprogress-phases-'));
+  const updates = [];
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.end(`${JSON.stringify({
+        type: 'text',
+        sessionID: 'ses_full',
+        part: { text: 'Análise completa.' },
+      })}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  await runVerbooAgent(
+    {
+      prompt: 'Analise o código.',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      model: 'deepseek-v4-flash',
+      timeout_seconds: 10,
+      __onProgress: (update) => { updates.push(update); },
+    },
+    {
+      availableModels: ['deepseek-v4-flash', 'glm-5.2'],
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base, VERBOO_API_KEY: 'test-key' },
+      spawnImpl,
+    },
+  );
+
+  const phases = updates.map((u) => u.phase);
+  assert.ok(phases.includes('routing'));
+  assert.ok(phases.includes('generating'));
+});
+
+test('onProgress inclui attempt info em fallback', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-onprogress-fallback-'));
+  const updates = [];
+  let callCount = 0;
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    callCount += 1;
+    setImmediate(() => {
+      if (callCount === 1) {
+        child.stderr.end('Selected model is at capacity. Please try a different model.\n');
+        child.stdout.end();
+        child.emit('close', 1);
+        return;
+      }
+      child.stdout.end(`${JSON.stringify({
+        type: 'text',
+        sessionID: 'ses_fb',
+        part: { text: 'Fallback OK.' },
+      })}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  await runVerbooAgent(
+    {
+      prompt: 'Analise.',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      model: 'auto',
+      timeout_seconds: 10,
+      __onProgress: (update) => { updates.push(update); },
+    },
+    {
+      availableModels: ['deepseek-v4-flash', 'glm-5.2'],
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_API_KEY: 'test-key',
+        VERBOO_AGENT_MAX_MODEL_ATTEMPTS: '2',
+      },
+      spawnImpl,
+    },
+  );
+
+  const generatingCalls = updates.filter((u) => u.phase === 'generating');
+  assert.ok(generatingCalls.length >= 1, 'deve ter ao menos um generating');
+  const lastGenerating = generatingCalls[generatingCalls.length - 1];
+  assert.equal(lastGenerating.attempts.current, 2);
+  assert.equal(lastGenerating.attempts.total, 2);
+});
+
+test('onProgress processa linha JSON dividida entre chunks', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-progress-chunks-'));
+  const updates = [];
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      const tool = JSON.stringify({ type: 'tool_use', part: { tool: 'read' } });
+      child.stdout.write(tool.slice(0, 12));
+      child.stdout.write(`${tool.slice(12)}\n`);
+      child.stdout.end(`${JSON.stringify({
+        type: 'text',
+        sessionID: 'ses_chunks',
+        part: { text: 'Concluído.' },
+      })}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  await runVerbooAgent(
+    {
+      prompt: 'Revise.',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      model: 'deepseek-v4-flash',
+      timeout_seconds: 10,
+      __onProgress: (update) => { updates.push(update); },
+    },
+    {
+      availableModels: ['deepseek-v4-flash'],
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base, VERBOO_API_KEY: 'test-key' },
+      spawnImpl,
+    },
+  );
+
+  const toolUpdate = updates.find((update) => update.tool_counts);
+  assert.ok(toolUpdate);
+  assert.equal(toolUpdate.phase, 'executing_tool');
+  assert.equal(toolUpdate.tool_counts.Read.total, 1);
+});
+
+// ── Parser multi-bloco (Gate 1) ─────────────────────────────────────────
+
+test('parseOpenCodeEvents preserva multiplos blocos text em ordem', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'Primeiro bloco.' } }),
+    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'Segundo bloco.' } }),
+    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'Terceiro.' } }),
+  ].join('\n');
+  const parsed = parseOpenCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Primeiro bloco.\nSegundo bloco.\nTerceiro.');
+});
+
+test('parseVerbooCodeEvents preserva multiplos blocos text em ordem', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({ type: 'assistant', session_id: 's2', message: { content: [
+      { type: 'text', text: 'Analisei.' },
+    ] } }),
+    JSON.stringify({ type: 'assistant', session_id: 's2', message: { content: [
+      { type: 'text', text: 'Encontrei um bug.' },
+    ] } }),
+    JSON.stringify({ type: 'result', session_id: 's2', result: 'Concluído.' }),
+  ].join('\n');
+  const parsed = parseVerbooCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Analisei.\nEncontrei um bug.\nConcluído.');
+});
+
+// ── onLine incremental tool_counts ──────────────────────────────────────
+
+test('buildProgressOnLine detecta tool_use e chama onProgress com tool_counts', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0 },
+  );
+  cb(JSON.stringify({ type: 'tool_use', part: { tool: 'read' } }));
+  cb(JSON.stringify({ type: 'tool_use', part: { tool: 'edit' } }));
+  cb(JSON.stringify({ type: 'text', part: { text: 'Feito.' } }));
+  cb(JSON.stringify({ type: 'tool_use', part: { tool: 'glob' } }));
+  const tcs = updates.filter((u) => u.tool_counts);
+  assert.equal(tcs.length, 3);
+  assert.equal(tcs[0].tool_counts.total.total, 1);
+  assert.equal(tcs[0].tool_counts.Read.total, 1);
+  assert.equal(tcs[1].tool_counts.total.total, 2);
+  assert.equal(tcs[1].tool_counts.Edit.total, 1);
+  assert.equal(tcs[2].tool_counts.total.total, 3);
+  assert.equal(tcs[2].tool_counts.Glob.total, 1);
+});
+
+test('buildProgressOnLine correlaciona resultado nativo e OpenCode por id', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0 },
+  );
+
+  cb(JSON.stringify({
+    type: 'assistant',
+    message: {
+      content: [
+        { type: 'tool_use', id: 'native-ok', name: 'read' },
+        { type: 'tool_use', id: 'native-fail', name: 'edit' },
+      ],
+    },
+  }));
+  cb(JSON.stringify({
+    type: 'user',
+    message: {
+      content: [
+        { type: 'tool_result', tool_use_id: 'native-ok', is_error: false },
+        { type: 'tool_result', tool_use_id: 'native-fail', is_error: true },
+      ],
+    },
+  }));
+  cb(JSON.stringify({
+    type: 'tool_use',
+    part: { id: 'opencode-ok', tool: 'glob', state: { status: 'running' } },
+  }));
+  cb(JSON.stringify({
+    type: 'tool_use',
+    part: { id: 'opencode-ok', tool: 'glob', state: { status: 'completed' } },
+  }));
+
+  const last = updates.at(-1).tool_counts;
+  assert.deepEqual(last.total, { total: 3, succeeded: 2, failed: 1 });
+  assert.deepEqual(last.Read, { total: 1, succeeded: 1, failed: 0 });
+  assert.deepEqual(last.Edit, { total: 1, succeeded: 0, failed: 1 });
+  assert.deepEqual(last.Glob, { total: 1, succeeded: 1, failed: 0 });
+});
+
+test('buildProgressOnLine limita emissões, faz flush e ignora evento tardio', () => {
+  const updates = [];
+  let clock = 0;
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 100, now: () => clock },
+  );
+  cb(JSON.stringify({ type: 'tool_use', part: { tool: 'read' } }));
+  clock = 10;
+  cb(JSON.stringify({ type: 'tool_use', part: { tool: 'edit' } }));
+  clock = 20;
+  cb(JSON.stringify({ type: 'tool_use', part: { tool: 'glob' } }));
+  assert.equal(updates.length, 1);
+
+  cb.flush();
+  assert.equal(updates.length, 2);
+  assert.equal(updates[1].tool_counts.total.total, 3);
+  assert.equal(updates[1].tool_counts.Read.total, 1);
+  assert.equal(updates[1].tool_counts.Edit.total, 1);
+  assert.equal(updates[1].tool_counts.Glob.total, 1);
+
+  cb.close();
+  cb(JSON.stringify({ type: 'tool_use', part: { tool: 'write' } }));
+  assert.equal(updates.length, 2);
+});
+
+test('buildProgressOnLine nao falha com JSON invalido', () => {
+  let called = false;
+  const onLine = buildProgressOnLine(() => { called = true; });
+  onLine('not json');
+  onLine('{"malformed"');
+  assert.equal(called, false);
 });

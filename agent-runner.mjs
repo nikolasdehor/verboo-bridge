@@ -299,6 +299,40 @@ export function configuredModelPolicy(availableModels, env) {
   };
 }
 
+export function assertGlobalModelAllowed(model, env) {
+  const allowlist = envList(env.VERBOO_MODEL_ALLOWLIST);
+  const denylist = new Set(envList(env.VERBOO_MODEL_DENYLIST));
+  validateConfiguredModels('VERBOO_MODEL_ALLOWLIST', allowlist);
+  validateConfiguredModels('VERBOO_MODEL_DENYLIST', [...denylist]);
+  const tiers = allowedTiers(env);
+  const tier = MODEL_CATALOG[model]?.tier;
+  if (allowlist.length && !allowlist.includes(model)) {
+    throw agentError(
+      'MODEL_NOT_ALLOWED',
+      `Modelo fora de VERBOO_MODEL_ALLOWLIST: ${model}.`,
+    );
+  }
+  if (denylist.has(model)) {
+    throw agentError(
+      'MODEL_NOT_ALLOWED',
+      `Modelo bloqueado por VERBOO_MODEL_DENYLIST: ${model}.`,
+    );
+  }
+  if (!tier || !tiers.includes(tier)) {
+    throw agentError(
+      'MODEL_NOT_ALLOWED',
+      `Tier do modelo bloqueado por VERBOO_MODEL_TIERS: ${model} (${tier ?? 'unknown'}).`,
+    );
+  }
+}
+
+export function globallyAllowedModels(availableModels, env) {
+  const policy = configuredModelPolicy(availableModels, env);
+  return policy.availableModels.filter(
+    (model) => policy.allowTiers.includes(MODEL_CATALOG[model]?.tier),
+  );
+}
+
 function markModelStarted(model) {
   const state = modelRuntimeState[model];
   state.inFlight += 1;
@@ -325,28 +359,7 @@ function recoverableModelFailure(error) {
 
 function modelRouteFor(request, availableModels, env) {
   if (request.model !== 'auto') {
-    const allowlist = envList(env.VERBOO_MODEL_ALLOWLIST);
-    const denylist = new Set(envList(env.VERBOO_MODEL_DENYLIST));
-    const tiers = allowedTiers(env);
-    const tier = MODEL_CATALOG[request.model]?.tier;
-    if (allowlist.length && !allowlist.includes(request.model)) {
-      throw agentError(
-        'MODEL_NOT_ALLOWED',
-        `Modelo fora de VERBOO_MODEL_ALLOWLIST: ${request.model}.`,
-      );
-    }
-    if (denylist.has(request.model)) {
-      throw agentError(
-        'MODEL_NOT_ALLOWED',
-        `Modelo bloqueado por VERBOO_MODEL_DENYLIST: ${request.model}.`,
-      );
-    }
-    if (!tier || !tiers.includes(tier)) {
-      throw agentError(
-        'MODEL_NOT_ALLOWED',
-        `Tier do modelo bloqueado por VERBOO_MODEL_TIERS: ${request.model} (${tier ?? 'unknown'}).`,
-      );
-    }
+    assertGlobalModelAllowed(request.model, env);
     return {
       strategy: 'manual',
       model: request.model,
@@ -534,9 +547,129 @@ function stripReasoning(text) {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 }
 
+function categorizeTool(name) {
+  const n = (name ?? '').toLowerCase();
+  if (n === 'read') return 'Read';
+  if (n === 'glob' || n === 'search') return 'Glob';
+  if (n === 'grep') return 'Grep';
+  if (n === 'edit' || n === 'apply_diff' || n === 'apply_patch') return 'Edit';
+  if (n === 'write' || n === 'create' || n === 'delete') return 'Write';
+  if (n === 'bash' || n === 'shell' || n === 'execute_command') return 'Bash';
+  return 'Other';
+}
+
+export function buildProgressOnLine(
+  onProgress,
+  { minIntervalMs = 100, now = Date.now } = {},
+) {
+  const categories = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', 'Other'];
+  const counts = Object.fromEntries(
+    categories.map((category) => [
+      category,
+      { total: 0, succeeded: 0, failed: 0 },
+    ]),
+  );
+  const pendingTools = new Map();
+  const completedTools = new Set();
+  let lastEmitAt = Number.NEGATIVE_INFINITY;
+  let pending = false;
+  let closed = false;
+  let anonymousId = 0;
+
+  const emit = () => {
+    if (!pending || closed) return;
+    pending = false;
+    lastEmitAt = now();
+    const toolCounts = Object.fromEntries(
+      Object.entries(counts).map(([category, value]) => [
+        category,
+        { ...value },
+      ]),
+    );
+    const total = Object.values(counts).reduce(
+      (sum, value) => ({
+        total: sum.total + value.total,
+        succeeded: sum.succeeded + value.succeeded,
+        failed: sum.failed + value.failed,
+      }),
+      { total: 0, succeeded: 0, failed: 0 },
+    );
+    onProgress({
+      phase: 'executing_tool',
+      tool_counts: {
+        ...toolCounts,
+        total,
+      },
+    });
+  };
+
+  const startTool = (name, id) => {
+    const key = id ? String(id) : `anonymous:${anonymousId += 1}`;
+    if (pendingTools.has(key) || completedTools.has(key)) return key;
+    const category = categorizeTool(name);
+    pendingTools.set(key, category);
+    counts[category].total += 1;
+    pending = true;
+    return key;
+  };
+
+  const finishTool = (id, failed) => {
+    if (!id) return;
+    const key = String(id);
+    const category = pendingTools.get(key);
+    if (!category || completedTools.has(key)) return;
+    counts[category][failed ? 'failed' : 'succeeded'] += 1;
+    pendingTools.delete(key);
+    completedTools.add(key);
+    pending = true;
+  };
+
+  const onLine = (line) => {
+    if (closed) return;
+    try {
+      const event = JSON.parse(line);
+      if (event.type === 'tool_use' && typeof event.part?.tool === 'string') {
+        const id = event.part.id
+          ?? event.part.callID
+          ?? event.part.callId
+          ?? event.part.toolCallID;
+        const key = startTool(event.part.tool, id);
+        const status = String(event.part.state?.status ?? '').toLowerCase();
+        if (['completed', 'failed', 'error'].includes(status)) {
+          finishTool(key, status !== 'completed' || Boolean(event.part.state?.error));
+        }
+      } else if (event.type === 'content' && event.content_type === 'tool_call' && typeof event.name === 'string') {
+        startTool(event.name, event.id ?? event.call_id ?? event.tool_use_id);
+      }
+
+      for (const block of nativeEventBlocks(event)) {
+        if (block.type === 'tool_use' && typeof block.name === 'string') {
+          startTool(block.name, block.id);
+        } else if (block.type === 'tool_result') {
+          finishTool(block.tool_use_id, block.is_error === true);
+        }
+      }
+      if (event.type === 'tool_result') {
+        finishTool(
+          event.tool_use_id ?? event.call_id ?? event.part?.tool_use_id,
+          event.is_error === true || event.part?.is_error === true,
+        );
+      }
+      if (pending && now() - lastEmitAt >= minIntervalMs) emit();
+    } catch {}
+  };
+  onLine.flush = emit;
+  onLine.close = () => {
+    emit();
+    closed = true;
+  };
+  return onLine;
+}
+
+
 export function parseOpenCodeEvents(raw, cwd) {
   let sessionId = null;
-  let result = '';
+  const resultParts = [];
   const artifacts = new Set();
   const toolsUsed = new Set();
   const successfulTools = new Set();
@@ -553,7 +686,7 @@ export function parseOpenCodeEvents(raw, cwd) {
     sessionId ||= event.sessionID ?? event.part?.sessionID ?? null;
     if (event.type === 'text') {
       const candidate = stripReasoning(event.part?.text ?? '');
-      if (candidate) result = candidate;
+      if (candidate) resultParts.push(candidate);
     }
 
     if (event.type === 'tool_use') {
@@ -571,7 +704,7 @@ export function parseOpenCodeEvents(raw, cwd) {
 
   return {
     sessionId,
-    result,
+    result: resultParts.join('\n'),
     artifacts: sortedStrings(artifacts),
     toolsUsed: sortedStrings(toolsUsed),
     successfulTools: sortedStrings(successfulTools),
@@ -585,7 +718,7 @@ function nativeEventBlocks(event) {
 
 export function parseVerbooCodeEvents(raw, cwd) {
   let sessionId = null;
-  let result = '';
+  const resultParts = [];
   const artifacts = new Set();
   const toolsUsed = new Set();
   const successfulTools = new Set();
@@ -603,13 +736,13 @@ export function parseVerbooCodeEvents(raw, cwd) {
     sessionId ||= event.session_id ?? event.sessionId ?? null;
     if (event.type === 'result' && typeof event.result === 'string') {
       const candidate = stripReasoning(event.result);
-      if (candidate) result = candidate;
+      if (candidate) resultParts.push(candidate);
     }
 
     for (const block of nativeEventBlocks(event)) {
       if (block.type === 'text') {
         const candidate = stripReasoning(block.text ?? '');
-        if (candidate) result = candidate;
+        if (candidate) resultParts.push(candidate);
         continue;
       }
       if (block.type === 'tool_use') {
@@ -639,7 +772,7 @@ export function parseVerbooCodeEvents(raw, cwd) {
 
   return {
     sessionId,
-    result,
+    result: resultParts.join('\n'),
     artifacts: sortedStrings(artifacts),
     toolsUsed: sortedStrings(toolsUsed),
     successfulTools: sortedStrings(successfulTools),
@@ -745,7 +878,9 @@ function execute(invocation, options) {
     spawnImpl = spawn,
     killImpl = process.kill,
     killGraceMs = KILL_GRACE_MS,
+    timeoutMs = timeoutSeconds * 1000,
     signal,
+    onLine,
   } = options;
 
   return new Promise((resolve, reject) => {
@@ -761,10 +896,9 @@ function execute(invocation, options) {
     let stderrBytes = 0;
     let settled = false;
     let terminationError = null;
-    let childClosed = false;
-    let forceKillSent = false;
     let forceKillTimer;
     let timer;
+    let lineBuffer = '';
 
     const child = spawnImpl(invocation.command, invocation.args, {
       cwd,
@@ -783,11 +917,12 @@ function execute(invocation, options) {
       signal.addEventListener('abort', onSignalAbort, { once: true });
     }
 
-    const finish = (callback, value) => {
+    const finish = (callback, value, clearForceKill = true) => {
       if (settled) return;
       settled = true;
+      onLine?.close?.();
       clearTimeout(timer);
-      clearTimeout(forceKillTimer);
+      if (clearForceKill) clearTimeout(forceKillTimer);
       if (signal) {
         signal.removeEventListener('abort', onSignalAbort);
       }
@@ -809,12 +944,11 @@ function execute(invocation, options) {
     const terminate = (error) => {
       if (settled || terminationError) return;
       terminationError = error;
-      signalTree('SIGTERM');
       forceKillTimer = setTimeout(() => {
-        forceKillSent = true;
         signalTree('SIGKILL');
-        if (childClosed) finish(reject, terminationError);
+        finish(reject, terminationError);
       }, killGraceMs);
+      signalTree('SIGTERM');
     };
 
     timer = setTimeout(() => {
@@ -822,7 +956,7 @@ function execute(invocation, options) {
         'TIMEOUT',
         `${invocation.label} excedeu o timeout de ${timeoutSeconds}s e foi interrompido.`,
       ));
-    }, timeoutSeconds * 1000);
+    }, timeoutMs);
 
     child.stdout?.on('data', (chunk) => {
       if (terminationError) return;
@@ -836,7 +970,14 @@ function execute(invocation, options) {
         );
         return;
       }
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      if (onLine) {
+        lineBuffer += text;
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop() ?? '';
+        for (const line of lines) onLine(line);
+      }
     });
 
     child.stderr?.on('data', (chunk) => {
@@ -860,9 +1001,9 @@ function execute(invocation, options) {
     });
 
     child.on('close', (code) => {
-      childClosed = true;
       if (terminationError) {
-        if (forceKillSent) finish(reject, terminationError);
+        const processGroupMayRemain = process.platform !== 'win32' && child.pid;
+        finish(reject, terminationError, !processGroupMayRemain);
         return;
       }
       if (code !== 0) {
@@ -903,6 +1044,7 @@ function execute(invocation, options) {
         );
         return;
       }
+      if (lineBuffer.trim() && onLine) onLine(lineBuffer);
       finish(resolve, stdout);
     });
   });
@@ -928,7 +1070,9 @@ async function executeAgentAttempt(
   options,
   timeoutSeconds = request.timeoutSeconds,
 ) {
+  if (options.onProgress) options.onProgress({ phase: 'executing_tool' });
   const invocation = buildAgentInvocation(request, executor, options.env);
+  const onLine = options.onProgress ? buildProgressOnLine(options.onProgress) : undefined;
   const raw = await execute(invocation, {
     cwd: request.cwd,
     timeoutSeconds,
@@ -936,8 +1080,11 @@ async function executeAgentAttempt(
     spawnImpl: options.spawnImpl,
     killImpl: options.killImpl,
     killGraceMs: options.killGraceMs,
+    timeoutMs: options.timeoutMs,
     signal: options.signal,
+    onLine,
   });
+  if (options.onProgress) options.onProgress({ phase: 'processing_result' });
   const parsed = executor === 'native'
     ? parseVerbooCodeEvents(raw, request.cwd)
     : parseOpenCodeEvents(raw, request.cwd);
@@ -1072,6 +1219,13 @@ async function runRoutedAgent(request, executor, options) {
     }
     const model = route.ranking[0].model;
     const attemptRequest = { ...request, model };
+    if (options.onProgress) {
+      options.onProgress({
+        phase: 'generating',
+        model,
+        attempts: { current: attempts.length + 1, total: maxAttempts },
+      });
+    }
     markModelStarted(model);
     try {
       const { parsed, status } = await executeAgentAttempt(
@@ -1110,6 +1264,12 @@ async function runRoutedAgent(request, executor, options) {
         throw error;
       }
       route = rerouteAfterFailure(request, options, attempts);
+      if (options.onProgress) {
+        options.onProgress({
+          phase: 'routing',
+          attempts: { current: attempts.length + 1, total: maxAttempts },
+        });
+      }
     }
   }
 
@@ -1137,6 +1297,12 @@ export function executorAvailableModels(executor, availableModels, env) {
 export async function runVerbooAgent(args, options) {
   let releaseAgentSlot = options.slotRelease;
   try {
+    const progressCallback = typeof args?.__onProgress === 'function'
+      ? args.__onProgress : null;
+    if (progressCallback) {
+      options = { ...options, onProgress: progressCallback };
+      progressCallback({ phase: 'routing' });
+    }
     const request = normalizeAgentRequest(args, options.availableModels);
     if (request.mode === 'write' && options.env.VERBOO_AGENT_WRITE_ENABLED !== '1') {
       throw agentError(
@@ -1156,11 +1322,15 @@ export async function runVerbooAgent(args, options) {
     request.prompt = promptWithMemory(originalPrompt, memoryContext);
     const executor = resolveAgentExecutor(args.executor, options.env);
     validateExecutorCredentials(executor, options.env);
-    const availableModels = executorAvailableModels(
+    const executorModels = executorAvailableModels(
       executor,
       options.availableModels,
       options.env,
     );
+    if (request.model !== 'auto') {
+      assertGlobalModelAllowed(request.model, options.env);
+    }
+    const availableModels = globallyAllowedModels(executorModels, options.env);
     if (availableModels.length === 0) {
       const error = agentError(
         'MODEL_ROUTE_EMPTY',
@@ -1169,7 +1339,7 @@ export async function runVerbooAgent(args, options) {
       error.executor = executor;
       throw error;
     }
-    if (request.model !== 'auto' && !availableModels.includes(request.model)) {
+    if (request.model !== 'auto' && !executorModels.includes(request.model)) {
       const error = agentError(
         'MODEL_NOT_ALLOWED',
         `Modelo ${request.model} indisponível para o executor ${executor}.`,
