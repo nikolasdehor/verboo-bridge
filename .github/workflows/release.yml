@@ -42,8 +42,10 @@ jobs:
       - name: Install
         run: npm ci --ignore-scripts
 
+      # A suíte completa continua no job validate (Linux). O Windows valida a nova
+      # superfície do PR #9 porque os testes legados utilizam premissas POSIX.
       - name: Validate
-        run: npm test
+        run: node --test --test-name-pattern="denylist|verboo_validate|verboo_agent_start|onProgress|parseOpenCodeEvents|parseVerbooCodeEvents|buildProgressOnLine|duravel|durável|persistencia|persistência|schema|recuperação|recuperacao|initStore|prune|progresso|queue_position|heartbeat|cancelamento" test/agent-runner.test.mjs test/job-queue.test.mjs test/mcp.test.mjs
 
   release:
     if: github.event_name == 'push'
