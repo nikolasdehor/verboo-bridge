@@ -27,6 +27,24 @@ jobs:
       - name: Validate
         run: npm test
 
+  validate-windows:
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Validate
+        run: npm test
+
   release:
     if: github.event_name == 'push'
     needs: validate
