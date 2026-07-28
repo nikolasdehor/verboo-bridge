@@ -94,6 +94,11 @@ export VERBOO_AGENT_EXECUTOR="native"
 export VERBOO_CODE_BIN="/caminho/para/verboo"
 # Opcional e sensivel: habilita edicao (sem shell)
 export VERBOO_AGENT_WRITE_ENABLED="1"
+# Memoria tecnica persistente e isolada por projeto
+export VERBOO_MEMORY_ENABLED="1"
+export VERBOO_MEMORY_DIR="$HOME/.local/share/verboo-bridge/memory"
+# Indices curados opcionais, somente leitura
+export VERBOO_SHARED_MEMORY_FILES="$HOME/.codex/memories/MEMORY.md:$HOME/ObsidianVaults/ClaudeBrain/MEMORY.md"
 ```
 
 Antes do modo nativo, autentique a CLI oficial uma vez com
@@ -255,7 +260,10 @@ Quando o MCP server estiver registrado, o orquestrador tera acesso a estas tools
 | Tool | Descricao |
 |------|-----------|
 | `verboo_route` | Classifica a tarefa e explica o ranking dos modelos sem executar um agente |
-| `verboo_agent` | Subagente repo-aware; `model: "auto"` escolhe e distribui modelos, com fallback recuperavel |
+| `verboo_agent` | Subagente repo-aware sincrono; `model: "auto"` escolhe e distribui modelos, com fallback recuperavel |
+| `verboo_agent_start` | Inicia subagente assincrono, mesma validacao de `verboo_agent`, retorna `job_id` imediatamente |
+| `verboo_job` | Gerencia jobs assincronos: `status`, `result`, `list`, `cancel` |
+| `verboo_memory` | Consulta ou registra uma nota tecnica duravel no diario isolado do projeto |
 | `verboo_code` | Codificacao com DeepSeek V4 Flash |
 | `verboo_review` | Code review |
 | `verboo_deepseek_v4_flash` | Modelo especifico |
@@ -324,6 +332,31 @@ continua responsavel por executar testes e outros comandos, revisar o diff,
 commitar e fazer deploy. O subprocesso recebe somente uma allowlist minima de
 variaveis de ambiente; tokens de GitHub, AWS e outros servicos nao sao herdados.
 O modo `write` falha fechado enquanto `VERBOO_AGENT_WRITE_ENABLED` nao for `1`.
+
+### Memoria dos subagentes
+
+Com `VERBOO_MEMORY_ENABLED=1`, o bridge mantem um diario JSONL separado para
+cada `cwd` canonico. O nome do arquivo combina o nome do projeto com um hash do
+caminho, impedindo que repositorios homonimos compartilhem contexto.
+
+Ao finalizar, o agente devolve uma nota curta entre `<memory_note>` e
+`</memory_note>`. O marcador e removido da resposta exibida, e somente a nota
+sanitizada, o modelo, o modo, o executor e os artefatos internos sao
+persistidos. Prompt integral, raciocinio, codigo bruto, credenciais e saida
+completa nao sao gravados. Notas sem marcador nao viram memoria automaticamente.
+Tokens conhecidos, atribuicoes de credenciais, chaves privadas, emails, CPFs e
+telefones tambem sao redigidos novamente no caminho de leitura.
+
+As ultimas notas do projeto entram na proxima delegacao com a instrucao de
+confirmar tudo no repositorio. `VERBOO_SHARED_MEMORY_FILES` pode adicionar
+indices curados de Codex, Claude ou Obsidian como fontes de leitura. O bridge
+limita quantidade e tamanho dessas fontes; ele nao varre o vault inteiro.
+Os caminhos compartilhados sao uma allowlist administrativa explicita e seu
+conteudo passa pela mesma redacao antes de chegar ao modelo.
+
+Gravacoes concorrentes sao serializadas por arquivo dentro do processo do
+bridge. Para decisões críticas, o orquestrador pode usar `verboo_memory` com
+`action: "remember"`; para auditoria, use `read` ou `status`.
 
 ### Via CLI direta
 
@@ -445,9 +478,17 @@ O server tambem expoe **resources** e **prompts**:
 | `VERBOO_LOG_LEVEL` | `info` | Nivel de log: `debug`, `info`, `warn`, `error` |
 | `VERBOO_AGENT_ALLOWED_ROOTS` | — | Raizes repo-aware separadas pelo delimitador de paths do SO; sem valor, `verboo_agent` falha fechado |
 | `VERBOO_AGENT_WRITE_ENABLED` | — | Defina `1` para habilitar `write`; por padrao somente `read_only` e aceito |
-| `VERBOO_AGENT_MAX_CONCURRENCY` | `1` | Execucoes simultaneas do agente; inteiro entre 1 e 8, valores invalidos usam 1 |
+| `VERBOO_AGENT_MAX_CONCURRENCY` | `4` | Execucoes simultaneas globais, incluindo jobs assincronos; inteiro entre 1 e 8, valores invalidos usam 4 |
+| `VERBOO_JOB_STORE_DIR` | — | Diretorio opcional 0700/0600 para persistencia somente de metadados seguros; resultados ficam apenas em memoria. Nao grava prompts, raciocinio, segredos ou env e recupera jobs interrompidos ao reiniciar |
+| `VERBOO_JOB_TTL_MS` | `1800000` (30 min) | TTL em ms para jobs finalizados sem resultado |
+| `VERBOO_JOB_RESULT_TTL_MS` | `600000` (10 min) | TTL em ms para resultados de jobs |
+| `VERBOO_JOB_MAX_RESULTS` | `100` | Maximo de resultados mantidos em memoria (ate 500) |
+| `VERBOO_JOB_MAX_QUEUED` | `50` | Maximo de jobs aguardando na fila |
 | `VERBOO_AGENT_MAX_MODEL_ATTEMPTS` | `2` | Tentativas de modelos no modo `auto` + `read_only`; inteiro entre 1 e 3 |
 | `VERBOO_AGENT_EXECUTOR` | `native` | Default administrativo; cada chamada pode substituir por `native` ou `opencode` |
+| `VERBOO_MEMORY_ENABLED` | — | Defina `1` para ativar memoria tecnica persistente dos subagentes |
+| `VERBOO_MEMORY_DIR` | `~/.local/share/verboo-bridge/memory` | Diretorio dos diarios JSONL isolados por projeto |
+| `VERBOO_SHARED_MEMORY_FILES` | — | Arquivos de memoria curada, somente leitura, separados pelo delimitador de paths do SO |
 | `VERBOO_MODEL_ALLOWLIST` | todos | Modelos permitidos no roteamento automatico, preview e selecao manual, separados por virgula |
 | `VERBOO_MODEL_DENYLIST` | — | Modelos bloqueados, separados por virgula |
 | `VERBOO_MODEL_TIERS` | `pro,ultra` | Tiers permitidos no roteamento automatico, preview e selecao manual |

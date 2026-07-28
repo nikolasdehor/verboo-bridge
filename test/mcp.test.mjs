@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { mkdtemp } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
@@ -7,6 +9,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   const repo = path.resolve('.');
+  const memoryDir = await mkdtemp(path.join(os.tmpdir(), 'verboo-mcp-memory-'));
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.join(repo, 'index.mjs')],
@@ -18,6 +21,8 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
       VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flash',
       VERBOO_MODEL_DENYLIST: '',
       VERBOO_MODEL_TIERS: 'pro',
+      VERBOO_MEMORY_ENABLED: '1',
+      VERBOO_MEMORY_DIR: memoryDir,
     },
     stderr: 'pipe',
   });
@@ -25,14 +30,16 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
     { name: 'verboo-bridge-test', version: '1.0.0' },
     { capabilities: {} },
   );
-  t.after(async () => client.close());
+  t.after(async () => { try { await client.close(); } catch {} });
   await client.connect(transport);
 
   const listed = await client.listTools();
   const routeTool = listed.tools.find((tool) => tool.name === 'verboo_route');
   const agentTool = listed.tools.find((tool) => tool.name === 'verboo_agent');
+  const memoryTool = listed.tools.find((tool) => tool.name === 'verboo_memory');
   assert.ok(routeTool);
   assert.ok(agentTool);
+  assert.ok(memoryTool);
   assert.deepEqual(routeTool.inputSchema.properties.executor.enum, [
     'opencode',
     'native',
@@ -45,6 +52,34 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   assert.equal(agentTool.inputSchema.properties.executor.default, 'native');
   assert.equal(agentTool.inputSchema.properties.model.default, 'auto');
   assert.ok(agentTool.inputSchema.properties.model.enum.includes('auto'));
+  assert.deepEqual(memoryTool.inputSchema.properties.action.enum, [
+    'status',
+    'read',
+    'remember',
+  ]);
+
+  const remembered = await client.callTool({
+    name: 'verboo_memory',
+    arguments: {
+      action: 'remember',
+      cwd: repo,
+      note: 'O bridge usa memória isolada por projeto.',
+    },
+  });
+  assert.notEqual(remembered.isError, true);
+  assert.equal(JSON.parse(remembered.content[0].text).persisted, true);
+
+  const recalled = await client.callTool({
+    name: 'verboo_memory',
+    arguments: { action: 'read', cwd: repo },
+  });
+  const recalledPayload = JSON.parse(recalled.content[0].text);
+  assert.equal(recalledPayload.enabled, true);
+  assert.equal(recalledPayload.entries.length, 1);
+  assert.equal(
+    recalledPayload.entries[0].note,
+    'O bridge usa memória isolada por projeto.',
+  );
 
   const routed = await client.callTool({
     name: 'verboo_route',
@@ -77,4 +112,107 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   const payload = JSON.parse(result.content[0].text);
   assert.equal(payload.status, 'error');
   assert.match(payload.summary, /fora das raízes autorizadas/);
+});
+
+test('MCP verboo_agent_start enfileira e verboo_job cancela antes de executar', async (t) => {
+  const repo = path.resolve('.');
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(repo, 'index.mjs')],
+    env: {
+      ...process.env,
+      VERBOO_API_KEY: 'test-key',
+      VERBOO_AGENT_ALLOWED_ROOTS: repo,
+      VERBOO_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+      VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+      VERBOO_MODEL_TIERS: 'pro',
+      VERBOO_MEMORY_ENABLED: '0',
+    },
+    stderr: 'pipe',
+  });
+  const client = new Client(
+    { name: 'verboo-bridge-test', version: '1.0.0' },
+    { capabilities: {} },
+  );
+  t.after(async () => client.close());
+  await client.connect(transport);
+
+  // verboo_agent_start
+  const enqueued = await client.callTool({
+    name: 'verboo_agent_start',
+    arguments: { prompt: 'lista arquivos', cwd: repo, mode: 'read_only', timeout_seconds: 30 },
+  });
+  const enqueuedPayload = JSON.parse(enqueued.content[0].text);
+  assert.ok(enqueuedPayload.job_id);
+  assert.equal(enqueuedPayload.error, undefined);
+
+  // verboo_job action=cancel — cancela ainda na fila (sem executar agente real)
+  const cancelResult = await client.callTool({
+    name: 'verboo_job',
+    arguments: { action: 'cancel', job_id: enqueuedPayload.job_id },
+  });
+  const cancelPayload = JSON.parse(cancelResult.content[0].text);
+  assert.equal(cancelPayload.status, 'cancelled');
+
+  // verboo_job action=status
+  const statusResult = await client.callTool({
+    name: 'verboo_job',
+    arguments: { action: 'status', job_id: enqueuedPayload.job_id },
+  });
+  const statusPayload = JSON.parse(statusResult.content[0].text);
+  assert.equal(statusPayload.status, 'cancelled');
+  assert.ok(statusPayload.finished_at, 'cancelled deve ter finished_at');
+
+  // verboo_job action=list
+  const listResult = await client.callTool({
+    name: 'verboo_job',
+    arguments: { action: 'list' },
+  });
+  const listPayload = JSON.parse(listResult.content[0].text);
+  assert.ok(Array.isArray(listPayload.jobs));
+
+  // verboo_job action=result com job inexistente
+  const missingResult = await client.callTool({
+    name: 'verboo_job',
+    arguments: { action: 'result', job_id: '00000000-0000-0000-0000-000000000000' },
+  });
+  const missingPayload = JSON.parse(missingResult.content[0].text);
+  assert.equal(missingPayload.error, 'NOT_FOUND');
+});
+
+test('MCP verboo://status resource contem capacity/queued/running/total', async (t) => {
+  const repo = path.resolve('.');
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(repo, 'index.mjs')],
+    env: {
+      ...process.env,
+      VERBOO_API_KEY: 'test-key',
+      VERBOO_AGENT_ALLOWED_ROOTS: repo,
+      VERBOO_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+      VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+      VERBOO_MODEL_TIERS: 'pro',
+      VERBOO_MEMORY_ENABLED: '0',
+    },
+    stderr: 'pipe',
+  });
+  const client = new Client(
+    { name: 'verboo-bridge-test', version: '1.0.0' },
+    { capabilities: {} },
+  );
+  t.after(async () => client.close());
+  await client.connect(transport);
+
+  const resources = await client.listResources();
+  const statusResource = resources.resources.find((r) => r.uri === 'verboo://status');
+  assert.ok(statusResource);
+
+  const statusRead = await client.readResource({ uri: 'verboo://status' });
+  const statusPayload = JSON.parse(statusRead.contents[0].text);
+  assert.ok(statusPayload.version);
+  assert.ok(statusPayload.job_queue);
+  assert.equal(typeof statusPayload.job_queue.concurrency, 'number');
+  assert.equal(typeof statusPayload.job_queue.queued, 'number');
+  assert.equal(typeof statusPayload.job_queue.running, 'number');
+  assert.equal(typeof statusPayload.job_queue.total, 'number');
 });

@@ -1,6 +1,6 @@
 {
   "name": "verboo-bridge",
-  "version": "1.3.0",
+  "version": "1.4.1",
   "type": "module",
   "description": "MCP server to use Verboo AI models as sub-agents in Claude Code, Codex, Cursor, or any MCP-compatible client",
   "keywords": [
@@ -23,6 +23,8 @@
   "files": [
     "index.mjs",
     "agent-runner.mjs",
+    "job-queue.mjs",
+    "memory-store.mjs",
     "model-router.mjs",
     "bin/",
     "skills/",

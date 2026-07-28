@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { chmod, mkdtemp, realpath, writeFile } from 'node:fs/promises';
+import {
+  access,
+  chmod,
+  mkdtemp,
+  realpath,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -25,6 +31,16 @@ test('verboo-mcp instalado por npm resolve index.mjs a partir do pacote real', a
     'npm',
     ['install', '--ignore-scripts', '--prefix', installPrefix, path.join(temp, filename)],
   );
+
+  const installedPackage = path.join(
+    installPrefix,
+    'node_modules',
+    'verboo-bridge',
+  );
+  await Promise.all([
+    access(path.join(installedPackage, 'job-queue.mjs')),
+    access(path.join(installedPackage, 'memory-store.mjs')),
+  ]);
 
   const installedBin = path.join(installPrefix, 'node_modules', '.bin', 'verboo-mcp');
   const result = await execFileAsync(installedBin, [], {

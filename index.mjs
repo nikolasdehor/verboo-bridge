@@ -10,13 +10,22 @@ import {
   formatAgentFailure,
   MAX_TIMEOUT_SECONDS,
   MIN_TIMEOUT_SECONDS,
+  normalizeAgentRequest,
+  resolveAllowedCwd,
   resolveAgentExecutor,
   runVerbooAgent,
+  waitForAgentSlot,
 } from './agent-runner.mjs';
 import {
   MODEL_CATALOG,
   selectModelForTask,
 } from './model-router.mjs';
+import {
+  memoryStatus,
+  readProjectMemory,
+  rememberProjectNote,
+} from './memory-store.mjs';
+import { JobQueue } from './job-queue.mjs';
 const require = createRequire(import.meta.url);
 const { version: VERSION } = require('./package.json');
 import {
@@ -124,6 +133,40 @@ async function callVerboo(model, messages, opts = {}) {
 }
 
 // ── MCP Server ──────────────────────────────────────────────────────────
+
+// ── Async Job Queue ────────────────────────────────────────────────────
+
+const MAX_CONCURRENCY_USER = Number(process.env.VERBOO_AGENT_MAX_CONCURRENCY ?? 4);
+const jobQueue = new JobQueue({
+  concurrency: Number.isInteger(MAX_CONCURRENCY_USER) && MAX_CONCURRENCY_USER >= 1 && MAX_CONCURRENCY_USER <= 8
+    ? MAX_CONCURRENCY_USER : 4,
+});
+
+// Wire runner — runnerData contém agentArgs reais, nunca persistidos
+// Usa waitForAgentSlot para que jobs assíncronos aguardem o slot global
+// em vez de falhar com AGENT_BUSY quando chamadas síncronas ocuparem.
+jobQueue.setRunner(async (job, signal, runnerData) => {
+  const slotRelease = await waitForAgentSlot(process.env, signal);
+  const options = {
+    availableModels: Object.keys(MODELS),
+    env: process.env,
+    signal,
+    slotRelease,
+  };
+  return runVerbooAgent(runnerData, options);
+});
+
+// Initialise store from env (initStore agora é await antes de start)
+let storeReady = true;
+if (process.env.VERBOO_JOB_STORE_DIR) {
+  try {
+    await jobQueue.initStore(process.env.VERBOO_JOB_STORE_DIR);
+    log('info', `Job store inicializado: ${process.env.VERBOO_JOB_STORE_DIR}`);
+  } catch (err) {
+    log('error', `Falha ao inicializar job store: ${err.message}`);
+    storeReady = false;
+  }
+}
 
 const server = new Server(
   { name: 'verboo-bridge', version: VERSION },
@@ -236,6 +279,58 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         required: ['prompt', 'cwd'],
       },
     },
+    {
+      name: 'verboo_agent_start',
+      description: 'Inicia um subagente Verboo assincronamente. Mesma validacao de verboo_agent, retorna job_id imediatamente. Use verboo_job para consultar resultado.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          prompt: { type: 'string', description: 'Tarefa concreta e delimitada para o agente' },
+          cwd: { type: 'string', description: 'Diretorio do projeto, dentro de VERBOO_AGENT_ALLOWED_ROOTS' },
+          executor: { type: 'string', enum: AGENT_EXECUTORS, default: DEFAULT_AGENT_EXECUTOR },
+          mode: { type: 'string', enum: ['read_only', 'write'], default: 'read_only' },
+          model: { type: 'string', enum: ['auto', ...Object.keys(MODELS)], default: 'auto' },
+          timeout_seconds: { type: 'integer', minimum: MIN_TIMEOUT_SECONDS, maximum: MAX_TIMEOUT_SECONDS, default: 600 },
+        },
+        required: ['prompt', 'cwd'],
+      },
+    },
+    {
+      name: 'verboo_job',
+      description: 'Gerencia jobs assincronos. action=status retorna estado atual; result retorna resultado completo; list lista todos os jobs; cancel cancela um job.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['status', 'result', 'list', 'cancel'], default: 'status' },
+          job_id: { type: 'string', description: 'Obrigatorio para actions status, result e cancel' },
+        },
+        required: ['action'],
+      },
+    },
+    {
+      name: 'verboo_memory',
+      description: 'Consulta ou registra memória técnica persistente de um projeto autorizado.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['status', 'read', 'remember'],
+            default: 'status',
+          },
+          cwd: {
+            type: 'string',
+            description: 'Diretório do projeto, dentro de VERBOO_AGENT_ALLOWED_ROOTS',
+          },
+          note: {
+            type: 'string',
+            description: 'Nota técnica curta, sem segredos ou dados pessoais',
+            maxLength: 2000,
+          },
+        },
+        required: ['action', 'cwd'],
+      },
+    },
   ];
 
   return { tools };
@@ -295,6 +390,86 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
       };
+    } else if (name === 'verboo_agent_start') {
+      // Validate same as verboo_agent
+      try {
+        normalizeAgentRequest(args, Object.keys(MODELS));
+      } catch (err) {
+        return { content: [{ type: 'text', text: JSON.stringify(formatAgentFailure(err), null, 2) }], isError: true };
+      }
+      const cwd = await resolveAllowedCwd(
+        String(args.cwd ?? ''),
+        process.env.VERBOO_AGENT_ALLOWED_ROOTS,
+      );
+      const executor = resolveAgentExecutor(args.executor, process.env);
+      const model = args.model ?? 'auto';
+      const agentArgs = {
+        prompt: String(args.prompt ?? ''),
+        cwd,
+        mode: args.mode ?? 'read_only',
+        model,
+        executor,
+        timeout_seconds: Number(args.timeout_seconds ?? 600),
+      };
+      const result = jobQueue.enqueue({
+        cwd,
+        model,
+        executor,
+        runnerData: agentArgs,
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        isError: Boolean(result.error),
+      };
+    } else if (name === 'verboo_job') {
+      const action = String(args.action ?? 'status');
+      const jobId = String(args.job_id ?? '');
+      switch (action) {
+        case 'list':
+          return { content: [{ type: 'text', text: JSON.stringify({ jobs: jobQueue.listJobs() }, null, 2) }] };
+        case 'status':
+          if (!jobId) return { content: [{ type: 'text', text: JSON.stringify({ error: 'job_id obrigatorio' }) }], isError: true };
+          return { content: [{ type: 'text', text: JSON.stringify(jobQueue.getJob(jobId) ?? { error: 'NOT_FOUND' }, null, 2) }] };
+        case 'result':
+          if (!jobId) return { content: [{ type: 'text', text: JSON.stringify({ error: 'job_id obrigatorio' }) }], isError: true };
+          return { content: [{ type: 'text', text: JSON.stringify(jobQueue.getJobResult(jobId) ?? { error: 'NOT_FOUND' }, null, 2) }] };
+        case 'cancel':
+          if (!jobId) return { content: [{ type: 'text', text: JSON.stringify({ error: 'job_id obrigatorio' }) }], isError: true };
+          return { content: [{ type: 'text', text: JSON.stringify(jobQueue.cancel(jobId), null, 2) }] };
+        default:
+          return { content: [{ type: 'text', text: JSON.stringify({ error: `Action desconhecida: ${action}` }) }], isError: true };
+      }
+    } else if (name === 'verboo_memory') {
+      const cwd = await resolveAllowedCwd(
+        String(args.cwd ?? ''),
+        process.env.VERBOO_AGENT_ALLOWED_ROOTS,
+      );
+      if (args.action === 'remember') {
+        const persisted = await rememberProjectNote(
+          cwd,
+          args.note,
+          { executor: 'orchestrator', status: 'curated' },
+          process.env,
+        );
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ ...memoryStatus(process.env), persisted }, null, 2),
+          }],
+        };
+      }
+      const entries = args.action === 'read'
+        ? await readProjectMemory(cwd, process.env)
+        : [];
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ...memoryStatus(process.env),
+            entries,
+          }, null, 2),
+        }],
+      };
     } else if (name === 'verboo_code') {
       model = args.model ?? 'deepseek-v4-flash';
       messages = [];
@@ -333,7 +508,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   } catch (err) {
     log('error', err.message);
-    if (name === 'verboo_agent') {
+    if (['verboo_agent', 'verboo_agent_start', 'verboo_job'].includes(name)) {
       return {
         content: [{ type: 'text', text: JSON.stringify(formatAgentFailure(err), null, 2) }],
         isError: true,
@@ -473,6 +648,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
           agent_executor: DEFAULT_AGENT_EXECUTOR,
           agent_default_executor: DEFAULT_AGENT_EXECUTOR,
           agent_executors: AGENT_EXECUTORS,
+          memory: memoryStatus(process.env),
+          job_queue: {
+            concurrency: jobQueue.capacity,
+            queued: jobQueue.status.queued,
+            running: jobQueue.status.running,
+            total: jobQueue.status.total,
+          },
         }, null, 2),
       }],
     };
@@ -482,6 +664,11 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
 });
 
 // ── Start ───────────────────────────────────────────────────────────────
+
+if (!storeReady) {
+  console.error('FATAL: Job store configurado mas nao inicializou. Abortando.');
+  process.exit(1);
+}
 
 try {
   const transport = new StdioServerTransport();
