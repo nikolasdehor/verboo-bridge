@@ -1,7 +1,15 @@
 #!/usr/bin/env node
 
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 
@@ -21,6 +29,12 @@ const TERMINAL_STATUSES = new Set([
 ]);
 
 function nowISO() { return new Date().toISOString(); }
+
+function validTimestamp(value, fallback) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value))
+    ? value
+    : fallback;
+}
 
 function configuredMax(envVar, fallback, hard) {
   const v = Number(process.env[envVar] ?? fallback);
@@ -78,10 +92,12 @@ function recoverStoredRecord(record) {
   return {
     job_id: record.job_id,
     status: isPending ? 'failed' : record.status,
-    created_at: record.created_at ?? timestamp,
+    created_at: validTimestamp(record.created_at, timestamp),
     updated_at: timestamp,
     started_at: null,
-    finished_at: isPending ? timestamp : (record.finished_at ?? timestamp),
+    finished_at: isPending
+      ? timestamp
+      : validTimestamp(record.finished_at, timestamp),
     model: record.model ?? null,
     executor: record.executor ?? null,
     result: null,
@@ -116,6 +132,7 @@ export class JobQueue extends EventEmitter {
   #maxQueued;
   #storeDir;
   #runnerData = new Map();
+  #storeTails = new Map();
   #pruneTimer;
   #disposed = false;
 
@@ -263,9 +280,44 @@ export class JobQueue extends EventEmitter {
     if (runnerData) this.#runnerData.set(job.job_id, runnerData);
     this.emit('enqueued', job.job_id);
 
-    setImmediate(() => this.#drain());
+    const persistence = this.#persistJob(job);
+    persistence
+      .then(() => setImmediate(() => this.#drain()))
+      .catch(() => {
+        if (job.status !== 'queued') return;
+        const timestamp = nowISO();
+        job.status = 'failed';
+        job.updated_at = timestamp;
+        job.finished_at = timestamp;
+        job.error = {
+          code: 'JOB_STORE_WRITE_FAILED',
+          message: 'Não foi possível persistir o job antes da execução.',
+        };
+        this.#queue = this.#queue.filter((id) => id !== job.job_id);
+        this.#runnerData.delete(job.job_id);
+        this.emit('completed', job.job_id);
+      });
 
     return { job_id: job.job_id };
+  }
+
+  async enqueuePersisted(args = {}) {
+    const result = this.enqueue(args);
+    if (result.error) return result;
+    try {
+      await this.waitForPersistence(result.job_id);
+      return result;
+    } catch {
+      return {
+        job_id: result.job_id,
+        error: 'JOB_STORE_WRITE_FAILED',
+        message: 'Não foi possível persistir o job antes da execução.',
+      };
+    }
+  }
+
+  async waitForPersistence(jobId) {
+    await (this.#storeTails.get(jobId) ?? Promise.resolve());
   }
 
   cancel(jobId) {
@@ -346,11 +398,13 @@ export class JobQueue extends EventEmitter {
         finished_at: nowISO(),
         result: {
           summary: result.summary,
+          output: result.result,
           next_actions: result.next_actions,
           artifacts: result.artifacts,
           tools_used: result.tools_used,
           session_id: result.session_id,
-          memory_note: result.memory_note ?? null,
+          memory: result.memory ?? null,
+          warnings: result.warnings ?? [],
         },
         model: result.model ?? job.model,
         executor: result.executor ?? job.executor,
@@ -400,9 +454,31 @@ export class JobQueue extends EventEmitter {
       executor: job.executor,
       error: job.error ? { code: job.error.code } : null,
     };
-    const filePath = path.join(this.#storeDir, `${job.job_id}.json`);
-    await writeFile(filePath, JSON.stringify(safe), { mode: 0o600 });
-    await chmod(filePath, 0o600);
+    await this.#serializeStore(job.job_id, async () => {
+      const filePath = path.join(this.#storeDir, `${job.job_id}.json`);
+      const temporaryPath = path.join(
+        this.#storeDir,
+        `.${job.job_id}.${randomUUID()}.tmp`,
+      );
+      try {
+        await writeFile(temporaryPath, JSON.stringify(safe), { mode: 0o600 });
+        await chmod(temporaryPath, 0o600);
+        await rename(temporaryPath, filePath);
+      } finally {
+        await unlink(temporaryPath).catch(() => {});
+      }
+    });
+  }
+
+  #serializeStore(jobId, operation) {
+    const previous = this.#storeTails.get(jobId) ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(operation);
+    this.#storeTails.set(jobId, current);
+    return current.finally(() => {
+      if (this.#storeTails.get(jobId) === current) {
+        this.#storeTails.delete(jobId);
+      }
+    });
   }
 
   #prune() {
@@ -439,13 +515,15 @@ export class JobQueue extends EventEmitter {
   #deleteJob(jobId) {
     this.#jobs.delete(jobId);
     this.#runnerData.delete(jobId);
-    this.#removeStore(jobId);
+    this.#removeStore(jobId).catch(() => {});
   }
 
   async #removeStore(jobId) {
     if (!this.#storeDir) return;
-    const filePath = path.join(this.#storeDir, `${jobId}.json`);
-    await unlink(filePath).catch(() => {});
+    await this.#serializeStore(jobId, async () => {
+      const filePath = path.join(this.#storeDir, `${jobId}.json`);
+      await unlink(filePath).catch(() => {});
+    });
   }
 
   #runFn = async () => ({ status: 'succeeded', summary: 'No runner set.' });

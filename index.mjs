@@ -337,7 +337,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const { name, arguments: args } = req.params;
+  const { name, arguments: rawArgs } = req.params;
+  const args = rawArgs ?? {};
   const match = name.match(/^verboo_(.+)$/);
 
   if (!match) {
@@ -391,29 +392,28 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
       };
     } else if (name === 'verboo_agent_start') {
-      // Validate same as verboo_agent
+      let request;
       try {
-        normalizeAgentRequest(args, Object.keys(MODELS));
+        request = normalizeAgentRequest(args, Object.keys(MODELS));
       } catch (err) {
         return { content: [{ type: 'text', text: JSON.stringify(formatAgentFailure(err), null, 2) }], isError: true };
       }
       const cwd = await resolveAllowedCwd(
-        String(args.cwd ?? ''),
+        request.cwd,
         process.env.VERBOO_AGENT_ALLOWED_ROOTS,
       );
       const executor = resolveAgentExecutor(args.executor, process.env);
-      const model = args.model ?? 'auto';
       const agentArgs = {
-        prompt: String(args.prompt ?? ''),
+        prompt: request.prompt,
         cwd,
-        mode: args.mode ?? 'read_only',
-        model,
+        mode: request.mode,
+        model: request.model,
         executor,
-        timeout_seconds: Number(args.timeout_seconds ?? 600),
+        timeout_seconds: request.timeoutSeconds,
       };
-      const result = jobQueue.enqueue({
+      const result = await jobQueue.enqueuePersisted({
         cwd,
-        model,
+        model: request.model,
         executor,
         runnerData: agentArgs,
       });
@@ -429,25 +429,49 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           return { content: [{ type: 'text', text: JSON.stringify({ jobs: jobQueue.listJobs() }, null, 2) }] };
         case 'status':
           if (!jobId) return { content: [{ type: 'text', text: JSON.stringify({ error: 'job_id obrigatorio' }) }], isError: true };
-          return { content: [{ type: 'text', text: JSON.stringify(jobQueue.getJob(jobId) ?? { error: 'NOT_FOUND' }, null, 2) }] };
+          {
+            const payload = jobQueue.getJob(jobId) ?? { error: 'NOT_FOUND' };
+            return {
+              content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+              isError: Boolean(payload.error),
+            };
+          }
         case 'result':
           if (!jobId) return { content: [{ type: 'text', text: JSON.stringify({ error: 'job_id obrigatorio' }) }], isError: true };
-          return { content: [{ type: 'text', text: JSON.stringify(jobQueue.getJobResult(jobId) ?? { error: 'NOT_FOUND' }, null, 2) }] };
+          {
+            const payload = jobQueue.getJobResult(jobId) ?? { error: 'NOT_FOUND' };
+            return {
+              content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+              isError: Boolean(payload.error),
+            };
+          }
         case 'cancel':
           if (!jobId) return { content: [{ type: 'text', text: JSON.stringify({ error: 'job_id obrigatorio' }) }], isError: true };
-          return { content: [{ type: 'text', text: JSON.stringify(jobQueue.cancel(jobId), null, 2) }] };
+          {
+            const payload = jobQueue.cancel(jobId);
+            return {
+              content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+              isError: Boolean(payload.error),
+            };
+          }
         default:
           return { content: [{ type: 'text', text: JSON.stringify({ error: `Action desconhecida: ${action}` }) }], isError: true };
       }
     } else if (name === 'verboo_memory') {
+      const action = String(args.action ?? 'status');
+      if (!['status', 'read', 'remember'].includes(action)) {
+        throw new Error(`Action desconhecida: ${action}`);
+      }
       const cwd = await resolveAllowedCwd(
         String(args.cwd ?? ''),
         process.env.VERBOO_AGENT_ALLOWED_ROOTS,
       );
-      if (args.action === 'remember') {
+      if (action === 'remember') {
+        const note = String(args.note ?? '').trim();
+        if (!note) throw new Error('note é obrigatória para action=remember.');
         const persisted = await rememberProjectNote(
           cwd,
-          args.note,
+          note,
           { executor: 'orchestrator', status: 'curated' },
           process.env,
         );
@@ -458,7 +482,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           }],
         };
       }
-      const entries = args.action === 'read'
+      const entries = action === 'read'
         ? await readProjectMemory(cwd, process.env)
         : [];
       return {
@@ -634,6 +658,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
   }
 
   if (req.params.uri === 'verboo://status') {
+    const queueStatus = jobQueue.status;
     return {
       contents: [{
         uri: 'verboo://status',
@@ -651,9 +676,9 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
           memory: memoryStatus(process.env),
           job_queue: {
             concurrency: jobQueue.capacity,
-            queued: jobQueue.status.queued,
-            running: jobQueue.status.running,
-            total: jobQueue.status.total,
+            queued: queueStatus.queued,
+            running: queueStatus.running,
+            total: queueStatus.total,
           },
         }, null, 2),
       }],

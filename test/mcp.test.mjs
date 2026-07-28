@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -114,8 +114,17 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   assert.match(payload.summary, /fora das raízes autorizadas/);
 });
 
-test('MCP verboo_agent_start enfileira e verboo_job cancela antes de executar', async (t) => {
+test('MCP verboo_agent_start enfileira e verboo_job cancela execução em andamento', async (t) => {
   const repo = path.resolve('.');
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'verboo-mcp-agent-'));
+  const fakeAgent = path.join(fixture, 'fake-agent.mjs');
+  await writeFile(
+    fakeAgent,
+    [
+      "process.on('SIGTERM', () => process.exit(0));",
+      'setInterval(() => {}, 1000);',
+    ].join('\n'),
+  );
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.join(repo, 'index.mjs')],
@@ -127,6 +136,8 @@ test('MCP verboo_agent_start enfileira e verboo_job cancela antes de executar', 
       VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flash',
       VERBOO_MODEL_TIERS: 'pro',
       VERBOO_MEMORY_ENABLED: '0',
+      VERBOO_CODE_BIN: process.execPath,
+      VERBOO_CODE_ENTRYPOINT: fakeAgent,
     },
     stderr: 'pipe',
   });
@@ -146,7 +157,19 @@ test('MCP verboo_agent_start enfileira e verboo_job cancela antes de executar', 
   assert.ok(enqueuedPayload.job_id);
   assert.equal(enqueuedPayload.error, undefined);
 
-  // verboo_job action=cancel — cancela ainda na fila (sem executar agente real)
+  let runningPayload;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const runningResult = await client.callTool({
+      name: 'verboo_job',
+      arguments: { action: 'status', job_id: enqueuedPayload.job_id },
+    });
+    runningPayload = JSON.parse(runningResult.content[0].text);
+    if (runningPayload.status === 'running') break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(runningPayload.status, 'running');
+
+  // verboo_job action=cancel — cancela deterministicamente o agente fake.
   const cancelResult = await client.callTool({
     name: 'verboo_job',
     arguments: { action: 'cancel', job_id: enqueuedPayload.job_id },
@@ -178,6 +201,7 @@ test('MCP verboo_agent_start enfileira e verboo_job cancela antes de executar', 
   });
   const missingPayload = JSON.parse(missingResult.content[0].text);
   assert.equal(missingPayload.error, 'NOT_FOUND');
+  assert.equal(missingResult.isError, true);
 });
 
 test('MCP verboo://status resource contem capacity/queued/running/total', async (t) => {

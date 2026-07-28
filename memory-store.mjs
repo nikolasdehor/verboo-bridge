@@ -3,7 +3,6 @@ import {
   appendFile,
   mkdir,
   open,
-  readFile,
 } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -55,6 +54,10 @@ export function projectMemoryFile(cwd, env) {
 
 function redactSensitive(value) {
   return String(value ?? '')
+    .replace(
+      /<\/?\s*(?:verboo_memory|memory_note)\s*>/gi,
+      '[MARCADOR DE MEMÓRIA REDIGIDO]',
+    )
     .replace(
       /\b(?:sk-(?:ant|proj|svc)-|sk_|vbk_|gh[pousr]_|github_pat_|hf_|glpat-)[a-z0-9_-]{8,}\b/gi,
       '[SEGREDO REDIGIDO]',
@@ -194,16 +197,30 @@ export function configuredSharedMemoryFiles(env) {
     .slice(0, MAX_SHARED_FILES);
 }
 
+async function readTextPrefix(file, maxChars) {
+  const handle = await open(file, 'r');
+  try {
+    const buffer = Buffer.alloc(maxChars * 4);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString('utf8').slice(0, maxChars);
+  } finally {
+    await handle.close();
+  }
+}
+
 async function readSharedMemory(env) {
   const sections = [];
   let usedChars = 0;
   for (const file of configuredSharedMemoryFiles(env)) {
     if (usedChars >= MAX_SHARED_CONTEXT_CHARS) break;
     try {
-      const raw = await readFile(file, 'utf8');
       const remaining = MAX_SHARED_CONTEXT_CHARS - usedChars;
+      const raw = await readTextPrefix(
+        file,
+        Math.min(MAX_SHARED_FILE_CHARS, remaining),
+      );
       const content = redactSensitive(
-        raw.slice(0, Math.min(MAX_SHARED_FILE_CHARS, remaining)),
+        raw,
       ).trim();
       if (!content) continue;
       sections.push(`Fonte compartilhada: ${path.basename(file)}\n${content}`);
@@ -226,7 +243,7 @@ export async function loadMemoryContext(cwd, env) {
   }
 
   const [entries, sharedSections] = await Promise.all([
-    readProjectMemory(cwd, env),
+    readProjectMemory(cwd, env).catch(() => []),
     readSharedMemory(env),
   ]);
   const projectSection = entries.length

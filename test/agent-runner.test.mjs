@@ -550,6 +550,51 @@ process.stdout.write(JSON.stringify({
   assert.equal((await readProjectMemory(await realpath(base), env)).length, 2);
 });
 
+test('falha de persistência da memória não mascara execução bem-sucedida', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-memory-failure-'));
+  const fakeVerboo = path.join(base, 'verboo-code');
+  const blockedMemoryPath = path.join(base, 'memory-is-a-file');
+  await writeFile(blockedMemoryPath, 'bloqueio');
+  await writeFile(
+    fakeVerboo,
+    `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  type: 'result',
+  session_id: 'memory_failure',
+  result: 'Alteração concluída. <memory_note>Persistir esta decisão.</memory_note>'
+}) + '\\n');
+`,
+  );
+  await chmod(fakeVerboo, 0o755);
+
+  const result = await runVerbooAgent(
+    {
+      prompt: 'Revise a decisão.',
+      cwd: base,
+      executor: 'native',
+      mode: 'read_only',
+      model: 'deepseek-v4-flash',
+      timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: {
+        ...process.env,
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_CODE_BIN: fakeVerboo,
+        VERBOO_MEMORY_ENABLED: '1',
+        VERBOO_MEMORY_DIR: blockedMemoryPath,
+      },
+    },
+  );
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result, 'Alteração concluída.');
+  assert.equal(result.memory.persisted, false);
+  assert.equal(result.memory.warning.code, 'MEMORY_PERSIST_FAILED');
+  assert.deepEqual(result.warnings, [result.memory.warning]);
+});
+
 test('model auto tenta fallback recuperável e relata todas as tentativas', async () => {
   resetModelRuntimeState();
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-model-fallback-'));
@@ -1403,6 +1448,40 @@ test('waitForAgentSlot: resolve imediatamente quando slot disponivel', async () 
   const env = { VERBOO_AGENT_MAX_CONCURRENCY: '2' };
   const release = await waitForAgentSlot(env);
   assert.equal(typeof release, 'function');
+  release();
+});
+
+test('runVerbooAgent libera slot fornecido quando o preflight falha', async () => {
+  let releases = 0;
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'edite',
+        cwd: '/repo',
+        mode: 'write',
+      },
+      {
+        availableModels: MODELS,
+        env: {},
+        slotRelease: () => { releases += 1; },
+      },
+    ),
+    (error) => error.code === 'WRITE_DISABLED',
+  );
+  assert.equal(releases, 1);
+});
+
+test('runVerbooAgent valida chamada síncrona antes de disputar slot interno', async () => {
+  resetAgentSlots();
+  const env = { VERBOO_AGENT_MAX_CONCURRENCY: '1' };
+  const release = await waitForAgentSlot(env);
+  await assert.rejects(
+    () => runVerbooAgent(
+      { prompt: '', cwd: '/repo' },
+      { availableModels: MODELS, env },
+    ),
+    (error) => error.code === 'PROMPT_REQUIRED',
+  );
   release();
 });
 
