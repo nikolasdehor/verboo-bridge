@@ -1134,7 +1134,7 @@ export function executorAvailableModels(executor, availableModels, env) {
 }
 
 export async function runVerbooAgent(args, options) {
-  const releaseAgentSlot = options.slotRelease ?? acquireAgentSlot(options.env);
+  let releaseAgentSlot = options.slotRelease;
   try {
     const request = normalizeAgentRequest(args, options.availableModels);
     if (request.mode === 'write' && options.env.VERBOO_AGENT_WRITE_ENABLED !== '1') {
@@ -1143,6 +1143,7 @@ export async function runVerbooAgent(args, options) {
         'Modo write desabilitado no servidor MCP.',
       );
     }
+    releaseAgentSlot ??= acquireAgentSlot(options.env);
 
     request.cwd = await resolveAllowedCwd(
       request.cwd,
@@ -1206,6 +1207,6 @@ export async function runVerbooAgent(args, options) {
     delete result.memory_note;
     return result;
   } finally {
-    releaseAgentSlot();
+    releaseAgentSlot?.();
   }
 }

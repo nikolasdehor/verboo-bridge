@@ -1471,6 +1471,20 @@ test('runVerbooAgent libera slot fornecido quando o preflight falha', async () =
   assert.equal(releases, 1);
 });
 
+test('runVerbooAgent valida chamada síncrona antes de disputar slot interno', async () => {
+  resetAgentSlots();
+  const env = { VERBOO_AGENT_MAX_CONCURRENCY: '1' };
+  const release = await waitForAgentSlot(env);
+  await assert.rejects(
+    () => runVerbooAgent(
+      { prompt: '', cwd: '/repo' },
+      { availableModels: MODELS, env },
+    ),
+    (error) => error.code === 'PROMPT_REQUIRED',
+  );
+  release();
+});
+
 test('waitForAgentSlot: release e idempotente', async () => {
   resetAgentSlots();
   const env = { VERBOO_AGENT_MAX_CONCURRENCY: '1' };
