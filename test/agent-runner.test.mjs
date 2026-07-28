@@ -16,9 +16,12 @@ import {
   parseVerbooCodeEvents,
   resolveAgentExecutor,
   resolveAllowedCwd,
+  resetAgentSlots,
   resetModelRuntimeState,
   runVerbooAgent,
+  waitForAgentSlot,
 } from '../agent-runner.mjs';
+import { readProjectMemory } from '../memory-store.mjs';
 
 const MODELS = ['deepseek-v4-flash', 'glm-5.2'];
 
@@ -488,6 +491,63 @@ process.stdout.write(JSON.stringify({
   assert.equal(result.session_id, 'native_run');
   assert.deepEqual(result.tools_used, ['Edit']);
   assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'status.txt')]);
+});
+
+test('runVerbooAgent persiste nota e injeta memória na execução seguinte', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-memory-'));
+  const fakeVerboo = path.join(base, 'verboo-code');
+  await writeFile(
+    fakeVerboo,
+    `#!/usr/bin/env node
+const prompt = process.argv.at(-1);
+const recalled = prompt.includes('O projeto usa filas idempotentes.');
+process.stdout.write(JSON.stringify({
+  type: 'result',
+  session_id: recalled ? 'memory_recalled' : 'memory_created',
+  result: recalled
+    ? 'Memória recuperada. <memory_note>Manter filas idempotentes.</memory_note>'
+    : 'Decisão concluída. <memory_note>O projeto usa filas idempotentes.</memory_note>'
+}) + '\\n');
+`,
+  );
+  await chmod(fakeVerboo, 0o755);
+  const env = {
+    ...process.env,
+    VERBOO_AGENT_ALLOWED_ROOTS: base,
+    VERBOO_CODE_BIN: fakeVerboo,
+    VERBOO_MEMORY_ENABLED: '1',
+    VERBOO_MEMORY_DIR: path.join(base, 'memory'),
+  };
+
+  const first = await runVerbooAgent(
+    {
+      prompt: 'Defina a estratégia de filas.',
+      cwd: base,
+      executor: 'native',
+      mode: 'read_only',
+      model: 'deepseek-v4-flash',
+      timeout_seconds: 10,
+    },
+    { availableModels: MODELS, env },
+  );
+  const second = await runVerbooAgent(
+    {
+      prompt: 'Revise a estratégia anterior.',
+      cwd: base,
+      executor: 'native',
+      mode: 'read_only',
+      model: 'deepseek-v4-flash',
+      timeout_seconds: 10,
+    },
+    { availableModels: MODELS, env },
+  );
+
+  assert.equal(first.result, 'Decisão concluída.');
+  assert.equal(first.memory.persisted, true);
+  assert.equal(first.memory.injected_project_entries, 0);
+  assert.equal(second.session_id, 'memory_recalled');
+  assert.equal(second.memory.injected_project_entries, 1);
+  assert.equal((await readProjectMemory(await realpath(base), env)).length, 2);
 });
 
 test('model auto tenta fallback recuperável e relata todas as tentativas', async () => {
@@ -1336,4 +1396,112 @@ test('falha tem contrato de recuperação determinístico', () => {
     artifacts: [],
     session_id: null,
   });
+});
+
+test('waitForAgentSlot: resolve imediatamente quando slot disponivel', async () => {
+  resetAgentSlots();
+  const env = { VERBOO_AGENT_MAX_CONCURRENCY: '2' };
+  const release = await waitForAgentSlot(env);
+  assert.equal(typeof release, 'function');
+  release();
+});
+
+test('waitForAgentSlot: release e idempotente', async () => {
+  resetAgentSlots();
+  const env = { VERBOO_AGENT_MAX_CONCURRENCY: '1' };
+  const firstRelease = await waitForAgentSlot(env);
+  firstRelease();
+  firstRelease();
+
+  const secondRelease = await waitForAgentSlot(env);
+  const thirdController = new AbortController();
+  let thirdResolved = false;
+  const third = waitForAgentSlot(env, thirdController.signal)
+    .then((release) => {
+      thirdResolved = true;
+      release();
+    });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(thirdResolved, false);
+  secondRelease();
+  await third;
+});
+
+test('waitForAgentSlot: rejeita quando signal ja aborted', async () => {
+  resetAgentSlots();
+  const env = { VERBOO_AGENT_MAX_CONCURRENCY: '1' };
+  const ac = new AbortController();
+  ac.abort();
+  try {
+    await waitForAgentSlot(env, ac.signal);
+    assert.fail('Deveria ter rejeitado');
+  } catch (err) {
+    assert.equal(err.code, 'CANCELLED');
+  }
+});
+
+test('configuredConcurrency: default 4', async () => {
+  resetAgentSlots();
+  const env = {};
+  const releases = [];
+  for (let i = 0; i < 4; i++) {
+    releases.push(await waitForAgentSlot(env));
+    assert.equal(typeof releases[i], 'function');
+  }
+  for (const r of releases) r();
+});
+
+test('runVerbooAgent propaga cancelamento ao subprocesso', {
+  skip: process.platform === 'win32',
+}, async () => {
+  resetAgentSlots();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-abort-signal-'));
+  const controller = new AbortController();
+  const signals = [];
+  let child;
+  let started;
+  const didStart = new Promise((resolve) => { started = resolve; });
+  const spawnImpl = () => {
+    child = new EventEmitter();
+    child.pid = 65432;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    started();
+    return child;
+  };
+  const killImpl = (pid, signal) => {
+    signals.push([pid, signal]);
+    if (signal === 'SIGKILL') setImmediate(() => child.emit('close', null));
+  };
+
+  const running = runVerbooAgent(
+    {
+      prompt: 'aguarde',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_API_KEY: 'test-key',
+      },
+      spawnImpl,
+      killImpl,
+      killGraceMs: 5,
+      signal: controller.signal,
+    },
+  );
+
+  await didStart;
+  controller.abort();
+  await assert.rejects(running, (error) => error.code === 'CANCELLED');
+  assert.deepEqual(signals, [
+    [-65432, 'SIGTERM'],
+    [-65432, 'SIGKILL'],
+  ]);
 });

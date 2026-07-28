@@ -3,6 +3,12 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 import { MODEL_CATALOG, selectModelForTask } from './model-router.mjs';
+import {
+  extractMemoryNote,
+  loadMemoryContext,
+  promptWithMemory,
+  rememberProjectNote,
+} from './memory-store.mjs';
 
 export const AGENT_MODES = ['read_only', 'write'];
 export const AGENT_EXECUTORS = ['opencode', 'native'];
@@ -12,10 +18,21 @@ export const MAX_TIMEOUT_SECONDS = 1800;
 
 const MAX_STDOUT_BYTES = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES = 256 * 1024;
+const DEFAULT_AGENT_CONCURRENCY = 4;
 const MAX_AGENT_CONCURRENCY = 8;
 const KILL_GRACE_MS = 2_000;
 const AGENT_NAME = 'verboo-bridge-agent';
 let activeAgentRuns = 0;
+let slotWaiters = [];
+
+export function resetAgentSlots() {
+  for (const waiter of slotWaiters) {
+    waiter.cleanup?.();
+    waiter.reject(agentError('CANCELLED', 'Fila de slots reiniciada.'));
+  }
+  activeAgentRuns = 0;
+  slotWaiters = [];
+}
 
 function createModelRuntimeState() {
   return Object.fromEntries(Object.keys(MODEL_CATALOG).map((model) => [
@@ -58,10 +75,10 @@ function agentError(code, message) {
 }
 
 function configuredConcurrency(env) {
-  const value = Number(env.VERBOO_AGENT_MAX_CONCURRENCY ?? 1);
+  const value = Number(env.VERBOO_AGENT_MAX_CONCURRENCY ?? DEFAULT_AGENT_CONCURRENCY);
   return Number.isInteger(value) && value >= 1 && value <= MAX_AGENT_CONCURRENCY
     ? value
-    : 1;
+    : DEFAULT_AGENT_CONCURRENCY;
 }
 
 function acquireAgentSlot(env) {
@@ -73,9 +90,63 @@ function acquireAgentSlot(env) {
     );
   }
   activeAgentRuns += 1;
+  return createSlotRelease();
+}
+
+function releaseAgentSlot() {
+  if (activeAgentRuns > 0) activeAgentRuns -= 1;
+  notifySlotWaiters();
+}
+
+function createSlotRelease() {
+  let released = false;
   return () => {
-    activeAgentRuns -= 1;
+    if (released) return;
+    released = true;
+    releaseAgentSlot();
   };
+}
+
+function notifySlotWaiters() {
+  while (slotWaiters.length > 0) {
+    const waiter = slotWaiters[0];
+    const limit = configuredConcurrency(waiter.env);
+    if (activeAgentRuns >= limit) break;
+    slotWaiters.shift();
+    if (waiter.signal?.aborted) {
+      waiter.reject(agentError('CANCELLED', 'Cancelado enquanto aguardava slot de agente.'));
+      continue;
+    }
+    if (waiter.cleanup) waiter.cleanup();
+    activeAgentRuns += 1;
+    waiter.resolve(createSlotRelease());
+  }
+}
+
+export function waitForAgentSlot(env, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(agentError('CANCELLED', 'Cancelado enquanto aguardava slot de agente.'));
+  }
+  const limit = configuredConcurrency(env);
+  if (activeAgentRuns < limit) {
+    activeAgentRuns += 1;
+    return Promise.resolve(createSlotRelease());
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, signal: signal ?? null, env };
+    let onAbort;
+    if (signal) {
+      onAbort = () => {
+        const idx = slotWaiters.indexOf(waiter);
+        if (idx >= 0) slotWaiters.splice(idx, 1);
+        waiter.cleanup?.();
+        reject(agentError('CANCELLED', 'Cancelado enquanto aguardava slot de agente.'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    waiter.cleanup = onAbort ? () => signal.removeEventListener('abort', onAbort) : undefined;
+    slotWaiters.push(waiter);
+  });
 }
 
 function isInside(root, candidate) {
@@ -290,7 +361,7 @@ function modelRouteFor(request, availableModels, env) {
 
   const policy = configuredModelPolicy(availableModels, env);
   const route = selectModelForTask({
-    prompt: request.prompt,
+    prompt: request.routePrompt ?? request.prompt,
     mode: request.mode,
     availableModels: policy.availableModels,
     allowTiers: policy.allowTiers,
@@ -669,9 +740,16 @@ function execute(invocation, options) {
     spawnImpl = spawn,
     killImpl = process.kill,
     killGraceMs = KILL_GRACE_MS,
+    signal,
   } = options;
 
   return new Promise((resolve, reject) => {
+    // Reject immediately if signal already aborted
+    if (signal?.aborted) {
+      reject(agentError('CANCELLED', 'Job cancelado antes de iniciar o subprocesso.'));
+      return;
+    }
+
     let stdout = '';
     let stderr = '';
     let stdoutBytes = 0;
@@ -691,11 +769,23 @@ function execute(invocation, options) {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
+    const onSignalAbort = () => terminate(
+      agentError('CANCELLED', 'Job cancelado pelo usuário.'),
+    );
+
+    // Connect external AbortSignal (from job queue) to child process
+    if (signal) {
+      signal.addEventListener('abort', onSignalAbort, { once: true });
+    }
+
     const finish = (callback, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(forceKillTimer);
+      if (signal) {
+        signal.removeEventListener('abort', onSignalAbort);
+      }
       callback(value);
     };
 
@@ -841,6 +931,7 @@ async function executeAgentAttempt(
     spawnImpl: options.spawnImpl,
     killImpl: options.killImpl,
     killGraceMs: options.killGraceMs,
+    signal: options.signal,
   });
   const parsed = executor === 'native'
     ? parseVerbooCodeEvents(raw, request.cwd)
@@ -880,12 +971,13 @@ function successfulAgentResult({
   parsed,
   status,
 }) {
+  const memory = extractMemoryNote(parsed.result);
   return {
     status,
     summary: status === 'warning'
       ? 'O agente encerrou sem executar ferramenta de edição; nenhuma mudança foi confirmada.'
       : `Agente Verboo concluiu a tarefa em modo ${request.mode}.`,
-    result: parsed.result || 'Execução concluída sem mensagem final.',
+    result: memory.result || 'Execução concluída sem mensagem final.',
     next_actions: status === 'warning'
       ? [
           'Não trate a tarefa como concluída.',
@@ -905,6 +997,7 @@ function successfulAgentResult({
     cwd: request.cwd,
     executor,
     routing: routingResult(route, initialRoute, model, attempts),
+    memory_note: memory.note || null,
   };
 }
 
@@ -1045,12 +1138,16 @@ export async function runVerbooAgent(args, options) {
     );
   }
 
-  const releaseAgentSlot = acquireAgentSlot(options.env);
+  const releaseAgentSlot = options.slotRelease ?? acquireAgentSlot(options.env);
   try {
     request.cwd = await resolveAllowedCwd(
       request.cwd,
       options.env.VERBOO_AGENT_ALLOWED_ROOTS,
     );
+    const originalPrompt = request.prompt;
+    const memoryContext = await loadMemoryContext(request.cwd, options.env);
+    request.routePrompt = originalPrompt;
+    request.prompt = promptWithMemory(originalPrompt, memoryContext);
     const executor = resolveAgentExecutor(args.executor, options.env);
     validateExecutorCredentials(executor, options.env);
     const availableModels = executorAvailableModels(
@@ -1074,10 +1171,22 @@ export async function runVerbooAgent(args, options) {
       error.executor = executor;
       throw error;
     }
-    return await runRoutedAgent(request, executor, {
+    const result = await runRoutedAgent(request, executor, {
       ...options,
       availableModels,
     });
+    result.memory = {
+      injected_project_entries: memoryContext.projectEntries,
+      injected_shared_files: memoryContext.sharedFiles,
+      persisted: await rememberProjectNote(
+        request.cwd,
+        result.memory_note,
+        result,
+        options.env,
+      ),
+    };
+    delete result.memory_note;
+    return result;
   } finally {
     releaseAgentSlot();
   }
