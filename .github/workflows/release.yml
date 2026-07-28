@@ -1,14 +1,35 @@
-name: Release
+name: CI / Release
 
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Validate
+        run: npm test
+
   release:
+    if: github.event_name == 'push'
+    needs: validate
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,12 +38,6 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-
-      - name: Install
-        run: npm ci --ignore-scripts
-
-      - name: Validate
-        run: npm test
 
       - name: Check npm version
         id: check
