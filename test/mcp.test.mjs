@@ -144,7 +144,7 @@ test('MCP aplica denylist em tools, schemas, recursos e chamadas antigas', async
       ...process.env,
       VERBOO_API_KEY: 'test-key',
       VERBOO_AGENT_ALLOWED_ROOTS: repo,
-      VERBOO_MODEL_DENYLIST: 'qwen3.6-27b,glm-4.7-flash',
+      VERBOO_MODEL_DENYLIST: 'qwen3.6-27b,glm-4.7-flash,glm-5.2',
       VERBOO_MEMORY_ENABLED: '0',
     },
     stderr: 'pipe',
@@ -165,6 +165,7 @@ test('MCP aplica denylist em tools, schemas, recursos e chamadas antigas', async
       .inputSchema.properties.model.enum;
     assert.ok(!modelEnum.includes('qwen3.6-27b'));
     assert.ok(!modelEnum.includes('glm-4.7-flash'));
+    assert.ok(!modelEnum.includes('glm-5.2'));
   }
   for (const name of ['verboo_route', 'verboo_agent', 'verboo_agent_start']) {
     const schema = listed.tools.find((tool) => tool.name === name).inputSchema;
@@ -172,6 +173,7 @@ test('MCP aplica denylist em tools, schemas, recursos e chamadas antigas', async
       ?? schema.properties.exclude_models.items.enum;
     assert.ok(!modelEnum.includes('qwen3.6-27b'));
     assert.ok(!modelEnum.includes('glm-4.7-flash'));
+    assert.ok(!modelEnum.includes('glm-5.2'));
   }
 
   const modelsResource = await client.readResource({ uri: 'verboo://models' });
@@ -179,6 +181,7 @@ test('MCP aplica denylist em tools, schemas, recursos e chamadas antigas', async
     .map((model) => model.id);
   assert.ok(!modelIds.includes('qwen3.6-27b'));
   assert.ok(!modelIds.includes('glm-4.7-flash'));
+  assert.ok(!modelIds.includes('glm-5.2'));
 
   const staleDirectCall = await client.callTool({
     name: 'verboo_qwen3_6_27b',
@@ -186,6 +189,13 @@ test('MCP aplica denylist em tools, schemas, recursos e chamadas antigas', async
   });
   assert.equal(staleDirectCall.isError, true);
   assert.match(staleDirectCall.content[0].text, /DENYLIST/);
+
+  const staleGlm52Call = await client.callTool({
+    name: 'verboo_glm_5_2',
+    arguments: { prompt: 'não deve executar' },
+  });
+  assert.equal(staleGlm52Call.isError, true);
+  assert.match(staleGlm52Call.content[0].text, /DENYLIST/);
 
   const deniedAsyncCall = await client.callTool({
     name: 'verboo_agent_start',
@@ -198,6 +208,18 @@ test('MCP aplica denylist em tools, schemas, recursos e chamadas antigas', async
   assert.equal(deniedAsyncCall.isError, true);
   assert.match(deniedAsyncCall.content[0].text, /DENYLIST/);
   assert.equal(JSON.parse(deniedAsyncCall.content[0].text).job_id, undefined);
+
+  const deniedGlm52Call = await client.callTool({
+    name: 'verboo_agent_start',
+    arguments: {
+      prompt: 'não deve enfileirar',
+      cwd: repo,
+      model: 'glm-5.2',
+    },
+  });
+  assert.equal(deniedGlm52Call.isError, true);
+  assert.match(deniedGlm52Call.content[0].text, /DENYLIST/);
+  assert.equal(JSON.parse(deniedGlm52Call.content[0].text).job_id, undefined);
 });
 
 test('MCP verboo_agent_start enfileira e verboo_job cancela execução em andamento', async (t) => {

@@ -973,18 +973,22 @@ test('modelo manual respeita allowlist e tiers administrativos', async () => {
 
 test('denylist global filtra seleção automática e rejeita seleção manual', () => {
   const env = {
-    VERBOO_MODEL_DENYLIST: 'qwen3.6-27b,glm-4.7-flash',
+    VERBOO_MODEL_DENYLIST: 'qwen3.6-27b,glm-4.7-flash,glm-5.2',
   };
 
   assert.deepEqual(
     globallyAllowedModels(
-      ['deepseek-v4-flash', 'qwen3.6-27b', 'glm-4.7-flash'],
+      ['deepseek-v4-flash', 'qwen3.6-27b', 'glm-4.7-flash', 'glm-5.2'],
       env,
     ),
     ['deepseek-v4-flash'],
   );
   assert.throws(
     () => assertGlobalModelAllowed('qwen3.6-27b', env),
+    (error) => error.code === 'MODEL_NOT_ALLOWED' && /DENYLIST/.test(error.message),
+  );
+  assert.throws(
+    () => assertGlobalModelAllowed('glm-5.2', env),
     (error) => error.code === 'MODEL_NOT_ALLOWED' && /DENYLIST/.test(error.message),
   );
 });
