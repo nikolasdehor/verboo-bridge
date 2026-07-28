@@ -176,7 +176,7 @@ const server = new Server(
       prompts: {},
       resources: {},
     },
-    instructions: 'Use somente as ferramentas MCP verboo_agent, verboo_agent_start, verboo_job e verboo_route para delegar à Verboo; nunca execute a CLI verboo diretamente pelo shell. verboo_agent é um subagente externo e repo-aware. read_only e write são modos de permissão. Prefira executor=native e model=auto. Use write apenas com autorização e opt-in. Se as ferramentas MCP não estiverem disponíveis, informe erro de configuração em vez de improvisar. O orquestrador revisa o diff e executa testes, Git e deploy.',
+    instructions: 'Delegue à Verboo somente pelas ferramentas MCP; nunca execute a CLI no shell. Cada execução é um subagente externo. Use verboo_agent_start por padrão em App/IDE ou tarefa não trivial, longa, paralela ou de duração incerta: mostre o job_id, continue trabalhando e consulte verboo_job status/result sem reenviar após timeout. Reserve verboo_agent síncrono para tarefa curta. Prefira executor=native, model=auto e read_only; write exige autorização e opt-in. Se o MCP faltar, reporte erro de configuração. O orquestrador revisa e roda testes, Git e deploy.',
   },
 );
 
@@ -227,8 +227,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           tiers: {
             type: 'array',
-            items: { type: 'string', enum: ['pro', 'ultra'] },
-            default: ['pro', 'ultra'],
+            items: { type: 'string', enum: ['pro', 'max', 'ultra'] },
+            default: ['pro', 'max', 'ultra'],
           },
           exclude_models: {
             type: 'array',
@@ -247,7 +247,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'verboo_agent',
-      description: 'Executa um subagente Verboo repo-aware pelo MCP, sem chamar a CLI diretamente. model=auto classifica a tarefa, distribui concorrência e tenta fallback recuperável; um modelo explícito preserva seleção manual. Quem chama escolhe native para usar o harness Verboo Code/OAuth ou opencode como fallback. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1 e pode somente editar. O orquestrador executa testes e outros comandos.',
+      description: 'Executa um subagente Verboo repo-aware de forma síncrona e bloqueia até concluir; use apenas para tarefa curta. Para App/IDE ou tarefa não trivial, longa, paralela ou de duração incerta, use verboo_agent_start. Nunca chame a CLI diretamente. model=auto classifica a tarefa e tenta fallback recuperável. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1. O orquestrador executa testes e outros comandos.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -282,7 +282,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'verboo_agent_start',
-      description: 'Inicia um subagente Verboo assincronamente. Mesma validacao de verboo_agent, retorna job_id imediatamente. Use verboo_job para consultar resultado.',
+      description: 'Inicia um subagente Verboo de forma assíncrona e retorna job_id imediatamente. É o padrão para App/IDE ou tarefa não trivial, longa, paralela ou de duração incerta. Mostre o job_id, continue trabalhando e consulte verboo_job status/result; não reenvie a mesma tarefa após timeout.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -298,7 +298,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: 'verboo_job',
-      description: 'Gerencia jobs assincronos. action=status retorna estado atual; result retorna resultado completo; list lista todos os jobs; cancel cancela um job.',
+      description: 'Gerencia jobs assíncronos iniciados por verboo_agent_start. Use status sem bloquear enquanto trabalha e result após estado terminal; list lista jobs e cancel cancela. Nunca reenvie a tarefa apenas porque uma consulta expirou.',
       inputSchema: {
         type: 'object',
         properties: {

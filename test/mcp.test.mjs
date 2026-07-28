@@ -34,17 +34,29 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   await client.connect(transport);
 
   assert.match(client.getInstructions() ?? '', /subagente externo/);
-  assert.match(client.getInstructions() ?? '', /read_only e write são modos de permissão/);
-  assert.match(client.getInstructions() ?? '', /nunca execute a CLI verboo diretamente/);
+  assert.match(client.getInstructions() ?? '', /verboo_agent_start por padrão em App\/IDE/);
+  assert.match(client.getInstructions() ?? '', /mostre o job_id/);
+  assert.match(client.getInstructions() ?? '', /continue trabalhando e consulte verboo_job/);
+  assert.match(client.getInstructions() ?? '', /Reserve verboo_agent síncrono para tarefa curta/);
+  assert.match(client.getInstructions() ?? '', /nunca execute a CLI no shell/);
+  assert.match(client.getInstructions() ?? '', /reporte erro de configuração/);
 
   const listed = await client.listTools();
   const routeTool = listed.tools.find((tool) => tool.name === 'verboo_route');
   const agentTool = listed.tools.find((tool) => tool.name === 'verboo_agent');
+  const agentStartTool = listed.tools.find((tool) => tool.name === 'verboo_agent_start');
+  const jobTool = listed.tools.find((tool) => tool.name === 'verboo_job');
   const memoryTool = listed.tools.find((tool) => tool.name === 'verboo_memory');
   assert.ok(routeTool);
   assert.ok(agentTool);
+  assert.ok(agentStartTool);
+  assert.ok(jobTool);
   assert.ok(memoryTool);
-  assert.match(agentTool.description, /pelo MCP, sem chamar a CLI diretamente/);
+  assert.match(agentTool.description, /forma síncrona e bloqueia até concluir/);
+  assert.match(agentTool.description, /use apenas para tarefa curta/);
+  assert.match(agentStartTool.description, /padrão para App\/IDE/);
+  assert.match(agentStartTool.description, /Mostre o job_id/);
+  assert.match(jobTool.description, /Nunca reenvie a tarefa/);
   assert.deepEqual(routeTool.inputSchema.properties.executor.enum, [
     'opencode',
     'native',
@@ -57,6 +69,8 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   assert.equal(agentTool.inputSchema.properties.executor.default, 'native');
   assert.equal(agentTool.inputSchema.properties.model.default, 'auto');
   assert.ok(agentTool.inputSchema.properties.model.enum.includes('auto'));
+  assert.ok(agentTool.inputSchema.properties.model.enum.includes('deepseek-v4-pro'));
+  assert.ok(agentTool.inputSchema.properties.model.enum.includes('mimo-v2.5-pro'));
   assert.deepEqual(memoryTool.inputSchema.properties.action.enum, [
     'status',
     'read',

@@ -7,7 +7,7 @@ R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; M='\033[0;35m'; 
 API="${VERBOO_API_KEY:-}"
 [ -z "$API" ] && [ -f ~/.config/claude-secrets.env ] \
   && API=$(grep '^export VERBOO_API_KEY=' ~/.config/claude-secrets.env | sed 's/^export VERBOO_API_KEY="//;s/"$//')
-[ -z "$API" ] && { echo -e "${R}ERRO${N}: VERBOO_API_KEY nao definida" >&2; exit 1; }
+[ -z "$API" ] && { echo -e "${R}ERRO${N}: VERBOO_API_KEY não definida" >&2; exit 1; }
 
 MODEL="deepseek-v4-flash"; TEMP="0.3"; SYS=""; PROMPT=""
 while [ $# -gt 0 ]; do
@@ -15,9 +15,9 @@ while [ $# -gt 0 ]; do
     --model|-m) MODEL="$2"; shift 2 ;;
     --system|-s) SYS="$2"; shift 2 ;;
     --temp|-t) TEMP="$2"; shift 2 ;;
-    --list) echo "deepseek-v4-flash glm-5.2 mimo-v2.5 kimi-k2.7 glm-4.7-flash minimax-m3 qwen3.6-27b"; exit 0 ;;
+    --list) echo "deepseek-v4-flash deepseek-v4-pro glm-5.2 mimo-v2.5 mimo-v2.5-pro kimi-k2.7 glm-4.7-flash minimax-m3 qwen3.6-27b"; exit 0 ;;
     --help|-h)
-      echo -e "${W}vb${N} — Verboo CLI direta\nUso: vb [opcoes] <prompt>\nModelos: deepseek-v4-flash, glm-5.2, mimo-v2.5, etc. Use --list para todos."; exit 0 ;;
+      echo -e "${W}vb${N} — Verboo CLI direta\nUso: vb [opções] <prompt>\nModelos: deepseek-v4-flash, glm-5.2, mimo-v2.5 etc. Use --list para todos."; exit 0 ;;
     *) PROMPT="$1"; shift ;;
   esac
 done

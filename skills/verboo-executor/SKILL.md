@@ -8,9 +8,9 @@ description: Delegate bounded editing, review, and analysis tasks to Verboo mode
 Use Verboo for bounded execution while the current assistant remains the
 orchestrator, reviewer, and final validator.
 
-## Native agent tool
+## Repo-aware agent tools
 
-Prefer `verboo_agent` when the task needs to inspect or modify a repository:
+Use the MCP repo-aware tools when the task needs to inspect or modify a repository:
 
 - Use `verboo_route` first when you need an explainable ranking without executing
   an agent.
@@ -23,6 +23,18 @@ Prefer `verboo_agent` when the task needs to inspect or modify a repository:
   concrete reason to override the explainable router.
 - `timeout_seconds`: 10-1800, normally 600.
 
+## Synchronous vs asynchronous
+
+Use `verboo_agent_start` by default for App/IDE clients and for any task that is
+non-trivial, long, parallel, or has uncertain duration. It returns a `job_id`
+immediately. Show that ID to the user, keep orchestrating, poll
+`verboo_job(action: "status")`, and fetch `verboo_job(action: "result")` after a
+terminal state.
+
+Reserve synchronous `verboo_agent` for a short task where blocking the caller is
+acceptable. A timeout while starting or checking a job is not permission to
+submit the same task again; inspect the existing job first.
+
 Prefer `native` when `@verboo/code` is installed and authenticated. It keeps
 Verboo's own agent harness while the MCP caller remains the orchestrator.
 Use `opencode` when the caller explicitly wants the OpenCode harness or native
@@ -32,6 +44,11 @@ OAuth is unavailable.
 shell, nested-agent, web, and external-directory tools remain disabled. The
 orchestrator must run tests, linters, builds, Git commands, and every other command.
 The bridge rejects `write` unless its server has `VERBOO_AGENT_WRITE_ENABLED=1`.
+The native executor uses `bypassPermissions` so the subprocess does not prompt
+again after the orchestrator delegates. The selected mode still scopes tools:
+`read_only` exposes only `Read`, `Glob`, and `Grep`; `write` also exposes scoped
+`Edit` and `Write`. Explicit deny rules keep secrets, shell, web, hooks, and
+nested agents unavailable.
 The subprocess inherits only a small environment allowlist, excluding GitHub, AWS,
 and unrelated service tokens. Treat these controls as defense in depth, not a
 security sandbox.
@@ -54,10 +71,11 @@ The tool returns a stable object with `status`, `summary`, `result`,
 3. Keep `model: auto` unless a manual model choice is justified; inspect
    `verboo_route` when the routing decision matters.
 4. Choose `native` or `opencode` explicitly when the harness matters.
-5. Use `read_only` for exploration or review.
-6. Use `write` only for an authorized, bounded patch.
-7. Inspect the diff and run the repository's own checks in the orchestrator.
-8. Never let the Verboo agent commit, push, deploy, or handle credentials.
+5. Prefer `verboo_agent_start`; use synchronous `verboo_agent` only for short work.
+6. Use `read_only` for exploration or review.
+7. Use `write` only for an authorized, bounded patch.
+8. Inspect the diff and run the repository's own checks in the orchestrator.
+9. Never let the Verboo agent commit, push, deploy, or handle credentials.
 
 For health, auth, clinical, financial, tenant-isolation, or other high-risk code,
 use Verboo only as an additional opinion. The primary security/code reviewer owns

@@ -28,6 +28,26 @@ export const MODEL_CATALOG = Object.freeze({
     },
     bias: 0.6,
   },
+  'deepseek-v4-pro': {
+    name: 'DeepSeek V4 Pro',
+    ctx: 1_048_576,
+    out: 65_536,
+    tier: 'max',
+    auto: false,
+    note: 'Variante Max para codificação mais exigente',
+    capabilities: {
+      coding: 10,
+      reasoning: 9,
+      review: 9,
+      security: 9,
+      ux: 8,
+      analysis: 9,
+      long_context: 10,
+      speed: 6,
+      light: 4,
+    },
+    bias: 0,
+  },
   'glm-4.7-flash': {
     name: 'GLM 4.7 Flash',
     ctx: 200_704,
@@ -49,7 +69,7 @@ export const MODEL_CATALOG = Object.freeze({
   },
   'glm-5.2': {
     name: 'GLM 5.2',
-    ctx: 524_288,
+    ctx: 196_608,
     out: 65_536,
     tier: 'ultra',
     note: 'Raciocínio complexo e desenvolvimento web',
@@ -68,7 +88,7 @@ export const MODEL_CATALOG = Object.freeze({
   },
   'kimi-k2.7': {
     name: 'Kimi K2.7',
-    ctx: 262_144,
+    ctx: 259_072,
     out: 65_536,
     tier: 'ultra',
     note: 'Bom equilíbrio para tarefas gerais e visuais',
@@ -103,6 +123,26 @@ export const MODEL_CATALOG = Object.freeze({
       light: 5,
     },
     bias: 0.2,
+  },
+  'mimo-v2.5-pro': {
+    name: 'Mimo V2.5 Pro',
+    ctx: 1_048_576,
+    out: 65_536,
+    tier: 'max',
+    auto: false,
+    note: 'Variante Max para análise mais exigente',
+    capabilities: {
+      coding: 8,
+      reasoning: 9,
+      review: 9,
+      security: 8,
+      ux: 7,
+      analysis: 10,
+      long_context: 10,
+      speed: 6,
+      light: 4,
+    },
+    bias: 0,
   },
   'minimax-m3': {
     name: 'Minimax M3',
@@ -295,6 +335,7 @@ export function rankModelsForTask({
       available.has(model)
       && !excluded.has(model)
       && tiers.has(MODEL_CATALOG[model].tier)
+      && MODEL_CATALOG[model].auto !== false
     ))
     .map((model) => {
       const metadata = MODEL_CATALOG[model];

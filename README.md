@@ -7,7 +7,7 @@
 
 <div align="center">
   <a href="https://github.com/verbeux-ai">
-    <img src="https://avatars.githubusercontent.com/u/122481543?v=4" alt="Logo da Verboo" width="140">
+    <img src="https://raw.githubusercontent.com/verbeux-ai/.github/main/images/logo-preto-com-branco-quadrado%20(1).png" alt="Logo da Verboo" width="140">
   </a>
   <h1>verboo-bridge</h1>
   <p><strong>Use modelos da Verboo como sub-agentes no Claude Code, Codex, OpenCode, Cursor ou qualquer cliente MCP</strong></p>
@@ -37,9 +37,9 @@ graph TB
 
     subgraph "Verboo API"
         DS[DeepSeek V4 Flash<br/>1M ctx]
-        GLM[GLM 5.2<br/>512K ctx]
+        GLM[GLM 5.2<br/>197K ctx]
         MIMO[Mimo V2.5<br/>1M ctx]
-        OUTROS[Kimi / Minimax / Qwen]
+        OUTROS[Kimi / Minimax / Qwen<br/>variantes Pro]
     end
 
     CLAUDE -->|MCP tools| MCP
@@ -65,15 +65,22 @@ graph TB
 
 ## Modelos disponíveis
 
-| Modelo | Contexto | Tier | SWE-bench Pro | Terminal-Bench | WebDev Arena | Ideal para |
-|--------|----------|------|:-:|:-:|:-:|-----------|
-| **DeepSeek V4 Flash** | 1.048.576 | Pro | 82-89% | 56.9 | - | Codificação geral, **melhor CxB** |
-| **Mimo V2.5** | 1.048.576 | Pro | - | - | - | Análise pesada, 63 tok/s |
-| **GLM 4.7 Flash** | 200.704 | Pro | - | - | - | Tarefas rápidas |
-| **Qwen 3.6 27B** | 262.144 | Pro | - | - | - | Tarefas leves, 27B params |
-| **GLM 5.2** | 524.288 | Ultra | 62.1% | 81.0 | #2 (1.593 Elo) | Raciocínio complexo |
-| **Kimi K2.7** | 262.144 | Ultra | ~60% | - | - | Tarefas gerais, visão |
-| **Minimax M3** | 1.048.576 | Ultra | - | - | - | Codificação, 87 tok/s, visão |
+| Modelo | Contexto anunciado | Planos | Seleção automática | Ideal para |
+|--------|--------------------|--------|:-------------------:|-----------|
+| **DeepSeek V4 Flash** | 1M | Pro, Max e Ultra | Sim | Codificação geral |
+| **DeepSeek V4 Pro** | 1M | Max | Não | Codificação mais exigente |
+| **Mimo V2.5** | 1M | Pro, Max e Ultra | Sim | Análise com contexto longo |
+| **Mimo V2.5 Pro** | 1M | Max | Não | Análise mais exigente |
+| **GLM 4.7 Flash** | 201k | Junior, Pro, Max e Ultra | Sim | Tarefas rápidas |
+| **Qwen 3.6 27B** | 262k | Junior, Pro, Max e Ultra | Sim | Tarefas leves |
+| **GLM 5.2** | 197k | Ultra | Sim | Raciocínio complexo |
+| **Kimi K2.7** | 259k | Ultra | Sim | Tarefas gerais e visão |
+| **Minimax M3** | até 1M | Max e Ultra | Sim | Codificação rápida e visão |
+
+O roteador não escolhe automaticamente as variantes exclusivas do Max porque a
+disponibilidade depende da assinatura. Elas podem ser selecionadas
+explicitamente por `model` e limitadas com `VERBOO_NATIVE_MODEL_ALLOWLIST`.
+O endpoint `/models` também é filtrado pelo plano associado à chave.
 
 ---
 
@@ -148,14 +155,15 @@ no repositório.
 ## Configuração por plataforma
 
 Em qualquer cliente, o Verboo aparece como uma ferramenta MCP. Ao chamar
-`verboo_agent`, o bridge inicia um subagente externo, separado e ciente do
-repositório. Ele não aparece como um subagente nativo da interface.
+`verboo_agent` ou `verboo_agent_start`, o bridge inicia um subagente externo,
+separado e ciente do repositório. Ele não aparece como um subagente nativo da interface.
 `read_only` e `write` são apenas modos de permissão dessa execução.
 
-> Para delegação de repositório, o orquestrador deve usar `verboo_agent` pelo
-> MCP. Se a ferramenta não aparecer, corrija ou reinicie a integração. Não
-> substitua a chamada por `verboo -p`, `vb`, `opencode run` ou outro comando de
-> shell.
+> Em App/IDE ou tarefa não trivial, longa, paralela ou de duração incerta, use
+> `verboo_agent_start`, mostre o `job_id`, continue trabalhando e consulte
+> `verboo_job` com `status`/`result`. Reserve o `verboo_agent` síncrono para
+> tarefas curtas. Se o MCP não aparecer, corrija ou reinicie a integração; não
+> substitua a chamada por `verboo -p`, `vb`, `opencode run` ou outro shell.
 
 Antes de configurar, descubra os caminhos absolutos:
 
@@ -359,9 +367,11 @@ fallback, em vez do executor nativo:
       },
       "models": {
         "deepseek-v4-flash": { "name": "DeepSeek V4 Flash", "limit": { "context": 1048576, "output": 65536 } },
-        "glm-5.2":           { "name": "GLM 5.2",           "limit": { "context": 524288,  "output": 65536 } },
+        "deepseek-v4-pro":   { "name": "DeepSeek V4 Pro",   "limit": { "context": 1048576, "output": 65536 } },
+        "glm-5.2":           { "name": "GLM 5.2",           "limit": { "context": 196608,  "output": 65536 } },
         "mimo-v2.5":         { "name": "Mimo V2.5",         "limit": { "context": 1048576, "output": 65536 } },
-        "kimi-k2.7":         { "name": "Kimi K2.7",         "limit": { "context": 262144,  "output": 65536 } },
+        "mimo-v2.5-pro":     { "name": "Mimo V2.5 Pro",     "limit": { "context": 1048576, "output": 65536 } },
+        "kimi-k2.7":         { "name": "Kimi K2.7",         "limit": { "context": 259072,  "output": 65536 } },
         "minimax-m3":        { "name": "Minimax M3",        "limit": { "context": 1048576, "output": 65536 } },
         "glm-4.7-flash":     { "name": "GLM 4.7 Flash",    "limit": { "context": 200704,  "output": 65536 } },
         "qwen3.6-27b":       { "name": "Qwen 3.6 27B",     "limit": { "context": 262144,  "output": 65536 } }
@@ -391,12 +401,10 @@ Depois de reiniciar o cliente, execute em ordem:
 > Use `verboo_route` para classificar “Revise este repositório”, sem executar
 > agente.
 
-> Use o subagente MCP `verboo_agent` com `executor: native`,
+> Inicie o subagente MCP com `verboo_agent_start`, `executor: native`,
 > `mode: read_only`, `model: auto` e `cwd` apontando para o caminho absoluto
-> deste repositório. Apenas analise; não edite.
-
-Para uma tarefa longa, use `verboo_agent_start` e consulte o resultado com
-`verboo_job`.
+> deste repositório. Informe o `job_id`, continue trabalhando e consulte
+> `verboo_job` até obter o resultado. Apenas analise; não edite.
 
 ---
 
@@ -409,15 +417,17 @@ Quando o servidor MCP estiver registrado, o orquestrador terá acesso a estas fe
 | Ferramenta | Descrição |
 |------|-----------|
 | `verboo_route` | Classifica a tarefa e explica o ranking dos modelos sem executar um agente |
-| `verboo_agent` | Subagente ciente do repositório e síncrono; `model: "auto"` escolhe e distribui modelos, com fallback recuperável |
-| `verboo_agent_start` | Inicia subagente assíncrono, com a mesma validação de `verboo_agent`, e retorna `job_id` imediatamente |
-| `verboo_job` | Gerencia jobs assíncronos: `status`, `result`, `list`, `cancel` |
+| `verboo_agent` | Variante síncrona para tarefa curta; bloqueia o cliente até concluir |
+| `verboo_agent_start` | Padrão para App/IDE e trabalho não trivial; retorna `job_id` imediatamente |
+| `verboo_job` | Consulta jobs sem bloquear: `status`, `result`, `list`, `cancel` |
 | `verboo_memory` | Consulta ou registra uma nota técnica durável no diário isolado do projeto |
 | `verboo_code` | Codificação com DeepSeek V4 Flash |
 | `verboo_review` | Code review |
 | `verboo_deepseek_v4_flash` | Modelo específico |
+| `verboo_deepseek_v4_pro` | Modelo específico do plano Max |
 | `verboo_glm_5_2` | Modelo específico |
 | `verboo_mimo_v2_5` | Modelo específico |
+| `verboo_mimo_v2_5_pro` | Modelo específico do plano Max |
 | `verboo_kimi_k2_7` | Modelo específico |
 | `verboo_minimax_m3` | Modelo específico |
 | `verboo_glm_4_7_flash` | Modelo específico |
@@ -425,9 +435,10 @@ Quando o servidor MCP estiver registrado, o orquestrador terá acesso a estas fe
 
 Exemplo de delegação nativa:
 
-> _"Use `verboo_agent` com `executor: native`, em modo `write`, com cwd neste
-> repo, para editar os testes deste módulo. Depois revise o diff e rode a suíte
-> local no orquestrador."_
+> _"Use `verboo_agent_start` com `executor: native`, em modo `write`, com cwd
+> neste repo, para editar os testes deste módulo. Informe o `job_id`, continue
+> trabalhando e consulte o resultado com `verboo_job`. Depois revise o diff e
+> rode a suíte local no orquestrador."_
 
 ### Seleção automática e rotação
 
@@ -533,9 +544,10 @@ vb --list
 O bridge não modifica `CLAUDE.md`, `AGENTS.md` nem regras do Cursor. Ao conectar,
 ele já envia `instructions` pelo próprio protocolo MCP para Codex, Claude,
 Cursor, OpenCode e outros hosts compatíveis. Essa orientação explica que
-`verboo_agent` é um subagente externo, recomenda `executor: native` e
-`model: auto`, separa `read_only` de `write` e mantém testes, Git e deploy com o
-orquestrador. Ela também proíbe fallback direto para a CLI.
+o Verboo é um subagente externo, recomenda `verboo_agent_start` para App/IDE ou
+trabalho não trivial, reserva `verboo_agent` para tarefas curtas, recomenda
+`executor: native` e `model: auto`, separa `read_only` de `write` e mantém
+testes, Git e deploy com o orquestrador. Ela também proíbe fallback direto para a CLI.
 
 Para reforçar a descoberta antes mesmo da primeira chamada MCP, instale também a
 skill empacotada:
@@ -567,8 +579,9 @@ A skill ensina o padrão de delegação:
 1. Claude recebe a tarefa
 2. Claude separa em **orquestração** (fica com Claude) + **volume** (delega para a Verboo)
 3. Claude/Codex escolhe `executor: native` ou `executor: opencode`
-4. Claude/Codex chama `verboo_agent` com `cwd`, modo e instruções claras
-5. Claude integra e valida o resultado
+4. Claude/Codex usa `verboo_agent_start` para trabalho não trivial, informa o
+   `job_id` e continua orquestrando; `verboo_agent` fica reservado para tarefa curta
+5. Claude/Codex consulta `verboo_job`, integra e valida o resultado
 
 ---
 
@@ -577,12 +590,14 @@ A skill ensina o padrão de delegação:
 | Plano | Preço | Tokens | Limite | Concorrência | Modelos incluídos |
 |-------|-------|--------|--------|--------------|-------------------|
 | Junior | R$ 75/mês | Ilimitados | 30 req/min | 4 | `qwen3.6-27b`, `glm-4.7-flash` |
-| **Pro** | **R$ 119/mês** | **Ilimitados** | **30 req/min** | **2** | Junior + `mimo-v2.5`, `deepseek-v4-flash` |
-| Max | R$ 319/mês | Ilimitados | 30 req/min | 2 | Pro + `minimax-m3`, `deepseek-v4-pro`, `mimo-v2.5-pro` |
-| Ultra | R$ 899/mês | Ilimitados | 30 req/min | 2 | Pro + `glm-5.2`, `kimi-k2.7`, `minimax-m3` |
+| **Pro** | **R$ 119/mês** | **Ilimitados** | **30 req/min** | **2** | `qwen3.6-27b`, `glm-4.7-flash`, `mimo-v2.5`, `deepseek-v4-flash` |
+| **Max** | **R$ 319/mês** | **Ilimitados** | **30 req/min** | **2** | `qwen3.6-27b`, `glm-4.7-flash`, `deepseek-v4-flash`, `minimax-m3`, `mimo-v2.5`, `deepseek-v4-pro`, `mimo-v2.5-pro` |
+| Ultra | R$ 899/mês | Ilimitados | 30 req/min | 2 | `qwen3.6-27b`, `glm-4.7-flash`, `mimo-v2.5`, `glm-5.2`, `kimi-k2.7`, `minimax-m3`, `deepseek-v4-flash` |
 
 > Preços e limites consultados em 28/07/2026. Confirme os
 > [planos oficiais do Verboo Code](https://code.verboo.ai/pt) antes de assinar.
+> Growth API (R$ 600/mês, 100 req/min com `qwen3.6-27b`) e Enterprise são
+> ofertas separadas dos planos individuais.
 
 ---
 
@@ -655,7 +670,7 @@ O servidor também expõe **recursos** e **prompts**:
 | `VERBOO_SHARED_MEMORY_FILES` | — | Arquivos de memória curada, somente leitura, separados pelo delimitador de paths do SO |
 | `VERBOO_MODEL_ALLOWLIST` | todos | Modelos permitidos no roteamento automático, preview e seleção manual, separados por vírgula |
 | `VERBOO_MODEL_DENYLIST` | — | Modelos bloqueados, separados por vírgula |
-| `VERBOO_MODEL_TIERS` | `pro,ultra` | Tiers permitidos no roteamento automático, preview e seleção manual |
+| `VERBOO_MODEL_TIERS` | `pro,max,ultra` | Grupos internos permitidos no roteamento, preview e seleção manual; não substitui a allowlist da assinatura |
 | `VERBOO_MODEL_COOLDOWN_SECONDS` | `60` | Cooldown de um modelo após falha recuperável |
 | `VERBOO_CODE_BIN` | `verboo` | Executável da CLI oficial; pode ser Node quando `VERBOO_CODE_ENTRYPOINT` estiver definido |
 | `VERBOO_CODE_ENTRYPOINT` | — | Caminho opcional para `@verboo/code/dist/cli.mjs` |
@@ -677,6 +692,7 @@ O servidor também expõe **recursos** e **prompts**:
 | O bridge não aparece no Codex | Rode `codex mcp get verboo-bridge`, abra uma nova sessão e confira `/mcp`. |
 | `user cancelled MCP tool call` no `codex exec` | A chamada aguardava aprovação sem terminal interativo. Use o Codex interativo ou aprove somente a ferramenta necessária no TOML. |
 | O cliente abriu **Shell** e executou `verboo -p` | O MCP não foi usado. Confirme `verboo_agent` na lista de ferramentas, atualize a skill com `verboo-install-instructions --force`, remova orientações antigas de fallback por CLI e reinicie o cliente. |
+| `write` inicia, mas `Edit`/`Write` são negados por `dontAsk` | Atualize para `verboo-bridge@1.4.3` ou superior e reinicie o cliente. O executor nativo usa `bypassPermissions`; o modo escolhido pelo orquestrador ainda delimita as ferramentas, e shell, web, hooks, agentes aninhados e segredos continuam negados. |
 | A chamada termina perto de 60 segundos | Defina `tool_timeout_sec = 1800` ou use `verboo_agent_start` com `verboo_job`. |
 | Aviso sobre `VERBOO_API_KEY` no modo nativo | A chave não é necessária para `verboo_agent` com OAuth; ela serve apenas às ferramentas de API. |
 

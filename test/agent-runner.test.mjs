@@ -169,7 +169,10 @@ test('invocação nativa usa Verboo Code headless com ferramentas delimitadas', 
   assert.equal(invocation.command, '/opt/node');
   assert.equal(invocation.args[0], '/opt/@verboo/code/dist/cli.mjs');
   assert.ok(invocation.args.includes('stream-json'));
-  assert.ok(invocation.args.includes('dontAsk'));
+  assert.equal(
+    invocation.args[invocation.args.indexOf('--permission-mode') + 1],
+    'bypassPermissions',
+  );
   assert.equal(
     invocation.args[invocation.args.indexOf('--model') + 1],
     'glm-5.2',
@@ -182,10 +185,34 @@ test('invocação nativa usa Verboo Code headless com ferramentas delimitadas', 
 
   const settings = JSON.parse(invocation.args[invocation.args.indexOf('--settings') + 1]);
   assert.equal(settings.disableAllHooks, true);
+  assert.equal(settings.permissions.defaultMode, 'bypassPermissions');
   assert.ok(settings.permissions.allow.includes('Read(/repo/**)'));
   assert.ok(settings.permissions.allow.includes('Edit(/repo/**)'));
   assert.ok(settings.permissions.allow.includes('Write(/repo/**)'));
   assert.ok(settings.permissions.deny.includes('Read(/repo/**/.env.*)'));
+  assert.ok(settings.permissions.deny.includes('Bash'));
+});
+
+test('invocação nativa read_only usa bypass sem liberar escrita', () => {
+  const invocation = buildVerbooCodeInvocation({
+    prompt: 'audite',
+    cwd: '/repo',
+    mode: 'read_only',
+    model: 'deepseek-v4-flash',
+  });
+  assert.equal(
+    invocation.args[invocation.args.indexOf('--permission-mode') + 1],
+    'bypassPermissions',
+  );
+  assert.equal(
+    invocation.args[invocation.args.indexOf('--tools') + 1],
+    'Read,Glob,Grep',
+  );
+  const settings = JSON.parse(invocation.args[invocation.args.indexOf('--settings') + 1]);
+  assert.equal(settings.disableAllHooks, true);
+  assert.equal(settings.permissions.defaultMode, 'bypassPermissions');
+  assert.ok(settings.permissions.deny.includes('Edit'));
+  assert.ok(settings.permissions.deny.includes('Write'));
   assert.ok(settings.permissions.deny.includes('Bash'));
 });
 

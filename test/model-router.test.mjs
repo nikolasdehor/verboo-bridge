@@ -75,6 +75,20 @@ test('respeita tier permitido e exclusões com fallback determinístico', () => 
   assert.equal(fallback.model, 'minimax-m3');
 });
 
+test('expõe modelos Max para seleção manual sem colocá-los no roteamento automático', () => {
+  assert.equal(MODEL_CATALOG['deepseek-v4-pro'].tier, 'max');
+  assert.equal(MODEL_CATALOG['mimo-v2.5-pro'].tier, 'max');
+
+  const ranking = rankModelsForTask({
+    prompt: 'Implemente uma refatoração grande com testes.',
+    mode: 'write',
+    availableModels: ALL_MODELS,
+    allowTiers: ['pro', 'max', 'ultra'],
+  });
+  assert.ok(!ranking.some((item) => item.model === 'deepseek-v4-pro'));
+  assert.ok(!ranking.some((item) => item.model === 'mimo-v2.5-pro'));
+});
+
 test('penaliza concorrência e uso recente sem fazer round-robin cego', () => {
   const now = 1_000_000;
   const ranking = rankModelsForTask({

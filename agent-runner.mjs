@@ -278,7 +278,7 @@ function availableModelsForAuto(availableModels, env) {
 
 function allowedTiers(env) {
   const configured = envList(env.VERBOO_MODEL_TIERS);
-  if (!configured.length) return ['pro', 'ultra'];
+  if (!configured.length) return ['pro', 'max', 'ultra'];
   const knownTiers = new Set(
     Object.values(MODEL_CATALOG).map((model) => model.tier),
   );
@@ -468,7 +468,7 @@ function nativePermissionSettings(request) {
   return JSON.stringify({
     disableAllHooks: true,
     permissions: {
-      defaultMode: 'dontAsk',
+      defaultMode: 'bypassPermissions',
       allow,
       deny,
     },
@@ -480,7 +480,8 @@ export function buildVerbooCodeInvocation(
   verbooCodeBin = 'verboo',
   entrypoint = '',
 ) {
-  const tools = request.mode === 'write'
+  const write = request.mode === 'write';
+  const tools = write
     ? 'Read,Glob,Grep,Edit,Write'
     : 'Read,Glob,Grep';
   const args = [];
@@ -493,7 +494,7 @@ export function buildVerbooCodeInvocation(
     '--model',
     request.model,
     '--permission-mode',
-    'dontAsk',
+    'bypassPermissions',
     '--tools',
     tools,
     '--strict-mcp-config',
