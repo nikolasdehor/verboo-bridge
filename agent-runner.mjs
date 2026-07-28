@@ -154,6 +154,10 @@ function isInside(root, candidate) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
+function sortedStrings(values) {
+  return [...values].sort((left, right) => left.localeCompare(right));
+}
+
 export async function resolveAllowedCwd(cwd, allowedRootsValue) {
   if (!allowedRootsValue?.trim()) {
     throw agentError(
@@ -567,9 +571,9 @@ export function parseOpenCodeEvents(raw, cwd) {
   return {
     sessionId,
     result,
-    artifacts: [...artifacts].sort(),
-    toolsUsed: [...toolsUsed].sort(),
-    successfulTools: [...successfulTools].sort(),
+    artifacts: sortedStrings(artifacts),
+    toolsUsed: sortedStrings(toolsUsed),
+    successfulTools: sortedStrings(successfulTools),
   };
 }
 
@@ -635,9 +639,9 @@ export function parseVerbooCodeEvents(raw, cwd) {
   return {
     sessionId,
     result,
-    artifacts: [...artifacts].sort(),
-    toolsUsed: [...toolsUsed].sort(),
-    successfulTools: [...successfulTools].sort(),
+    artifacts: sortedStrings(artifacts),
+    toolsUsed: sortedStrings(toolsUsed),
+    successfulTools: sortedStrings(successfulTools),
   };
 }
 
@@ -1130,16 +1134,16 @@ export function executorAvailableModels(executor, availableModels, env) {
 }
 
 export async function runVerbooAgent(args, options) {
-  const request = normalizeAgentRequest(args, options.availableModels);
-  if (request.mode === 'write' && options.env.VERBOO_AGENT_WRITE_ENABLED !== '1') {
-    throw agentError(
-      'WRITE_DISABLED',
-      'Modo write desabilitado no servidor MCP.',
-    );
-  }
-
   const releaseAgentSlot = options.slotRelease ?? acquireAgentSlot(options.env);
   try {
+    const request = normalizeAgentRequest(args, options.availableModels);
+    if (request.mode === 'write' && options.env.VERBOO_AGENT_WRITE_ENABLED !== '1') {
+      throw agentError(
+        'WRITE_DISABLED',
+        'Modo write desabilitado no servidor MCP.',
+      );
+    }
+
     request.cwd = await resolveAllowedCwd(
       request.cwd,
       options.env.VERBOO_AGENT_ALLOWED_ROOTS,
@@ -1175,16 +1179,30 @@ export async function runVerbooAgent(args, options) {
       ...options,
       availableModels,
     });
-    result.memory = {
-      injected_project_entries: memoryContext.projectEntries,
-      injected_shared_files: memoryContext.sharedFiles,
-      persisted: await rememberProjectNote(
+    let persisted = false;
+    let persistenceWarning = null;
+    try {
+      persisted = await rememberProjectNote(
         request.cwd,
         result.memory_note,
         result,
         options.env,
-      ),
+      );
+    } catch {
+      persistenceWarning = {
+        code: 'MEMORY_PERSIST_FAILED',
+        message: 'O agente concluiu, mas a memória opcional não pôde ser persistida.',
+      };
+    }
+    result.memory = {
+      injected_project_entries: memoryContext.projectEntries,
+      injected_shared_files: memoryContext.sharedFiles,
+      persisted,
     };
+    if (persistenceWarning) {
+      result.memory.warning = persistenceWarning;
+      result.warnings = [...(result.warnings ?? []), persistenceWarning];
+    }
     delete result.memory_note;
     return result;
   } finally {

@@ -14,6 +14,7 @@ function fakeResult(opts = {}) {
     status: 'succeeded',
     finished_at: now,
     summary: opts.summary ?? 'Done.',
+    result: opts.output ?? 'Resposta final.',
     next_actions: [],
     artifacts: [],
     tools_used: [],
@@ -125,7 +126,10 @@ test('JobQueue: get retorna job publico sem dados sensiveis', async () => {
 
 test('JobQueue: result retorna resultado completo', () => {
   const q = new JobQueue({ concurrency: 1 });
-  q.setRunner(async () => fakeResult({ summary: 'Done.' }));
+  q.setRunner(async () => fakeResult({
+    summary: 'Done.',
+    output: 'Análise substantiva.',
+  }));
   const { job_id } = q.enqueue({ runnerData: { prompt: 'test' } });
   return new Promise((resolve) => {
     q.on('completed', () => {
@@ -133,6 +137,8 @@ test('JobQueue: result retorna resultado completo', () => {
       assert.ok(result);
       assert.ok(result.result);
       assert.equal(result.result.summary, 'Done.');
+      assert.equal(result.result.output, 'Análise substantiva.');
+      assert.equal(result.result.memory_note, undefined);
       resolve();
     });
   });
@@ -380,6 +386,7 @@ test('JobQueue: persistencia armazena apenas metadados seguros', async () => {
 
   const { job_id } = q.enqueue({ runnerData: { prompt: 'secret-data' } });
   await new Promise((resolve) => q.on('completed', resolve));
+  await q.waitForPersistence(job_id);
 
   // Lê o arquivo direto do disco — retenta até 1s para aguardar I/O do #persistJob
   const { readFile } = await import('node:fs/promises');
@@ -407,6 +414,68 @@ test('JobQueue: persistencia armazena apenas metadados seguros', async () => {
   assert.ok(!stored.runnerData, 'runnerData não deve ser persistido');
 
   const { rm } = await import('node:fs/promises');
+  await rm(dir, { recursive: true, force: true });
+});
+
+test('JobQueue: enqueuePersisted grava estado queued antes de responder', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-queued-store-'));
+  const q = new JobQueue({ concurrency: 1 });
+  q.setRunner(async (_job, signal) => {
+    await new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        reject(Object.assign(new Error('cancelled'), { code: 'CANCELLED' }));
+      }, { once: true });
+    });
+    return fakeResult();
+  });
+  await q.initStore(dir);
+
+  const first = await q.enqueuePersisted({ runnerData: { prompt: 'running' } });
+  await new Promise((resolve) => q.once('started', resolve));
+  const second = await q.enqueuePersisted({ runnerData: { prompt: 'queued' } });
+
+  const { readFile, rm } = await import('node:fs/promises');
+  const stored = JSON.parse(
+    await readFile(path.join(dir, `${second.job_id}.json`), 'utf8'),
+  );
+  assert.equal(stored.status, 'queued');
+  assert.equal(q.getJob(second.job_id).status, 'queued');
+
+  q.cancel(second.job_id);
+  q.cancel(first.job_id);
+  q.dispose();
+  await Promise.all([
+    q.waitForPersistence(first.job_id),
+    q.waitForPersistence(second.job_id),
+  ]);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test('JobQueue: recuperação normaliza timestamps inválidos', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-invalid-date-'));
+  const { randomUUID } = await import('node:crypto');
+  const { rm, writeFile } = await import('node:fs/promises');
+  const jobId = randomUUID();
+  await writeFile(
+    path.join(dir, `${jobId}.json`),
+    JSON.stringify({
+      app: 'verboo-bridge-job-v1',
+      job_id: jobId,
+      status: 'succeeded',
+      created_at: 123,
+      finished_at: { invalid: true },
+    }),
+  );
+
+  const q = new JobQueue({ concurrency: 1 });
+  await q.initStore(dir);
+  const [job] = q.listJobs();
+  assert.equal(typeof job.created_at, 'string');
+  assert.equal(typeof job.finished_at, 'string');
+  assert.ok(Number.isFinite(Date.parse(job.created_at)));
+  assert.ok(Number.isFinite(Date.parse(job.finished_at)));
+
+  q.dispose();
   await rm(dir, { recursive: true, force: true });
 });
 
