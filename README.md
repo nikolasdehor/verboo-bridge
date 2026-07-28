@@ -7,7 +7,7 @@
 
 <div align="center">
   <a href="https://github.com/verbeux-ai">
-    <img src="https://raw.githubusercontent.com/verbeux-ai/.github/main/images/logo-preto-com-branco-quadrado%20(1).png" alt="Logo da Verboo" width="140">
+    <img src="https://avatars.githubusercontent.com/u/122481543?v=4" alt="Logo da Verboo" width="140">
   </a>
   <h1>verboo-bridge</h1>
   <p><strong>Use modelos da Verboo como sub-agentes no Claude Code, Codex, OpenCode, Cursor ou qualquer cliente MCP</strong></p>
