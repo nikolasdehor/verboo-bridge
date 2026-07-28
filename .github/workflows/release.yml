@@ -45,7 +45,13 @@ jobs:
       # A suíte completa continua no job validate (Linux). O Windows valida a nova
       # superfície do PR #9 porque os testes legados utilizam premissas POSIX.
       - name: Validate
-        run: node --test --test-name-pattern="denylist|verboo_validate|verboo_agent_start|onProgress|parseOpenCodeEvents|parseVerbooCodeEvents|buildProgressOnLine|duravel|durável|persistencia|persistência|schema|recuperação|recuperacao|initStore|prune|progresso|queue_position|heartbeat|cancelamento" test/agent-runner.test.mjs test/job-queue.test.mjs test/mcp.test.mjs
+        run: |
+          node --test --test-name-pattern="^(denylist global filtra seleção automática e rejeita seleção manual|onProgress (recebe routing e generating em execucao bem-sucedida|nao afeta execucao quando ausente|recebe executing_tool e processing_result|inclui attempt info em fallback|processa linha JSON dividida entre chunks)|parse(OpenCode|VerbooCode)Events preserva multiplos blocos text em ordem|buildProgressOnLine (detecta tool_use e chama onProgress com tool_counts|correlaciona resultado nativo e OpenCode por id|limita emissões, faz flush e ignora evento tardio|nao falha com JSON invalido))$" test/agent-runner.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test --test-name-pattern="^JobQueue: (persistencia armazena apenas metadados seguros|resultado duravel exige opt-in na escrita e recuperacao|resultado duravel recupera warning failed e cancelled|schema desconhecido e legado nunca recuperam resultado|falha ao gravar resultado nunca publica sucesso falso|enqueuePersisted grava estado queued antes de responder|recuperação normaliza timestamps inválidos|initStore rejeita path traversal em filename|prune autonomo remove job e arquivo persistido|getJob inclui campos de progresso para job ativo|progresso tem tool_counts enquanto ativo e limpa no terminal|queue_position 0 running positivo queued null terminal|listJobs nao expoe campos de progresso|progresso limpo ao cancelar|progresso limpo ao fazer dispose|progress_summary gerado a partir da fase e contadores|getJob expoe updated_at no progresso|runnerData original nao contem __onProgress apos enqueue|heartbeat relata silencio como idle e atividade restaura fase|cancelamento com falha de persistência não expõe status de cancelado confirmado)$" test/job-queue.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --test --test-name-pattern="^MCP (aplica denylist em tools, schemas, recursos e chamadas antigas|verboo_agent_start enfileira e verboo_job cancela execução em andamento|verboo_validate (falha fechado sem opt-in e anota ação não read-only|separa perfil estático de project-code com segundo gate|executa binário resolvido e rejeita política adversarial|stop_on_failure, timeout total, truncamento e redaction))$" test/mcp.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   release:
     if: github.event_name == 'push'
