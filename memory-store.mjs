@@ -36,7 +36,8 @@ function safeProjectName(cwd) {
   const basename = path.basename(cwd)
     .normalize('NFKD')
     .replace(/[^\w.-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
+    .replace(/^-+/, '')
+    .replace(/-+$/, '')
     .slice(0, 48) || 'project';
   const digest = createHash('sha256').update(cwd).digest('hex').slice(0, 12);
   return `${basename}-${digest}`;
@@ -49,7 +50,7 @@ export function projectMemoryFile(cwd, env) {
 function redactSensitive(value) {
   return String(value ?? '')
     .replace(
-      /\b(?:sk-(?:ant|proj|svc)-|sk_|vbk_|gh[pousr]_|github_pat_|hf_|glpat-)[A-Za-z0-9_-]{8,}\b/gi,
+      /\b(?:sk-(?:ant|proj|svc)-|sk_|vbk_|gh[pousr]_|github_pat_|hf_|glpat-)[a-z0-9_-]{8,}\b/gi,
       '[SEGREDO REDIGIDO]',
     )
     .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[SEGREDO REDIGIDO]')
@@ -59,14 +60,24 @@ function redactSensitive(value) {
       '[CHAVE PRIVADA REDIGIDA]',
     )
     .replace(
-      /\b(authorization|api[_-]?key|token|password|senha)\s*[:=]\s*(?:"[^"\n]*"|'[^'\n]*'|[^\s,;]+)/gi,
+      /\b(authorization|api[_-]?key|token|password|senha)\s*[:=]\s*(?:"[^"\n]*"|'[^'\n]*')/gi,
+      '$1=[SEGREDO REDIGIDO]',
+    )
+    .replace(
+      /\b(authorization|api[_-]?key|token|password|senha)\s*[:=]\s*[^\s,;]+/gi,
       '$1=[SEGREDO REDIGIDO]',
     )
     .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/g, '[EMAIL REDIGIDO]')
     .replace(/\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b/g, '[CPF REDIGIDO]')
     .replace(
-      /(?:\+?55[\s.-]*)?(?:\(?\d{2}\)?[\s.-]*)?9?\d{4}[\s.-]?\d{4}\b/g,
-      '[TELEFONE REDIGIDO]',
+      /\+?\d[\d ().-]{8,}\d/g,
+      (candidate) => {
+        const digits = candidate.replace(/\D/g, '');
+        const national = digits.startsWith('55') ? digits.slice(2) : digits;
+        return national.length === 10 || national.length === 11
+          ? '[TELEFONE REDIGIDO]'
+          : candidate;
+      },
     );
 }
 
@@ -79,7 +90,7 @@ function sanitizeNote(value) {
 
 export function extractMemoryNote(result) {
   const text = String(result ?? '');
-  const match = text.match(MEMORY_NOTE_PATTERN);
+  const match = MEMORY_NOTE_PATTERN.exec(text);
   return {
     result: text.replace(MEMORY_NOTE_PATTERN, '').trim(),
     note: sanitizeNote(match?.[1]),

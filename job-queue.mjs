@@ -16,6 +16,9 @@ const STORE_MARKER = 'verboo-bridge-job-v1';
 const VALID_STATUSES = new Set([
   'queued', 'running', 'succeeded', 'warning', 'failed', 'cancelled',
 ]);
+const TERMINAL_STATUSES = new Set([
+  'succeeded', 'warning', 'failed', 'cancelled',
+]);
 
 function nowISO() { return new Date().toISOString(); }
 
@@ -34,6 +37,57 @@ function safeJSON(val, fallback) {
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+async function loadStoredRecord(storeDir, file) {
+  if (!file.endsWith('.json')) return null;
+
+  const filePath = path.join(storeDir, file);
+  const basename = path.basename(file, '.json');
+  const content = await readFile(filePath, 'utf-8').catch(() => null);
+  if (!content) return null;
+
+  const record = safeJSON(content, null);
+  if (!record) return null;
+
+  const validIdentity = (
+    UUID_RE.test(basename)
+    && UUID_RE.test(record.job_id)
+    && record.job_id === basename
+  );
+  if (!validIdentity) {
+    // Nunca remove JSON alheio de um diretório configurado por engano.
+    if (record.app === STORE_MARKER) {
+      await unlink(filePath).catch(() => {});
+    }
+    return null;
+  }
+  if (!VALID_STATUSES.has(record.status)) return null;
+  return record;
+}
+
+function recoverStoredRecord(record) {
+  const timestamp = nowISO();
+  const isPending = record.status === 'queued' || record.status === 'running';
+  let error = null;
+  if (isPending) {
+    error = { code: 'RESTART' };
+  } else if (record.status === 'failed' && record.error?.code) {
+    error = { code: record.error.code };
+  }
+
+  return {
+    job_id: record.job_id,
+    status: isPending ? 'failed' : record.status,
+    created_at: record.created_at ?? timestamp,
+    updated_at: timestamp,
+    started_at: null,
+    finished_at: isPending ? timestamp : (record.finished_at ?? timestamp),
+    model: record.model ?? null,
+    executor: record.executor ?? null,
+    result: null,
+    error,
+  };
+}
 
 export function createJobRecord({ cwd, model, executor }) {
   return {
@@ -94,7 +148,7 @@ export class JobQueue extends EventEmitter {
     const timestamp = nowISO();
     for (const [jobId, entry] of this.#running) {
       const job = this.#jobs.get(jobId);
-      if (job && !['succeeded', 'warning', 'failed', 'cancelled'].includes(job.status)) {
+      if (job && !TERMINAL_STATUSES.has(job.status)) {
         job.status = 'cancelled';
         job.updated_at = timestamp;
         job.finished_at = timestamp;
@@ -104,7 +158,7 @@ export class JobQueue extends EventEmitter {
     }
     for (const jobId of this.#queue) {
       const job = this.#jobs.get(jobId);
-      if (!job || job.status !== 'queued') continue;
+      if (job?.status !== 'queued') continue;
       job.status = 'cancelled';
       job.updated_at = timestamp;
       job.finished_at = timestamp;
@@ -322,56 +376,10 @@ export class JobQueue extends EventEmitter {
 
     const files = await readdir(storeDir).catch(() => []);
     for (const file of files) {
-      if (!file.endsWith('.json')) continue;
-
-      const basename = path.basename(file, '.json');
-      const content = await readFile(path.join(storeDir, file), 'utf-8').catch(() => null);
-      if (!content) continue;
-
-      const record = safeJSON(content, null);
+      const record = await loadStoredRecord(storeDir, file);
       if (!record) continue;
 
-      // Nunca remove JSON alheio de um diretório configurado por engano.
-      // Arquivos do bridge levam marcador explícito; legado válido é aceito e reescrito.
-      if (!UUID_RE.test(basename)) {
-        if (record.app === STORE_MARKER) {
-          await unlink(path.join(storeDir, file)).catch(() => {});
-        }
-        continue;
-      }
-      if (!UUID_RE.test(record.job_id) || record.job_id !== basename) {
-        if (record.app === STORE_MARKER) {
-          await unlink(path.join(storeDir, file)).catch(() => {});
-        }
-        continue;
-      }
-
-      if (!VALID_STATUSES.has(record.status)) continue;
-
-      // Sanitiza recovery: mantém só metadados seguros
-      const safe = {
-        job_id: record.job_id,
-        status: record.status,
-        created_at: record.created_at ?? nowISO(),
-        updated_at: nowISO(),
-        started_at: null,
-        finished_at: null,
-        model: record.model ?? null,
-        executor: record.executor ?? null,
-        result: null,
-        error: null,
-      };
-
-      const isPending = record.status === 'queued' || record.status === 'running';
-
-      safe.status = isPending ? 'failed' : record.status;
-      safe.finished_at = isPending ? nowISO() : (record.finished_at ?? nowISO());
-      safe.error = isPending
-        ? { code: 'RESTART' }
-        : record.status === 'failed' && record.error?.code
-          ? { code: record.error.code }
-          : null;
-
+      const safe = recoverStoredRecord(record);
       this.#jobs.set(safe.job_id, safe);
       // Reescreve imediatamente usando o mesmo schema mínimo da persistência normal.
       await this.#persistJob(safe);
@@ -400,43 +408,38 @@ export class JobQueue extends EventEmitter {
   #prune() {
     const now = Date.now();
     const finished = [...this.#jobs.values()]
-      .filter((j) => ['succeeded', 'warning', 'failed', 'cancelled'].includes(j.status))
+      .filter((job) => TERMINAL_STATUSES.has(job.status))
       .sort((a, b) => (a.finished_at ?? a.updated_at).localeCompare(b.finished_at ?? b.updated_at));
 
     for (const job of finished) {
       const t = job.finished_at ?? job.updated_at;
       if (!t) continue;
       const age = now - new Date(t).getTime();
-      if (job.result && age > this.#resultTtl) {
-        this.#removeStore(job.job_id);
-        this.#jobs.delete(job.job_id);
-        this.#runnerData.delete(job.job_id);
-      } else if (!job.result && age > this.#ttl) {
-        this.#removeStore(job.job_id);
-        this.#jobs.delete(job.job_id);
-        this.#runnerData.delete(job.job_id);
-      }
+      const ttl = job.result ? this.#resultTtl : this.#ttl;
+      if (age > ttl) this.#deleteJob(job.job_id);
     }
 
     const remaining = [...this.#jobs.values()]
-      .filter((j) => ['succeeded', 'warning', 'failed', 'cancelled'].includes(j.status))
+      .filter((job) => TERMINAL_STATUSES.has(job.status))
       .sort((a, b) => (b.finished_at ?? b.updated_at).localeCompare(a.finished_at ?? a.updated_at));
     if (remaining.length > this.#maxResults) {
       for (const job of remaining.slice(this.#maxResults)) {
-        this.#removeStore(job.job_id);
-        this.#jobs.delete(job.job_id);
-        this.#runnerData.delete(job.job_id);
+        this.#deleteJob(job.job_id);
       }
     }
 
     if (this.#queue.length > this.#maxQueued) {
       const excess = this.#queue.splice(this.#maxQueued);
       for (const id of excess) {
-        this.#jobs.delete(id);
-        this.#removeStore(id);
-        this.#runnerData.delete(id);
+        this.#deleteJob(id);
       }
     }
+  }
+
+  #deleteJob(jobId) {
+    this.#jobs.delete(jobId);
+    this.#runnerData.delete(jobId);
+    this.#removeStore(jobId);
   }
 
   async #removeStore(jobId) {
