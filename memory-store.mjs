@@ -22,6 +22,14 @@ function enabledValue(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').toLowerCase());
 }
 
+function trimEdgeHyphens(value) {
+  let start = 0;
+  let end = value.length;
+  while (start < end && value[start] === '-') start += 1;
+  while (end > start && value[end - 1] === '-') end -= 1;
+  return value.slice(start, end);
+}
+
 export function memoryEnabled(env) {
   return enabledValue(env.VERBOO_MEMORY_ENABLED);
 }
@@ -33,12 +41,10 @@ export function memoryDirectory(env) {
 }
 
 function safeProjectName(cwd) {
-  const basename = path.basename(cwd)
+  const normalized = path.basename(cwd)
     .normalize('NFKD')
-    .replace(/[^\w.-]+/g, '-')
-    .replace(/^-+/, '')
-    .replace(/-+$/, '')
-    .slice(0, 48) || 'project';
+    .replace(/[^\w.-]+/g, '-');
+  const basename = trimEdgeHyphens(normalized).slice(0, 48) || 'project';
   const digest = createHash('sha256').update(cwd).digest('hex').slice(0, 12);
   return `${basename}-${digest}`;
 }
