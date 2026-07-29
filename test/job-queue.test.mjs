@@ -688,6 +688,26 @@ test('JobQueue: initStore rejeita path traversal em filename', async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+test('JobQueue: initStore remove somente órfão temporário do writer', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-store-orphan-'));
+  const { randomUUID } = await import('node:crypto');
+  const { access, rm, writeFile } = await import('node:fs/promises');
+  const orphan = path.join(dir, `.${randomUUID()}.${randomUUID()}.tmp`);
+  const unrelated = path.join(dir, '.foreign.tmp');
+  await Promise.all([
+    writeFile(orphan, 'parcial'),
+    writeFile(unrelated, 'não é do bridge'),
+  ]);
+
+  const q = new JobQueue({ concurrency: 1 });
+  await q.initStore(dir);
+
+  await assert.rejects(access(orphan), { code: 'ENOENT' });
+  await access(unrelated);
+  q.dispose();
+  await rm(dir, { recursive: true, force: true });
+});
+
 test('JobQueue: prune autonomo remove job e arquivo persistido', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-autoprune-'));
   const q = new JobQueue({

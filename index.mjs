@@ -169,7 +169,7 @@ function verifyAllowlist(envVar) {
   );
 }
 
-function verifyChildEnv(homeDir) {
+function verifyChildEnv(homeDir, cmd) {
   const env = {
     PATH: process.env.PATH,
     HOME: homeDir,
@@ -180,6 +180,19 @@ function verifyChildEnv(homeDir) {
   if (process.platform === 'win32') {
     env.SystemRoot = process.env.SystemRoot;
     env.USERPROFILE = homeDir;
+  }
+  if (cmd === 'git') {
+    // `status` pode chamar o fsmonitor configurado pelo próprio repositório.
+    // Config de escopo command vence a local; locks opcionais evitam refresh do index.
+    Object.assign(env, {
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'core.fsmonitor',
+      GIT_CONFIG_VALUE_0: 'false',
+      GIT_CONFIG_KEY_1: 'core.hooksPath',
+      GIT_CONFIG_VALUE_1: path.join(homeDir, 'git-hooks-disabled'),
+      GIT_OPTIONAL_LOCKS: '0',
+    });
   }
   return env;
 }
@@ -236,9 +249,7 @@ function resolveVerifyExecutable(cmd, pathEnv) {
   };
 }
 
-function normalizeVerifyCommand(command, cwd, pathEnv) {
-  const cmd = String(command?.cmd ?? '');
-  const args = Array.isArray(command?.args) ? command.args.map(String) : [];
+function validateVerifyArgs(args) {
   if (args.length > VERIFY_MAX_ARGS) {
     throw new Error(`muitos argumentos (max ${VERIFY_MAX_ARGS})`);
   }
@@ -250,54 +261,76 @@ function normalizeVerifyCommand(command, cwd, pathEnv) {
       throw new Error('argumento com metacaractere proibido');
     }
   }
+}
+
+function validateNpmVerifyArgs(args) {
+  if (args.length === 1 && args[0] === 'test') return;
+  if (
+    args.length === 2
+    && args[0] === 'run'
+    && /^[A-Za-z0-9:_-]+$/.test(args[1])
+  ) {
+    if (verifyAllowlist('VERBOO_AGENT_VERIFY_NPM_SCRIPTS').has(args[1])) return;
+    throw new Error('script npm fora da allowlist administrativa');
+  }
+  throw new Error('comando npm fora da política de validação');
+}
+
+function resolveNodeCheckFile(args, cwd) {
+  if (args.length !== 2 || args[0] !== '--check') {
+    throw new Error('comando node fora da política de validação');
+  }
+  let file;
+  try {
+    file = realpathSync(path.resolve(cwd, args[1]));
+  } catch {
+    throw new Error('arquivo de verificação inexistente');
+  }
+  if (file === cwd || !file.startsWith(cwd + path.sep)) {
+    throw new Error('arquivo de verificação fora do diretório autorizado');
+  }
+  return file;
+}
+
+function validateGitVerifyArgs(args) {
+  // Allowlist positiva exata: qualquer flag/pathspec/config não modelada
+  // (-c, --git-dir, --work-tree, pager, pathspec magic) é rejeitada.
+  const allowed = [
+    ['diff', '--check'],
+    ['diff', '--cached', '--check'],
+    ['status', '--porcelain=v1'],
+    ['log', '--oneline'],
+  ];
+  const exactMatch = allowed.some(
+    (spec) => spec.length === args.length
+      && spec.every((value, index) => value === args[index]),
+  );
+  const boundedLog = args.length === 4
+    && args[0] === 'log'
+    && args[1] === '--oneline'
+    && args[2] === '-n'
+    && /^\d{1,3}$/.test(args[3])
+    && Number(args[3]) <= 100;
+  if (!exactMatch && !boundedLog) {
+    throw new Error('comando git fora da política de validação');
+  }
+}
+
+function normalizeVerifyCommand(command, cwd, pathEnv) {
+  const cmd = String(command?.cmd ?? '');
+  const args = Array.isArray(command?.args) ? command.args.map(String) : [];
+  validateVerifyArgs(args);
   let file = null;
   switch (cmd) {
-    case 'npm': {
-      if (args.length === 1 && args[0] === 'test') break;
-      if (args.length === 2 && args[0] === 'run' && /^[A-Za-z0-9:_-]+$/.test(args[1])) {
-        if (verifyAllowlist('VERBOO_AGENT_VERIFY_NPM_SCRIPTS').has(args[1])) break;
-        throw new Error('script npm fora da allowlist administrativa');
-      }
-      throw new Error('comando npm fora da política de validação');
-    }
-    case 'node': {
-      if (args.length !== 2 || args[0] !== '--check') {
-        throw new Error('comando node fora da política de validação');
-      }
-      try {
-        file = realpathSync(path.resolve(cwd, args[1]));
-      } catch {
-        throw new Error('arquivo de verificação inexistente');
-      }
-      if (file === cwd || !file.startsWith(cwd + path.sep)) {
-        throw new Error('arquivo de verificação fora do diretório autorizado');
-      }
+    case 'npm':
+      validateNpmVerifyArgs(args);
       break;
-    }
-    case 'git': {
-      // Allowlist positiva exata: qualquer flag/pathspec/config não modelada
-      // (-c, --git-dir, --work-tree, pager, pathspec magic) é rejeitada.
-      const allowed = [
-        ['diff', '--check'],
-        ['diff', '--cached', '--check'],
-        ['status', '--porcelain=v1'],
-        ['log', '--oneline'],
-      ];
-      if (allowed.some((spec) => spec.length === args.length && spec.every((value, i) => value === args[i]))) {
-        break;
-      }
-      if (
-        args.length === 4
-        && args[0] === 'log'
-        && args[1] === '--oneline'
-        && args[2] === '-n'
-        && /^\d{1,3}$/.test(args[3])
-        && Number(args[3]) <= 100
-      ) {
-        break;
-      }
-      throw new Error('comando git fora da política de validação');
-    }
+    case 'node':
+      file = resolveNodeCheckFile(args, cwd);
+      break;
+    case 'git':
+      validateGitVerifyArgs(args);
+      break;
     default:
       throw new Error(`comando fora da política de validação: ${cmd}`);
   }
@@ -335,29 +368,41 @@ function recheckVerifyTarget(command) {
   }
 }
 
-function killVerifyChild(child, signal) {
-  if (process.platform === 'win32' && child.pid) {
-    try {
-      const systemRoot = realpathSync(process.env.SystemRoot || 'C:\\Windows');
-      const taskkill = realpathSync(path.join(systemRoot, 'System32', 'taskkill.exe'));
-      if (!taskkill.toLowerCase().startsWith(systemRoot.toLowerCase() + path.sep)) {
-        throw new Error('taskkill fora de SystemRoot');
-      }
-      execFile(
-        taskkill,
-        ['/PID', String(child.pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])],
-        { shell: false, windowsHide: true },
-        () => {},
-      );
-      return;
-    } catch { /* fallback direto abaixo */ }
-  }
+function killWindowsVerifyTree(child, signal) {
+  if (process.platform !== 'win32' || !child.pid) return false;
   try {
-    if (process.platform !== 'win32' && child.pid) {
-      process.kill(-child.pid, signal); // grupo de processo (detached)
-      return;
+    const systemRoot = realpathSync(
+      process.env.SystemRoot || String.raw`C:\Windows`,
+    );
+    const taskkill = realpathSync(path.join(systemRoot, 'System32', 'taskkill.exe'));
+    if (!taskkill.toLowerCase().startsWith(systemRoot.toLowerCase() + path.sep)) {
+      throw new Error('taskkill fora de SystemRoot');
     }
-  } catch { /* grupo já morto; tenta kill direto */ }
+    execFile(
+      taskkill,
+      ['/PID', String(child.pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])],
+      { shell: false, windowsHide: true },
+      () => {},
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killUnixVerifyGroup(child, signal) {
+  if (process.platform === 'win32' || !child.pid) return false;
+  try {
+    process.kill(-child.pid, signal); // grupo de processo (detached)
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killVerifyChild(child, signal) {
+  if (killWindowsVerifyTree(child, signal)) return;
+  if (killUnixVerifyGroup(child, signal)) return;
   try { child.kill(signal); } catch { /* processo já encerrado */ }
 }
 
@@ -496,12 +541,15 @@ async function runVerbooValidate(args) {
 
   const isolatedHome = mkdtempSync(path.join(tmpdir(), 'verboo-verify-home-'));
   try {
-    const childEnv = verifyChildEnv(isolatedHome);
     // Valida TODA a sequência antes de executar qualquer comando: violação de
     // política falha fechado, sem efeito parcial no repositório.
     let normalized;
     try {
-      normalized = commands.map((command) => normalizeVerifyCommand(command, cwd, childEnv.PATH));
+      normalized = commands.map((command) => normalizeVerifyCommand(
+        command,
+        cwd,
+        verifyChildEnv(isolatedHome).PATH,
+      ));
     } catch (err) {
       return { status: 'error', error: err.message, executed: [] };
     }
@@ -521,7 +569,12 @@ async function runVerbooValidate(args) {
       const recheckError = recheckVerifyTarget(command);
       const result = recheckError
         ? { ...emptyVerifyResult(), error: recheckError }
-        : await runVerifyCommand(command, cwd, childEnv, Math.min(perCommandMs, remainingMs));
+        : await runVerifyCommand(
+          command,
+          cwd,
+          verifyChildEnv(isolatedHome, command.cmd),
+          Math.min(perCommandMs, remainingMs),
+        );
       results.push({ cmd: command.cmd, args: command.args, ...result });
       const failed = Boolean(result.error) || result.timed_out || result.exit_code !== 0;
       if (failed && stopOnFailure && results.length < normalized.length) {
@@ -775,7 +828,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       annotations: {
         title: 'Validação segura do repositório',
         readOnlyHint: false,
-        destructiveHint: false,
+        destructiveHint: true,
         idempotentHint: false,
         openWorldHint: true,
       },

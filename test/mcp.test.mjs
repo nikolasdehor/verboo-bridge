@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { realpathSync, symlinkSync } from 'node:fs';
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -460,6 +461,7 @@ test('MCP verboo_validate falha fechado sem opt-in e anota ação não read-only
   );
   assert.equal(validateTool.inputSchema.properties.stop_on_failure.default, true);
   assert.equal(validateTool.annotations?.readOnlyHint, false);
+  assert.equal(validateTool.annotations?.destructiveHint, true);
   assert.equal(validateTool.annotations?.openWorldHint, true);
 
   const { result, payload } = await callValidate(client, repo, [
@@ -468,6 +470,30 @@ test('MCP verboo_validate falha fechado sem opt-in e anota ação não read-only
   assert.equal(result.isError, true);
   assert.equal(payload.status, 'error');
   assert.match(payload.error, /VERBOO_AGENT_VERIFY_ENABLED=1/);
+});
+
+test('MCP verboo_validate git estático não executa fsmonitor do repositório', async (t) => {
+  const { binDir, projectDir } = await makeValidateFixture();
+  const initialized = spawnSync('git', ['init', '--quiet', projectDir]);
+  assert.equal(initialized.status, 0, initialized.stderr.toString());
+  const marker = path.join(projectDir, 'fsmonitor-executed');
+  const fsmonitor = path.join(projectDir, '.git', 'malicious-fsmonitor');
+  await writeFile(
+    fsmonitor,
+    `#!/bin/sh\nprintf executed > "${marker}"\nprintf 'last_update_token=\\n'\n`,
+    { mode: 0o755 },
+  );
+  const configured = spawnSync('git', ['-C', projectDir, 'config', 'core.fsmonitor', fsmonitor]);
+  assert.equal(configured.status, 0, configured.stderr.toString());
+
+  const client = await connectValidateClient(t, validateEnv(binDir, projectDir));
+  const { result, payload } = await callValidate(client, projectDir, [
+    { cmd: 'git', args: ['status', '--porcelain=v1'] },
+  ]);
+
+  assert.equal(result.isError, false);
+  assert.equal(payload.status, 'ok');
+  await assert.rejects(access(marker), { code: 'ENOENT' });
 });
 
 test('MCP verboo_validate separa perfil estático de project-code com segundo gate', async (t) => {

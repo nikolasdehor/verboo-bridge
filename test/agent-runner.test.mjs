@@ -443,6 +443,64 @@ process.stdout.write(JSON.stringify({
   assert.deepEqual(result.tools_used, ['edit']);
 });
 
+test('write OpenCode confirma content tool_call concluído por tool_result', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-content-write-'));
+  const fakeOpenCode = path.join(base, 'opencode');
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.end(`${[
+        {
+          type: 'content',
+          content_type: 'tool_call',
+          sessionID: 'ses_content_write',
+          name: 'Edit',
+        },
+        {
+          type: 'tool_result',
+          sessionID: 'ses_content_write',
+          call_id: 'generated_on_result',
+        },
+        {
+          type: 'text',
+          sessionID: 'ses_content_write',
+          part: { text: 'Alteração concluída.' },
+        },
+      ].map(JSON.stringify).join('\n')}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const result = await runVerbooAgent(
+    {
+      prompt: 'edite um arquivo',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'write',
+      timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: {
+        ...process.env,
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_AGENT_WRITE_ENABLED: '1',
+        VERBOO_API_KEY: 'test-key',
+        VERBOO_OPENCODE_BIN: fakeOpenCode,
+      },
+      spawnImpl,
+    },
+  );
+
+  assert.equal(result.status, 'success');
+  assert.deepEqual(result.tools_used, ['Edit']);
+});
+
 test('write falha fechado sem feature gate server-side', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-write-gate-'));
 
@@ -2201,12 +2259,20 @@ test('onProgress processa linha JSON dividida entre chunks', async () => {
 test('parseOpenCodeEvents preserva multiplos blocos text em ordem', () => {
   const cwd = '/repo';
   const raw = [
-    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'Primeiro bloco.' } }),
-    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'Segundo bloco.' } }),
+    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'Primeiro bloco.\n' } }),
+    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'Segundo bloco.\n' } }),
     JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'Terceiro.' } }),
   ].join('\n');
   const parsed = parseOpenCodeEvents(raw, cwd);
   assert.equal(parsed.result, 'Primeiro bloco.\nSegundo bloco.\nTerceiro.');
+});
+
+test('parseOpenCodeEvents preserva espaço entre fragmentos adjacentes', () => {
+  const raw = [
+    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'This is ' } }),
+    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'an answer' } }),
+  ].join('\n');
+  assert.equal(parseOpenCodeEvents(raw, '/repo').result, 'This is an answer');
 });
 
 test('parseOpenCodeEvents remove bloco think dividido entre multiplos fragmentos', () => {
@@ -2223,15 +2289,25 @@ test('parseVerbooCodeEvents preserva multiplos blocos text em ordem', () => {
   const cwd = '/repo';
   const raw = [
     JSON.stringify({ type: 'assistant', session_id: 's2', message: { content: [
-      { type: 'text', text: 'Analisei.' },
+      { type: 'text', text: 'Analisei.\n' },
     ] } }),
     JSON.stringify({ type: 'assistant', session_id: 's2', message: { content: [
-      { type: 'text', text: 'Encontrei um bug.' },
+      { type: 'text', text: 'Encontrei um bug.\n' },
     ] } }),
     JSON.stringify({ type: 'result', session_id: 's2', result: 'Concluído.' }),
   ].join('\n');
   const parsed = parseVerbooCodeEvents(raw, cwd);
   assert.equal(parsed.result, 'Analisei.\nEncontrei um bug.\nConcluído.');
+});
+
+test('parseVerbooCodeEvents preserva espaço entre fragmentos adjacentes', () => {
+  const raw = [
+    JSON.stringify({ type: 'assistant', session_id: 's2', message: { content: [
+      { type: 'text', text: 'This is ' },
+    ] } }),
+    JSON.stringify({ type: 'result', session_id: 's2', result: 'an answer' }),
+  ].join('\n');
+  assert.equal(parseVerbooCodeEvents(raw, '/repo').result, 'This is an answer');
 });
 
 test('parseVerbooCodeEvents remove bloco think dividido entre multiplos fragmentos', () => {
@@ -2349,13 +2425,14 @@ test('buildProgressOnLine detecta tool_use e chama onProgress com tool_counts', 
   cb(JSON.stringify({ type: 'text', part: { text: 'Feito.' } }));
   cb(JSON.stringify({ type: 'tool_use', part: { tool: 'glob' } }));
   const tcs = updates.filter((u) => u.tool_counts);
-  assert.equal(tcs.length, 3);
+  assert.equal(tcs.length, 4);
   assert.equal(tcs[0].tool_counts.total.total, 1);
   assert.equal(tcs[0].tool_counts.Read.total, 1);
   assert.equal(tcs[1].tool_counts.total.total, 2);
   assert.equal(tcs[1].tool_counts.Edit.total, 1);
-  assert.equal(tcs[2].tool_counts.total.total, 3);
-  assert.equal(tcs[2].tool_counts.Glob.total, 1);
+  assert.equal(tcs[2].tool_counts.total.total, 2);
+  assert.equal(tcs[3].tool_counts.total.total, 3);
+  assert.equal(tcs[3].tool_counts.Glob.total, 1);
 });
 
 test('buildProgressOnLine correlaciona resultado nativo e OpenCode por id', () => {
@@ -2562,7 +2639,7 @@ test('parseOpenCodeEvents trata <think> partido entre dois fragmentos', () => {
     }),
   ].join('\n');
   const parsed = parseOpenCodeEvents(raw, cwd);
-  assert.equal(parsed.result, 'Antes do\nDepois.');
+  assert.equal(parsed.result, 'Antes doDepois.');
 });
 
 test('parseOpenCodeEvents trata </think> partido entre dois fragmentos', () => {
@@ -2761,14 +2838,14 @@ test('buildProgressOnLine deduplica tool_use de stream_event quando assistant ch
   assert.equal(last.Read.succeeded, 1);
 });
 
-test('buildProgressOnLine nao expoe thinking_delta nem texto de stream_event', () => {
+test('buildProgressOnLine registra atividade sem expor thinking_delta nem texto', () => {
   const updates = [];
   const cb = buildProgressOnLine(
     (update) => { updates.push(update); },
     { minIntervalMs: 0, mode: 'read_only' },
   );
 
-  // stream_event com thinking_delta — ignorado
+  // stream_event com thinking_delta — atividade sem conteúdo sensível
   cb(JSON.stringify({
     type: 'stream_event',
     session_id: 'ses_think',
@@ -2779,7 +2856,7 @@ test('buildProgressOnLine nao expoe thinking_delta nem texto de stream_event', (
     },
   }));
 
-  // stream_event com texto — ignorado
+  // stream_event com texto — atividade sem conteúdo
   cb(JSON.stringify({
     type: 'stream_event',
     session_id: 'ses_text',
@@ -2790,7 +2867,9 @@ test('buildProgressOnLine nao expoe thinking_delta nem texto de stream_event', (
     },
   }));
 
-  // Nenhum update deve ter sido emitido (sem tool_use)
   const toolUpdates = updates.filter((u) => u.tool_counts);
-  assert.equal(toolUpdates.length, 0, 'thinking_delta e texto não devem gerar tool_counts');
+  assert.equal(toolUpdates.length, 2, 'cada fragmento válido deve renovar o heartbeat');
+  assert.ok(toolUpdates.every((update) => update.phase === 'waiting_model'));
+  assert.ok(toolUpdates.every((update) => update.tool_counts.total.total === 0));
+  assert.ok(toolUpdates.every((update) => !('text' in update) && !('thinking' in update)));
 });

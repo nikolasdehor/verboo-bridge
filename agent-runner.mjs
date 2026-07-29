@@ -575,92 +575,103 @@ export function buildChildEnv(sourceEnv, invocation) {
   return childEnv;
 }
 
+const THINK_OPEN = '<think>';
+const THINK_CLOSE = '</think>';
+
+function isBacktickedTag(input, index, tag) {
+  return index > 0
+    && input[index - 1] === '`'
+    && input[index + tag.length] === '`';
+}
+
+function trailingTagPrefix(text, tag) {
+  for (let length = Math.min(text.length, tag.length - 1); length > 0; length--) {
+    if (tag.startsWith(text.slice(-length).toLowerCase())) {
+      return text.slice(-length);
+    }
+  }
+  return '';
+}
+
+function consumeInsideThink(input, position) {
+  const closeIndex = input.toLowerCase().indexOf(THINK_CLOSE, position);
+  if (closeIndex === -1) {
+    return {
+      position: input.length,
+      inThink: true,
+      buffer: trailingTagPrefix(input.slice(position), THINK_CLOSE),
+      visible: '',
+    };
+  }
+  return {
+    position: closeIndex + THINK_CLOSE.length,
+    inThink: isBacktickedTag(input, closeIndex, THINK_CLOSE),
+    buffer: '',
+    visible: '',
+  };
+}
+
+function consumeVisibleText(input, position) {
+  const openIndex = input.toLowerCase().indexOf(THINK_OPEN, position);
+  if (openIndex === -1) {
+    const remaining = input.slice(position);
+    const buffer = trailingTagPrefix(remaining, THINK_OPEN);
+    return {
+      position: input.length,
+      inThink: false,
+      buffer,
+      visible: remaining.slice(0, remaining.length - buffer.length),
+    };
+  }
+  if (isBacktickedTag(input, openIndex, THINK_OPEN)) {
+    return {
+      position: openIndex + THINK_OPEN.length,
+      inThink: false,
+      buffer: '',
+      visible: input.slice(position, openIndex + THINK_OPEN.length),
+    };
+  }
+  return {
+    position: openIndex + THINK_OPEN.length,
+    inThink: true,
+    buffer: '',
+    visible: input.slice(position, openIndex),
+  };
+}
+
+function consumeThinkStream(input, startsInThink) {
+  let position = 0;
+  let inThink = startsInThink;
+  let buffer = '';
+  let visible = '';
+  while (position < input.length) {
+    const consumed = inThink
+      ? consumeInsideThink(input, position)
+      : consumeVisibleText(input, position);
+    position = consumed.position;
+    inThink = consumed.inThink;
+    buffer = consumed.buffer;
+    visible += consumed.visible;
+  }
+  return { inThink, buffer, visible };
+}
+
 function createThinkFilter() {
   let inThink = false;
   let thinkBuffer = '';
 
   const filter = (text) => {
     if (!text) return '';
-    let result = '';
-    let pos = 0;
-    const input = thinkBuffer + text;
-    thinkBuffer = '';
-
-    while (pos < input.length) {
-      if (inThink) {
-        const closeIdx = input.toLowerCase().indexOf('</think>', pos);
-        if (closeIdx !== -1) {
-          if (
-            closeIdx > 0
-            && input[closeIdx - 1] === '`'
-            && input[closeIdx + 8] === '`'
-          ) {
-            // Literal </think> em backticks — pula sem sair do think
-            pos = closeIdx + 8;
-          } else {
-            inThink = false;
-            pos = closeIdx + 8;
-          }
-        } else {
-          const remaining = input.slice(pos);
-          let partialMatchLength = 0;
-          for (let len = Math.min(remaining.length, 7); len > 0; len--) {
-            if ('</think>'.startsWith(remaining.slice(-len).toLowerCase())) {
-              partialMatchLength = len;
-              break;
-            }
-          }
-          if (partialMatchLength > 0) {
-            thinkBuffer = remaining.slice(-partialMatchLength);
-          }
-          break;
-        }
-      } else {
-        const openIdx = input.toLowerCase().indexOf('<think>', pos);
-        if (openIdx !== -1) {
-          if (
-            openIdx > 0
-            && input[openIdx - 1] === '`'
-            && input[openIdx + 7] === '`'
-          ) {
-            // Literal <think> em backticks — emite e continua
-            result += input.slice(pos, openIdx + 7);
-            pos = openIdx + 7;
-            continue;
-          }
-          result += input.slice(pos, openIdx);
-          inThink = true;
-          pos = openIdx + 7;
-        } else {
-          const remaining = input.slice(pos);
-          let partialMatchLength = 0;
-          for (let len = Math.min(remaining.length, 6); len > 0; len--) {
-            if ('<think>'.startsWith(remaining.slice(-len).toLowerCase())) {
-              partialMatchLength = len;
-              break;
-            }
-          }
-          if (partialMatchLength > 0) {
-            result += remaining.slice(0, remaining.length - partialMatchLength);
-            thinkBuffer = remaining.slice(-partialMatchLength);
-          } else {
-            result += remaining;
-          }
-          break;
-        }
-      }
-    }
-    return result.trim();
+    const consumed = consumeThinkStream(thinkBuffer + text, inThink);
+    inThink = consumed.inThink;
+    thinkBuffer = consumed.buffer;
+    return consumed.visible;
   };
 
   filter.flush = () => {
-    if (!inThink && thinkBuffer) {
-      const buf = thinkBuffer.trim();
-      thinkBuffer = '';
-      return buf;
-    }
+    const visible = inThink ? '' : thinkBuffer;
     thinkBuffer = '';
-    return '';
+    return visible;
   };
 
   return filter;
@@ -806,67 +817,102 @@ export function buildProgressOnLine(
     return null;
   };
 
+  const emitIfReady = () => {
+    if (pending && now() - lastEmitAt >= minIntervalMs) emit();
+  };
+
+  const handleStreamToolStart = (event) => {
+    const streamEvent = event.type === 'stream_event' ? event.event : null;
+    if (
+      streamEvent?.type !== 'content_block_start'
+      || streamEvent.content_block?.type !== 'tool_use'
+    ) {
+      return false;
+    }
+    const block = streamEvent.content_block;
+    startTool(block.name, block.id, {
+      sessionId: event.session_id,
+      context: block.input,
+    });
+    return true;
+  };
+
+  const registerContentToolCall = (event, sessionId) => {
+    const id = event.id ?? event.call_id ?? event.tool_use_id;
+    const key = startTool(event.name, id, {
+      sessionId,
+      forceNewAnonymous: !id,
+    });
+    if (id) toolAliases.set(String(id), key);
+    const sessionKey = String(sessionId ?? 'global');
+    const queue = pendingContentToolsBySession.get(sessionKey) ?? [];
+    if (!queue.includes(key)) queue.push(key);
+    pendingContentToolsBySession.set(sessionKey, queue);
+  };
+
+  const handleOpenCodeToolUse = (event, sessionId) => {
+    if (event.type === 'tool_use' && typeof event.part?.tool === 'string') {
+      const id = event.part.id
+        ?? event.part.callID
+        ?? event.part.callId
+        ?? event.part.toolCallID;
+      const context = event.part.state?.input ?? event.part.input;
+      const key = startTool(event.part.tool, id, { sessionId, context });
+      const status = String(event.part.state?.status ?? '').toLowerCase();
+      if (['completed', 'failed', 'error'].includes(status)) {
+        finishTool(key, status !== 'completed' || Boolean(event.part.state?.error));
+      }
+      return;
+    }
+    if (
+      event.type === 'content'
+      && event.content_type === 'tool_call'
+      && typeof event.name === 'string'
+    ) {
+      registerContentToolCall(event, sessionId);
+    }
+  };
+
+  const handleNativeBlocks = (event, sessionId) => {
+    for (const block of nativeEventBlocks(event)) {
+      if (block.type === 'tool_use' && typeof block.name === 'string') {
+        startTool(block.name, block.id, { sessionId, context: block.input });
+      } else if (block.type === 'tool_result') {
+        finishTool(block.tool_use_id, block.is_error === true);
+      }
+    }
+  };
+
+  const handleToolResult = (event, sessionId) => {
+    if (event.type !== 'tool_result') return;
+    const id = event.tool_use_id ?? event.call_id ?? event.part?.tool_use_id;
+    const directKey = id && pendingTools.has(String(id)) ? String(id) : null;
+    const aliasedKey = id ? toolAliases.get(String(id)) : null;
+    finishTool(
+      directKey
+        ?? aliasedKey
+        ?? takePendingContentTool(sessionId),
+      event.is_error === true || event.part?.is_error === true,
+    );
+  };
+
   const onLine = (line) => {
     if (closed) return;
     try {
       const event = JSON.parse(line);
-      const sessionID = event.sessionID ?? event.part?.sessionID ?? event.session_id ?? event.sessionId;
-
-      // Partial messages wrap the Anthropic event under `event`.
-      const streamEvent = event.type === 'stream_event' ? event.event : null;
-      if (
-        streamEvent?.type === 'content_block_start'
-        && streamEvent.content_block?.type === 'tool_use'
-      ) {
-        const cb = streamEvent.content_block;
-        startTool(cb.name, cb.id, { sessionId: event.session_id, context: cb.input });
-        if (pending && now() - lastEmitAt >= minIntervalMs) emit();
+      pending = true;
+      const sessionId = event.sessionID
+        ?? event.part?.sessionID
+        ?? event.session_id
+        ?? event.sessionId;
+      if (handleStreamToolStart(event)) {
+        emitIfReady();
         return;
       }
-
-      if (event.type === 'tool_use' && typeof event.part?.tool === 'string') {
-        const id = event.part.id
-          ?? event.part.callID
-          ?? event.part.callId
-          ?? event.part.toolCallID;
-        const context = event.part.state?.input ?? event.part.input;
-        const key = startTool(event.part.tool, id, { sessionId: sessionID, context });
-        const status = String(event.part.state?.status ?? '').toLowerCase();
-        if (['completed', 'failed', 'error'].includes(status)) {
-          finishTool(key, status !== 'completed' || Boolean(event.part.state?.error));
-        }
-      } else if (event.type === 'content' && event.content_type === 'tool_call' && typeof event.name === 'string') {
-        const id = event.id ?? event.call_id ?? event.tool_use_id;
-        const key = startTool(event.name, id, {
-          sessionId: sessionID,
-          forceNewAnonymous: !id,
-        });
-        if (id) toolAliases.set(String(id), key);
-        const sessionKey = String(sessionID ?? 'global');
-        const queue = pendingContentToolsBySession.get(sessionKey) ?? [];
-        if (!queue.includes(key)) queue.push(key);
-        pendingContentToolsBySession.set(sessionKey, queue);
-      }
-
-      for (const block of nativeEventBlocks(event)) {
-        if (block.type === 'tool_use' && typeof block.name === 'string') {
-          startTool(block.name, block.id, { sessionId: sessionID, context: block.input });
-        } else if (block.type === 'tool_result') {
-          finishTool(block.tool_use_id, block.is_error === true);
-        }
-      }
-      if (event.type === 'tool_result') {
-        const id = event.tool_use_id ?? event.call_id ?? event.part?.tool_use_id;
-        const directKey = id && pendingTools.has(String(id)) ? String(id) : null;
-        const aliasedKey = id ? toolAliases.get(String(id)) : null;
-        finishTool(
-          directKey
-            ?? aliasedKey
-            ?? takePendingContentTool(sessionID),
-          event.is_error === true || event.part?.is_error === true,
-        );
-      }
-      if (pending && now() - lastEmitAt >= minIntervalMs) emit();
+      handleOpenCodeToolUse(event, sessionId);
+      handleNativeBlocks(event, sessionId);
+      handleToolResult(event, sessionId);
+      emitIfReady();
     } catch {}
   };
   onLine.flush = emit;
@@ -878,12 +924,52 @@ export function buildProgressOnLine(
 }
 
 
+function openCodeEventSessionId(event) {
+  return event.sessionID
+    ?? event.part?.sessionID
+    ?? event.session_id
+    ?? event.sessionId
+    ?? null;
+}
+
+function registerOpenCodeContentTool(pendingBySession, event) {
+  if (
+    event.type !== 'content'
+    || event.content_type !== 'tool_call'
+    || typeof event.name !== 'string'
+  ) {
+    return null;
+  }
+  const sessionKey = String(openCodeEventSessionId(event) ?? 'global');
+  const queue = pendingBySession.get(sessionKey) ?? [];
+  const id = event.id ?? event.call_id ?? event.tool_use_id;
+  queue.push({ id: id == null ? null : String(id), tool: event.name });
+  pendingBySession.set(sessionKey, queue);
+  return event.name;
+}
+
+function takeSuccessfulOpenCodeContentTool(pendingBySession, event) {
+  if (event.type !== 'tool_result') return null;
+  const sessionKey = String(openCodeEventSessionId(event) ?? 'global');
+  const queue = pendingBySession.get(sessionKey) ?? [];
+  if (queue.length === 0) return null;
+  const id = event.tool_use_id ?? event.call_id ?? event.part?.tool_use_id;
+  const matchedIndex = id == null
+    ? -1
+    : queue.findIndex((pending) => pending.id === String(id));
+  const [completed] = queue.splice(matchedIndex >= 0 ? matchedIndex : 0, 1);
+  if (queue.length === 0) pendingBySession.delete(sessionKey);
+  if (event.is_error === true || event.part?.is_error === true) return null;
+  return completed.tool;
+}
+
 export function parseOpenCodeEvents(raw, cwd) {
   let sessionId = null;
   const resultParts = [];
   const artifacts = new Set();
   const toolsUsed = new Set();
   const successfulTools = new Set();
+  const pendingContentToolsBySession = new Map();
   const filter = createThinkFilter();
 
   for (const line of raw.split('\n')) {
@@ -895,7 +981,7 @@ export function parseOpenCodeEvents(raw, cwd) {
       continue;
     }
 
-    sessionId ||= event.sessionID ?? event.part?.sessionID ?? null;
+    sessionId ||= openCodeEventSessionId(event);
     if (event.type === 'text') {
       const candidate = filter(event.part?.text ?? '');
       if (candidate) resultParts.push(candidate);
@@ -912,13 +998,16 @@ export function parseOpenCodeEvents(raw, cwd) {
         if (isInside(cwd, candidate)) artifacts.add(candidate);
       }
     }
-    if (
-      event.type === 'content'
-      && event.content_type === 'tool_call'
-      && typeof event.name === 'string'
-    ) {
-      toolsUsed.add(event.name);
-    }
+    const contentTool = registerOpenCodeContentTool(
+      pendingContentToolsBySession,
+      event,
+    );
+    if (contentTool) toolsUsed.add(contentTool);
+    const completedContentTool = takeSuccessfulOpenCodeContentTool(
+      pendingContentToolsBySession,
+      event,
+    );
+    if (completedContentTool) successfulTools.add(completedContentTool);
   }
 
   const remaining = filter.flush();
@@ -926,7 +1015,7 @@ export function parseOpenCodeEvents(raw, cwd) {
 
   return {
     sessionId,
-    result: resultParts.join('\n'),
+    result: resultParts.join('').trim(),
     artifacts: sortedStrings(artifacts),
     toolsUsed: sortedStrings(toolsUsed),
     successfulTools: sortedStrings(successfulTools),
@@ -998,7 +1087,7 @@ export function parseVerbooCodeEvents(raw, cwd) {
 
   return {
     sessionId,
-    result: resultParts.join('\n'),
+    result: resultParts.join('').trim(),
     artifacts: sortedStrings(artifacts),
     toolsUsed: sortedStrings(toolsUsed),
     successfulTools: sortedStrings(successfulTools),

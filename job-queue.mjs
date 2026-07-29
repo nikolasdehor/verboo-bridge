@@ -148,6 +148,7 @@ function safeTerminalResult(result) {
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const STORE_TEMP_FILE_RE = /^\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
 
 async function loadStoredRecord(storeDir, file) {
   if (!file.endsWith('.json')) return null;
@@ -624,6 +625,11 @@ export class JobQueue extends EventEmitter {
 
     const files = await readdir(storeDir).catch(() => []);
     for (const file of files) {
+      // Só remove órfãos do rename atômico produzido por #persistJob.
+      if (STORE_TEMP_FILE_RE.test(file)) {
+        await unlink(path.join(storeDir, file)).catch(() => {});
+        continue;
+      }
       const record = await loadStoredRecord(storeDir, file);
       if (!record) continue;
 
