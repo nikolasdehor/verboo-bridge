@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { chmod, mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdtemp,
+  mkdir,
+  realpath,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -15,6 +22,7 @@ import {
   buildTaskkillInvocation,
   buildVerbooCodeInvocation,
   buildChildEnv,
+  createNativeEventParser,
   formatAgentFailure,
   globallyAllowedModels,
   normalizeAgentRequest,
@@ -680,9 +688,10 @@ process.stdout.write(JSON.stringify({
   assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'status.txt')]);
 });
 
-test('issue #14: tentativas Bash negadas retornam warning sem perder o contrato nativo', async () => {
+test('issue #14 / PR #17: Edit real e Bash negada preservam contrato para revisão', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-denied-bash-'));
   const artifact = path.join(base, 'src', 'audit.md');
+  const artifactEventPath = path.relative(base, artifact);
   await mkdir(path.dirname(artifact), { recursive: true });
   await writeFile(artifact, 'audit');
   const spawnImpl = () => {
@@ -694,7 +703,7 @@ test('issue #14: tentativas Bash negadas retornam warning sem perder o contrato 
       child.stdout.end(`${[
         {
           type: 'assistant', session_id: 'native_denied_bash', message: { content: [
-            { type: 'tool_use', id: 'edit_1', name: 'Edit', input: { file_path: artifact } },
+            { type: 'tool_use', id: 'edit_1', name: 'Edit', input: { file_path: artifactEventPath } },
             { type: 'tool_use', id: 'bash_1', name: 'Bash', input: { command: 'pwd' } },
           ] },
         },
@@ -714,7 +723,15 @@ test('issue #14: tentativas Bash negadas retornam warning sem perder o contrato 
             { type: 'tool_result', tool_use_id: 'bash_2', content: 'denied', is_error: true },
           ] },
         },
-        { type: 'result', session_id: 'native_denied_bash', result: 'Resultado canônico.' },
+        {
+          type: 'result',
+          session_id: 'native_denied_bash',
+          result: 'Resultado canônico.',
+          permission_denials: [
+            { tool_name: 'Bash', tool_use_id: 'bash_1' },
+            { tool_name: 'Bash', tool_use_id: 'bash_2' },
+          ],
+        },
       ].map(JSON.stringify).join('\n')}\n`);
       child.stderr.end();
       child.emit('close', 0);
@@ -739,11 +756,179 @@ test('issue #14: tentativas Bash negadas retornam warning sem perder o contrato 
 
   assert.equal(result.status, 'warning');
   assert.match(result.summary, /negadas/i);
+  assert.match(result.summary, /alteração|artefato/i);
+  assert.match(result.summary, /revis/i);
   assert.doesNotMatch(result.summary, /nenhuma mudança foi confirmada/i);
   assert.equal(result.result, 'Resultado canônico.');
-  assert.deepEqual(result.artifacts, [artifact]);
+  assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'src', 'audit.md')]);
   assert.equal(result.model, 'deepseek-v4-flash');
   assert.equal(result.executor, 'native');
+});
+
+test('PR #17: warning exige permission_denials exata no resultado final', async (t) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-denial-proof-'));
+  const events = [
+    { type: 'assistant', session_id: 's1', message: { content: [
+      { type: 'tool_use', id: 'read_ok', name: 'Read' },
+      { type: 'tool_use', id: 'bash_1', name: 'Bash' },
+    ] } },
+    { type: 'user', session_id: 's1', message: { content: [
+      { type: 'tool_result', tool_use_id: 'read_ok', is_error: false },
+      { type: 'tool_result', tool_use_id: 'bash_1', is_error: true },
+    ] } },
+  ];
+  const run = (finalEvent) => runVerbooAgent(
+    {
+      prompt: 'audite sem shell', cwd: base, executor: 'native', mode: 'read_only',
+      model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+      spawnImpl: spawnJsonlFixture([...events, finalEvent]),
+    },
+  );
+  const finalResult = (permissionDenials, sessionId = 's1') => ({
+    type: 'result',
+    session_id: sessionId,
+    result: 'Resultado.',
+    ...(permissionDenials === undefined
+      ? {}
+      : { permission_denials: permissionDenials }),
+  });
+
+  await t.test('prova exata permite warning', async () => {
+    const result = await run(finalResult([
+      { tool_name: 'Bash', tool_use_id: 'bash_1' },
+    ]));
+    assert.equal(result.status, 'warning');
+    assert.match(result.summary, /negadas/i);
+  });
+
+  const invalidProofs = [
+    ['permission_denials ausente', finalResult()],
+    ['tool_use_id diferente', finalResult([
+      { tool_name: 'Bash', tool_use_id: 'bash_other' },
+    ])],
+    ['tool_name diferente', finalResult([
+      { tool_name: 'Read', tool_use_id: 'bash_1' },
+    ])],
+    ['sessão diferente', finalResult([
+      { tool_name: 'Bash', tool_use_id: 'bash_1' },
+    ], 's2')],
+  ];
+  for (const [name, finalEvent] of invalidProofs) {
+    await t.test(name, async () => {
+      await assert.rejects(
+        () => run(finalEvent),
+        (error) => error.code === 'FORBIDDEN_TOOL_USED',
+      );
+    });
+  }
+});
+
+test('PR #17: result terminal encerra o fluxo nativo', async (t) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-terminal-result-'));
+  const run = (events) => runVerbooAgent(
+    {
+      prompt: 'audite sem shell', cwd: base, executor: 'native', mode: 'read_only',
+      model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+      spawnImpl: spawnJsonlFixture(events),
+    },
+  );
+  const deniedBash = [
+    { type: 'assistant', session_id: 's1', message: { content: [
+      { type: 'tool_use', id: 'bash_1', name: 'Bash' },
+    ] } },
+    { type: 'user', session_id: 's1', message: { content: [
+      { type: 'tool_result', tool_use_id: 'bash_1', is_error: true },
+    ] } },
+  ];
+  const terminal = {
+    type: 'result',
+    session_id: 's1',
+    result: 'Resultado.',
+    permission_denials: [{ tool_name: 'Bash', tool_use_id: 'bash_1' }],
+  };
+
+  await t.test('tool_use rejeitada antes do result termina em warning', async () => {
+    const result = await run([...deniedBash, terminal]);
+    assert.equal(result.status, 'warning');
+    assert.match(result.summary, /negadas/i);
+  });
+  await t.test('permission_denial antecipada não autoriza tool_use posterior', async () => {
+    await assert.rejects(
+      () => run([terminal, ...deniedBash]),
+      (error) => ['INVALID_EVENT', 'FORBIDDEN_TOOL_USED'].includes(error.code),
+    );
+  });
+  await t.test('evento substantivo após result terminal é inválido', async () => {
+    await assert.rejects(
+      () => run([
+        { type: 'result', session_id: 's1', result: 'Primeiro.' },
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'text', text: 'Texto tardio.' },
+        ] } },
+      ]),
+      (error) => error.code === 'INVALID_EVENT',
+    );
+  });
+  await t.test('segundo result terminal é inválido', async () => {
+    await assert.rejects(
+      () => run([
+        { type: 'result', session_id: 's1', result: 'Primeiro.' },
+        { type: 'result', session_id: 's1', result: 'Segundo.' },
+      ]),
+      (error) => error.code === 'INVALID_EVENT',
+    );
+  });
+});
+
+test('PR #17: ruído de Read não contamina negação explícita de Bash', async (t) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-denial-noise-'));
+  const run = (noisyToolUseId) => runVerbooAgent(
+    {
+      prompt: 'audite sem shell', cwd: base, executor: 'native', mode: 'read_only',
+      model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+      spawnImpl: spawnJsonlFixture([
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: 'read_1', name: 'Read' },
+          { type: 'tool_use', id: 'bash_1', name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: 's1', message: { content: [
+          { type: 'tool_result', tool_use_id: 'read_1', is_error: false },
+          { type: 'tool_result', tool_use_id: 'bash_1', is_error: true },
+          { type: 'tool_result', tool_use_id: noisyToolUseId, is_error: true },
+        ] } },
+        {
+          type: 'result',
+          session_id: 's1',
+          result: 'Resultado.',
+          permission_denials: [{ tool_name: 'Bash', tool_use_id: 'bash_1' }],
+        },
+      ]),
+    },
+  );
+
+  await t.test('tool_result duplicado de Read mantém warning', async () => {
+    const result = await run('read_1');
+    assert.equal(result.status, 'warning');
+    assert.match(result.summary, /negadas/i);
+  });
+  await t.test('tool_result duplicado de Bash mantém fail-closed', async () => {
+    await assert.rejects(
+      () => run('bash_1'),
+      (error) => error.code === 'FORBIDDEN_TOOL_USED',
+    );
+  });
 });
 
 test('issue #14: Bash sem negação inequívoca por tentativa continua fail-closed', async () => {
@@ -949,7 +1134,7 @@ test('issue #14 high: IDs nativos não aceitam coerção de tipos', async (t) =>
       { type: 'tool_result', tool_use_id: 'read_ok', is_error: false },
     ] } },
   ];
-  const run = (events) => runVerbooAgent(
+  const run = (events, permissionDenials) => runVerbooAgent(
     {
       prompt: 'audite sem shell', cwd: base, executor: 'native', mode: 'read_only',
       model: 'deepseek-v4-flash', timeout_seconds: 10,
@@ -960,7 +1145,12 @@ test('issue #14 high: IDs nativos não aceitam coerção de tipos', async (t) =>
       spawnImpl: spawnJsonlFixture([
         ...prefix,
         ...events,
-        { type: 'result', session_id: 's1', result: 'Resultado.' },
+        {
+          type: 'result',
+          session_id: 's1',
+          result: 'Resultado.',
+          permission_denials: permissionDenials,
+        },
       ]),
     },
   );
@@ -973,7 +1163,7 @@ test('issue #14 high: IDs nativos não aceitam coerção de tipos', async (t) =>
       { type: 'user', session_id: 's1', message: { content: [
         { type: 'tool_result', tool_use_id: 'bash_1', is_error: true },
       ] } },
-    ]);
+    ], [{ tool_name: 'Bash', tool_use_id: 'bash_1' }]);
     assert.equal(result.status, 'warning');
     assert.match(result.summary, /negadas/i);
   });
@@ -981,6 +1171,7 @@ test('issue #14 high: IDs nativos não aceitam coerção de tipos', async (t) =>
   const cases = [
     {
       name: 'session_id número não correlaciona com string',
+      denialId: 'bash_1',
       events: [
         { type: 'assistant', session_id: 1, message: { content: [
           { type: 'tool_use', id: 'bash_1', name: 'Bash' },
@@ -992,6 +1183,7 @@ test('issue #14 high: IDs nativos não aceitam coerção de tipos', async (t) =>
     },
     {
       name: 'tool_use_id número não correlaciona com string',
+      denialId: '1',
       events: [
         { type: 'assistant', session_id: 's1', message: { content: [
           { type: 'tool_use', id: 1, name: 'Bash' },
@@ -1003,6 +1195,7 @@ test('issue #14 high: IDs nativos não aceitam coerção de tipos', async (t) =>
     },
     {
       name: 'tool_use_id objeto não correlaciona com string',
+      denialId: '[object Object]',
       events: [
         { type: 'assistant', session_id: 's1', message: { content: [
           { type: 'tool_use', id: { value: 'bash_1' }, name: 'Bash' },
@@ -1013,14 +1206,14 @@ test('issue #14 high: IDs nativos não aceitam coerção de tipos', async (t) =>
       ],
     },
   ];
-  for (const { name, events } of cases) {
+  for (const { name, denialId, events } of cases) {
     await t.test(name, async () => {
       await assert.rejects(
-        () => run(events),
-        (error) => (
-          error.code === 'FORBIDDEN_TOOL_USED'
-          || /PROTOCOL|INVALID.*EVENT/.test(String(error.code))
-        ),
+        () => run(events, [{
+          tool_name: 'Bash',
+          tool_use_id: denialId,
+        }]),
+        (error) => error.code === 'INVALID_EVENT',
       );
     });
   }
@@ -1117,10 +1310,11 @@ test('issue #14 high: IDs nativos excedentes falham bounded sem evicção', asyn
 test('issue #14 high: memory_note isolada mantém fallback factual da execução', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-memory-fallback-'));
   const artifact = path.join(base, 'status.txt');
+  const artifactEventPath = path.relative(base, artifact);
   await writeFile(artifact, 'status');
   const events = [
     { type: 'assistant', session_id: 's1', message: { content: [
-      { type: 'tool_use', id: 'edit_1', name: 'Edit', input: { file_path: artifact } },
+      { type: 'tool_use', id: 'edit_1', name: 'Edit', input: { file_path: artifactEventPath } },
     ] } },
     { type: 'user', session_id: 's1', message: { content: [
       { type: 'tool_result', tool_use_id: 'edit_1', is_error: false },
@@ -1150,7 +1344,280 @@ test('issue #14 high: memory_note isolada mantém fallback factual da execução
   assert.match(result.result, /Ferramentas concluídas: Edit\./);
   assert.match(result.result, /Artefatos registrados: 1\./);
   assert.doesNotMatch(result.result, /memory_note|Execução concluída sem mensagem final/);
-  assert.deepEqual(result.artifacts, [artifact]);
+  assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'status.txt')]);
+});
+
+test('PR #17: fallback factual maior que MAX_RESULT_TEXT_BYTES falha bounded', () => {
+  const parser = createNativeEventParser('/repo');
+  const sharedName = 'x'.repeat(821 * 1024);
+  let retainedNameBytes = 0;
+  for (let index = 0; index < 5; index += 1) {
+    const name = `${index}${sharedName}`;
+    const toolUse = {
+      type: 'assistant',
+      session_id: 's1',
+      message: { content: [{ type: 'tool_use', id: `t${index}`, name }] },
+    };
+    retainedNameBytes += Buffer.byteLength(name);
+    assert.ok(Buffer.byteLength(JSON.stringify(toolUse)) < 1024 * 1024);
+    parser.feed(JSON.stringify(toolUse));
+    parser.feed(JSON.stringify({
+      type: 'user',
+      session_id: 's1',
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: `t${index}`,
+        is_error: false,
+      }] },
+    }));
+  }
+  assert.ok(retainedNameBytes > 4 * 1024 * 1024);
+  assert.throws(
+    () => parser.finish(),
+    (error) => error.code === 'OUTPUT_LIMIT',
+  );
+});
+
+test('PR #17: file_path respeita limites de bytes e componentes', async (t) => {
+  const parsePath = (filePath) => parseVerbooCodeEvents([
+    JSON.stringify({
+      type: 'assistant',
+      session_id: 's1',
+      message: { content: [{
+        type: 'tool_use',
+        id: 'read_1',
+        name: 'Read',
+        input: { file_path: filePath },
+      }] },
+    }),
+    JSON.stringify({
+      type: 'user',
+      session_id: 's1',
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'read_1',
+        is_error: false,
+      }] },
+    }),
+    JSON.stringify({ type: 'result', session_id: 's1', result: 'Resultado.' }),
+  ].join('\n'), '/repo');
+  const pathAtByteLimit = Array(17).fill('x'.repeat(240)).join('/');
+  const pathAboveByteLimit = `${pathAtByteLimit}x`;
+  const pathAtComponentLimit = Array(256).fill('x').join('/');
+  const pathAboveComponentLimit = Array(257).fill('x').join('/');
+  assert.equal(Buffer.byteLength(pathAtByteLimit), 4_096);
+  assert.equal(Buffer.byteLength(pathAboveByteLimit), 4_097);
+
+  await t.test('aceita 4096 bytes e 256 componentes', () => {
+    assert.equal(parsePath(pathAtByteLimit).result, 'Resultado.');
+    assert.equal(parsePath(pathAtComponentLimit).result, 'Resultado.');
+  });
+  await t.test('rejeita 4097 bytes antes de resolver o caminho', () => {
+    assert.throws(
+      () => parsePath(pathAboveByteLimit),
+      (error) => error.code === 'OUTPUT_LIMIT',
+    );
+  });
+  await t.test('rejeita 257 componentes antes de resolver o caminho', () => {
+    assert.throws(
+      () => parsePath(pathAboveComponentLimit),
+      (error) => error.code === 'INVALID_EVENT',
+    );
+  });
+});
+
+test('PR #17: OpenCode limita filePath e path antes de resolver artefatos', async (t) => {
+  const parsePath = (field, value) => parseOpenCodeEvents(JSON.stringify({
+    type: 'tool_use',
+    sessionID: 's1',
+    part: {
+      tool: 'read',
+      state: { status: 'completed', input: { [field]: value } },
+    },
+  }), '/repo');
+  const pathAtByteLimit = Array(17).fill('x'.repeat(240)).join('/');
+  const pathAboveByteLimit = `${pathAtByteLimit}x`;
+  const pathAtComponentLimit = Array(256).fill('x').join('/');
+  const pathAboveComponentLimit = Array(257).fill('x').join('/');
+  assert.equal(Buffer.byteLength(pathAtByteLimit), 4_096);
+  assert.equal(Buffer.byteLength(pathAboveByteLimit), 4_097);
+
+  for (const field of ['filePath', 'path']) {
+    await t.test(`${field} aceita os limites`, () => {
+      assert.deepEqual(parsePath(field, pathAtByteLimit).successfulTools, ['read']);
+      assert.deepEqual(parsePath(field, pathAtComponentLimit).successfulTools, ['read']);
+    });
+    await t.test(`${field} rejeita 4097 bytes`, () => {
+      assert.throws(
+        () => parsePath(field, pathAboveByteLimit),
+        (error) => error.code === 'OUTPUT_LIMIT',
+      );
+    });
+    await t.test(`${field} rejeita 257 componentes`, () => {
+      assert.throws(
+        () => parsePath(field, pathAboveComponentLimit),
+        (error) => error.code === 'OUTPUT_LIMIT',
+      );
+    });
+  }
+});
+
+test('PR #17: warning write distingue ausência e confirmação de mudança', async (t) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-write-warning-'));
+  const artifact = path.join(base, 'status.txt');
+  await writeFile(artifact, 'status');
+  const run = (withEdit) => {
+    const toolUses = [{ type: 'tool_use', id: 'bash_1', name: 'Bash' }];
+    const toolResults = [{
+      type: 'tool_result',
+      tool_use_id: 'bash_1',
+      is_error: true,
+    }];
+    if (withEdit) {
+      toolUses.unshift({
+        type: 'tool_use',
+        id: 'edit_1',
+        name: 'Edit',
+        input: { file_path: 'status.txt' },
+      });
+      toolResults.unshift({
+        type: 'tool_result',
+        tool_use_id: 'edit_1',
+        is_error: false,
+      });
+    }
+    return runVerbooAgent(
+      {
+        prompt: 'atualize sem shell', cwd: base, executor: 'native', mode: 'write',
+        model: 'deepseek-v4-flash', timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_AGENT_WRITE_ENABLED: '1',
+        },
+        spawnImpl: spawnJsonlFixture([
+          { type: 'assistant', session_id: 's1', message: { content: toolUses } },
+          { type: 'user', session_id: 's1', message: { content: toolResults } },
+          {
+            type: 'result',
+            session_id: 's1',
+            result: 'Resultado.',
+            permission_denials: [{ tool_name: 'Bash', tool_use_id: 'bash_1' }],
+          },
+        ]),
+      },
+    );
+  };
+
+  await t.test('sem Edit ou Write confirma ausência de mudança', async () => {
+    const result = await run(false);
+    assert.equal(result.status, 'warning');
+    assert.match(result.summary, /nenhuma mudança foi confirmada/i);
+    assert.deepEqual(result.artifacts, []);
+  });
+  await t.test('com Edit confirmada orienta revisão do artefato', async () => {
+    const result = await run(true);
+    assert.equal(result.status, 'warning');
+    assert.match(result.summary, /revis/i);
+    assert.match(result.summary, /alteração|artefato/i);
+    assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'status.txt')]);
+  });
+});
+
+test('PR #17: artefato resiste a troca TOCTOU por symlink', {
+  skip: process.platform === 'win32'
+    ? 'requer semântica de symlink POSIX'
+    : false,
+}, async (t) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-artifact-toctou-'));
+  const outside = await mkdtemp(path.join(os.tmpdir(), 'verboo-artifact-outside-'));
+  const outsideFile = path.join(outside, 'secret.txt');
+  await writeFile(outsideFile, 'outside');
+  const run = (spawnImpl) => runVerbooAgent(
+    {
+      prompt: 'grave o arquivo', cwd: base, executor: 'native', mode: 'write',
+      model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_AGENT_WRITE_ENABLED: '1',
+      },
+      spawnImpl,
+    },
+  );
+
+  await t.test('arquivo interno real continua sendo publicado', async () => {
+    const internal = path.join(base, 'internal.txt');
+    await writeFile(internal, 'inside');
+    const result = await run(spawnJsonlFixture([
+      { type: 'assistant', session_id: 's1', message: { content: [{
+        type: 'tool_use',
+        id: 'write_1',
+        name: 'Write',
+        input: { file_path: 'internal.txt' },
+      }] } },
+      { type: 'user', session_id: 's1', message: { content: [{
+        type: 'tool_result',
+        tool_use_id: 'write_1',
+        is_error: false,
+      }] } },
+      { type: 'result', session_id: 's1', result: 'Concluído.' },
+    ]));
+    assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'internal.txt')]);
+  });
+
+  await t.test('symlink que passa a escapar antes do tool_result não é publicado', async () => {
+    const link = path.join(base, 'link.txt');
+    const target = path.join(base, 'target.txt');
+    await symlink('target.txt', link);
+    const spawnImpl = () => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => true;
+      setImmediate(async () => {
+        child.stdout.write(`${JSON.stringify({
+          type: 'assistant',
+          session_id: 's1',
+          message: { content: [{
+            type: 'tool_use',
+            id: 'write_1',
+            name: 'Write',
+            input: { file_path: 'link.txt' },
+          }] },
+        })}\n`);
+        await symlink(outsideFile, target);
+        child.stdout.end(`${[
+          { type: 'user', session_id: 's1', message: { content: [{
+            type: 'tool_result',
+            tool_use_id: 'write_1',
+            is_error: false,
+          }] } },
+          { type: 'result', session_id: 's1', result: 'Concluído.' },
+        ].map(JSON.stringify).join('\n')}\n`);
+        child.stderr.end();
+        child.emit('close', 0);
+      });
+      return child;
+    };
+
+    const outcome = await run(spawnImpl).then(
+      (result) => ({ result }),
+      (error) => ({ error }),
+    );
+    assert.equal(await realpath(link), await realpath(outsideFile));
+    if (outcome.error) {
+      assert.ok(
+        ['INVALID_EVENT', 'ARTIFACT_OUTSIDE_CWD'].includes(outcome.error.code),
+      );
+    } else {
+      assert.deepEqual(outcome.result.artifacts, []);
+    }
+  });
 });
 
 test('executor nativo falha fechado se reportar ferramenta proibida', async () => {

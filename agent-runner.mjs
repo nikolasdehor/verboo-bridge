@@ -26,6 +26,7 @@ const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_RESULT_TEXT_BYTES = 4 * 1024 * 1024;
 const MAX_TRACKED_ITEMS = 4_096;
 const MAX_NATIVE_KEY_PART_BYTES = 4_096;
+const MAX_NATIVE_PATH_COMPONENTS = 256;
 const DEFAULT_AGENT_CONCURRENCY = 4;
 const MAX_AGENT_CONCURRENCY = 8;
 const KILL_GRACE_MS = 2_000;
@@ -184,21 +185,22 @@ export function waitForAgentSlot(env, signal) {
   });
 }
 
-function isInside(root, candidate) {
-  const canonicalize = (value) => {
-    const suffix = [];
-    for (let current = value; ;) {
-      try {
-        return path.join(realpathSync(current), ...suffix);
-      } catch {
-        const parent = path.dirname(current);
-        if (parent === current) return value;
-        suffix.unshift(path.basename(current));
-        current = parent;
-      }
+function canonicalizePath(value) {
+  const suffix = [];
+  for (let current = value; ;) {
+    try {
+      return path.join(realpathSync(current), ...suffix);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return value;
+      suffix.unshift(path.basename(current));
+      current = parent;
     }
-  };
-  const relative = path.relative(canonicalize(root), canonicalize(candidate));
+  }
+}
+
+function isInside(root, candidate) {
+  const relative = path.relative(canonicalizePath(root), canonicalizePath(candidate));
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
@@ -1134,6 +1136,25 @@ function finishEventParser(state) {
   };
 }
 
+function validateArtifactPath(value, componentErrorCode = 'INVALID_EVENT') {
+  if (typeof value !== 'string') {
+    throw agentError('INVALID_EVENT', 'Caminho de artefato deve ser uma string.');
+  }
+  if (Buffer.byteLength(value) > MAX_NATIVE_KEY_PART_BYTES) {
+    throw agentError(
+      'OUTPUT_LIMIT',
+      `Caminho de artefato excedeu o limite de ${MAX_NATIVE_KEY_PART_BYTES} bytes.`,
+    );
+  }
+  if (value.split(/[\\/]+/u).filter(Boolean).length > MAX_NATIVE_PATH_COMPONENTS) {
+    throw agentError(
+      componentErrorCode,
+      `Caminho de artefato excedeu ${MAX_NATIVE_PATH_COMPONENTS} componentes.`,
+    );
+  }
+  return value;
+}
+
 export function createOpenCodeEventParser(cwd) {
   const state = createEventParserState(cwd);
   const pendingContentTools = { bySession: new Map(), size: 0 };
@@ -1164,9 +1185,12 @@ export function createOpenCodeEventParser(cwd) {
             );
           }
           const input = event.part?.state?.input ?? {};
-          for (const value of [input.filePath, input.path]) {
-            if (typeof value !== 'string') continue;
-            const candidate = path.resolve(state.cwd, value);
+          for (const value of [input.file_path, input.filePath, input.path]) {
+            if (value === undefined) continue;
+            const candidate = path.resolve(
+              state.cwd,
+              validateArtifactPath(value, 'OUTPUT_LIMIT'),
+            );
             if (isInside(state.cwd, candidate)) {
               addBounded(state.artifacts, candidate, 'Artefatos');
             }
@@ -1212,11 +1236,11 @@ export function createNativeEventParser(cwd, allowedToolNames = null) {
   const pendingTools = new Map();
   const seenToolUseIds = new Set();
   const toolAttempts = new Map();
-  let toolAttemptsAmbiguous = false;
+  let permissionDenials = [];
+  let terminalSeen = false;
 
   const boundedKeyPart = (value, label) => {
     if (typeof value !== 'string') {
-      toolAttemptsAmbiguous = true;
       throw agentError('INVALID_EVENT', `${label} deve ser uma string.`);
     }
     if (Buffer.byteLength(value) > MAX_NATIVE_KEY_PART_BYTES) {
@@ -1239,6 +1263,41 @@ export function createNativeEventParser(cwd, allowedToolNames = null) {
       ? null
       : JSON.stringify([sessionKey, boundedKeyPart(id, 'tool_use_id')])
   );
+  const denialKeyFor = (sessionId, toolUseId, tool) => (
+    JSON.stringify([sessionId, toolUseId, tool])
+  );
+  const capturePermissionDenials = (event, session) => {
+    permissionDenials = [];
+    if (!Object.hasOwn(event, 'permission_denials')) return;
+    if (!Array.isArray(event.permission_denials)) {
+      throw agentError('INVALID_EVENT', 'permission_denials deve ser uma lista.');
+    }
+    if (!session.reliable) {
+      throw agentError('INVALID_EVENT', 'permission_denials exige session_id string.');
+    }
+    if (event.permission_denials.length > MAX_TRACKED_ITEMS) {
+      throw agentError(
+        'OUTPUT_LIMIT',
+        `permission_denials excedeu o limite de ${MAX_TRACKED_ITEMS} itens.`,
+      );
+    }
+    permissionDenials = event.permission_denials.map((denial) => {
+      if (!denial || Array.isArray(denial) || typeof denial !== 'object') {
+        throw agentError('INVALID_EVENT', 'permission_denials contém item inválido.');
+      }
+      if (typeof denial.tool_name !== 'string') {
+        throw agentError('INVALID_EVENT', 'permission_denials.tool_name deve ser uma string.');
+      }
+      return {
+        sessionId: session.key,
+        toolUseId: boundedKeyPart(
+          denial.tool_use_id,
+          'permission_denials.tool_use_id',
+        ),
+        tool: denial.tool_name,
+      };
+    });
+  };
 
   return {
     feed(line) {
@@ -1250,13 +1309,25 @@ export function createNativeEventParser(cwd, allowedToolNames = null) {
         return;
       }
 
+      const blocks = nativeEventBlocks(event);
+      const substantive = event.type === 'result' || blocks.some((block) => (
+        ['text', 'tool_use', 'tool_result'].includes(block.type)
+      ));
+      if (terminalSeen) {
+        if (substantive) {
+          throw agentError('INVALID_EVENT', 'Evento substantivo recebido após result terminal.');
+        }
+        return;
+      }
       state.sessionId ||= event.session_id ?? event.sessionId ?? null;
-      if (event.type === 'result' && typeof event.result === 'string') {
-        setCanonicalResult(state, event.result);
+      const session = sessionFor(event);
+      if (event.type === 'result') {
+        if (typeof event.result === 'string') setCanonicalResult(state, event.result);
+        capturePermissionDenials(event, session);
+        terminalSeen = true;
       }
 
-      const session = sessionFor(event);
-      for (const block of nativeEventBlocks(event)) {
+      for (const block of blocks) {
         if (block.type === 'text') {
           if (state.canonicalResult == null) {
             appendVisibleText(state, state.filter(block.text ?? ''));
@@ -1264,7 +1335,10 @@ export function createNativeEventParser(cwd, allowedToolNames = null) {
           continue;
         }
         if (block.type === 'tool_use') {
-          const tool = String(block.name ?? '');
+          if (typeof block.name !== 'string') {
+            throw agentError('INVALID_EVENT', 'tool_use.name deve ser uma string.');
+          }
+          const tool = block.name;
           const tracked = allowedToolNames != null && !allowedToolNames.has(policyToolName(tool));
           if (tool) addBounded(state.toolsUsed, tool, 'Ferramentas usadas');
           const paths = [];
@@ -1273,16 +1347,20 @@ export function createNativeEventParser(cwd, allowedToolNames = null) {
             block.input?.filePath,
             block.input?.path,
           ]) {
-            if (typeof value !== 'string') continue;
-            const candidate = path.resolve(state.cwd, value);
-            if (isInside(state.cwd, candidate)) paths.push(candidate);
+            if (value === undefined) continue;
+            const validatedPath = validateArtifactPath(value);
+            const candidate = path.resolve(state.cwd, validatedPath);
+            if (isInside(state.cwd, candidate)) paths.push(validatedPath);
           }
           const key = attemptKeyFor(session.key, block.id);
           if (!key) {
             if (tracked) {
-              toolAttemptsAmbiguous = true;
               setBounded(toolAttempts, `ambiguous:${toolAttempts.size}`, {
-                tool, outcome: 'pending',
+                tool,
+                outcome: 'pending',
+                sessionId: session.key,
+                toolUseId: null,
+                ambiguous: true,
               }, 'Tentativas proibidas de ferramentas nativas');
             }
             continue;
@@ -1291,48 +1369,92 @@ export function createNativeEventParser(cwd, allowedToolNames = null) {
             ? pendingTools.has(key)
             : seenToolUseIds.has(key);
           if (repeated) {
-            toolAttemptsAmbiguous = true;
+            const existingAttempt = toolAttempts.get(key);
+            if (existingAttempt) {
+              existingAttempt.ambiguous = true;
+            } else if (tracked) {
+              setBounded(toolAttempts, `reuse:${toolAttempts.size}`, {
+                tool,
+                outcome: 'pending',
+                sessionId: session.key,
+                toolUseId: block.id,
+                ambiguous: true,
+              }, 'Tentativas proibidas de ferramentas nativas');
+            }
             continue;
           }
           if (allowedToolNames != null) {
             addBounded(seenToolUseIds, key, 'IDs de ferramentas nativas');
           }
-          const attempt = { tool, paths, outcome: 'pending', tracked };
+          const attempt = {
+            tool,
+            paths,
+            outcome: 'pending',
+            tracked,
+            sessionId: session.key,
+            toolUseId: block.id,
+            ambiguous: !session.reliable,
+          };
           setBounded(pendingTools, key, attempt, 'Ferramentas nativas pendentes');
           if (tracked) {
-            if (!session.reliable) toolAttemptsAmbiguous = true;
             setBounded(toolAttempts, key, attempt, 'Tentativas proibidas de ferramentas nativas');
           }
           continue;
         }
         if (block.type !== 'tool_result') continue;
+        const key = attemptKeyFor(session.key, block.tool_use_id);
         if (event.type !== 'user') {
-          toolAttemptsAmbiguous = true;
+          const trackedAttempt = key && toolAttempts.get(key);
+          if (trackedAttempt) trackedAttempt.ambiguous = true;
           continue;
         }
-        const key = attemptKeyFor(session.key, block.tool_use_id);
         const attempt = key && pendingTools.get(key);
         if (!attempt || attempt.outcome !== 'pending') {
-          toolAttemptsAmbiguous = true;
+          const trackedAttempt = key && toolAttempts.get(key);
+          if (trackedAttempt) trackedAttempt.ambiguous = true;
           continue;
         }
         pendingTools.delete(key);
-        if (attempt.tracked && !session.reliable) toolAttemptsAmbiguous = true;
+        if (attempt.tracked && !session.reliable) attempt.ambiguous = true;
         attempt.outcome = block.is_error === true ? 'rejected' : 'succeeded';
         if (attempt.outcome === 'rejected') continue;
         if (attempt.tool) addBounded(state.successfulTools, attempt.tool, 'Ferramentas concluídas');
-        for (const artifact of attempt.paths) {
+        for (const artifactPath of attempt.paths) {
+          const candidate = path.resolve(
+            state.cwd,
+            validateArtifactPath(artifactPath),
+          );
+          const artifact = canonicalizePath(candidate);
+          if (!isInside(state.cwd, artifact)) {
+            throw agentError(
+              'ARTIFACT_OUTSIDE_CWD',
+              'Artefato resolveu fora do diretório autorizado.',
+            );
+          }
           addBounded(state.artifacts, artifact, 'Artefatos');
         }
       }
     },
     finish() {
       const parsed = finishEventParser(state);
+      const nativeToolAttempts = [...toolAttempts.values()].map((attempt) => ({
+        tool: attempt.tool,
+        outcome: attempt.outcome,
+        ambiguous: attempt.ambiguous,
+        denialKey: attempt.toolUseId == null
+          ? null
+          : denialKeyFor(attempt.sessionId, attempt.toolUseId, attempt.tool),
+      }));
       Object.defineProperties(parsed, {
-        nativeToolAttempts: {
-          value: [...toolAttempts.values()].map(({ tool, outcome }) => ({ tool, outcome })),
+        nativeToolAttempts: { value: nativeToolAttempts },
+        nativeToolAttemptsAmbiguous: {
+          value: nativeToolAttempts.some(({ ambiguous }) => ambiguous),
         },
-        nativeToolAttemptsAmbiguous: { value: toolAttemptsAmbiguous },
+        nativePermissionDenialKeys: {
+          value: new Set(permissionDenials.map(({ sessionId, toolUseId, tool }) => (
+            denialKeyFor(sessionId, toolUseId, tool)
+          ))),
+        },
       });
       return parsed;
     },
@@ -1800,10 +1922,15 @@ async function executeAgentAttempt(
     const forbiddenAttempts = (parsed.nativeToolAttempts ?? []).filter(
       ({ tool }) => !allowedTools.has(policyToolName(tool)),
     );
+    const permissionDenialKeys = parsed.nativePermissionDenialKeys ?? new Set();
     const allForbiddenAttemptsRejected = executor === 'native'
-      && !parsed.nativeToolAttemptsAmbiguous
       && forbiddenAttempts.length > 0
-      && forbiddenAttempts.every(({ outcome }) => outcome === 'rejected');
+      && forbiddenAttempts.every((attempt) => (
+        !attempt.ambiguous
+        && attempt.outcome === 'rejected'
+        && attempt.denialKey != null
+        && permissionDenialKeys.has(attempt.denialKey)
+      ));
     if (allForbiddenAttemptsRejected) {
       return { parsed, status: 'warning', warningReason: 'forbidden_tools_rejected' };
     }
@@ -1840,8 +1967,20 @@ function routingResult(route, initialRoute, model, attempts) {
 function successfulResultText({ result, successfulTools, artifacts }) {
   if (result) return result;
   if (successfulTools.length === 0) return '';
-  return `Ferramentas concluídas: ${sortedStrings(successfulTools).join(', ')}. `
-    + `Artefatos registrados: ${artifacts.length}.`;
+  const names = sortedStrings(successfulTools);
+  const prefix = 'Ferramentas concluídas: ';
+  const suffix = `. Artefatos registrados: ${artifacts.length}.`;
+  let bytes = Buffer.byteLength(prefix) + Buffer.byteLength(suffix);
+  for (const [index, name] of names.entries()) {
+    bytes += Buffer.byteLength(name) + (index === 0 ? 0 : Buffer.byteLength(', '));
+    if (bytes > MAX_RESULT_TEXT_BYTES) {
+      throw agentError(
+        'OUTPUT_LIMIT',
+        `Resultado factual excedeu o limite de ${MAX_RESULT_TEXT_BYTES} bytes.`,
+      );
+    }
+  }
+  return `${prefix}${names.join(', ')}${suffix}`;
 }
 
 function successfulAgentResult({
@@ -1857,11 +1996,19 @@ function successfulAgentResult({
 }) {
   const memory = extractMemoryNote(parsed.result);
   const result = successfulResultText({ ...parsed, result: memory.result });
+  const hasConfirmedWrite = request.mode === 'write'
+    && parsed.successfulTools.some((tool) => (
+      ['apply_patch', 'edit', 'write'].includes(tool.toLowerCase())
+    ));
   return {
     status,
     summary: status === 'warning'
       ? warningReason === 'forbidden_tools_rejected'
-        ? 'O agente solicitou ferramentas proibidas, mas elas foram negadas pela política.'
+        ? hasConfirmedWrite
+          ? 'As ferramentas proibidas solicitadas foram negadas; uma alteração foi confirmada. Revise os artefatos.'
+          : request.mode === 'write'
+            ? 'As ferramentas proibidas solicitadas foram negadas; nenhuma mudança foi confirmada.'
+            : 'O agente solicitou ferramentas proibidas, mas elas foram negadas pela política.'
         : 'O agente encerrou sem executar ferramenta de edição; nenhuma mudança foi confirmada.'
       : `Agente Verboo concluiu a tarefa em modo ${request.mode}.`,
     result: result || 'Execução concluída sem mensagem final.',
