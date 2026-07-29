@@ -1038,10 +1038,21 @@ test('JobQueue: rejeicao inesperada em listener nao causa unhandled rejection', 
   q.on('completed', () => { throw new Error('listener-error'); });
 
   const { job_id } = q.enqueue({});
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error('job não finalizou')),
+      1_000,
+    );
+    const poll = setInterval(() => {
+      if (q.getJobResult(job_id)?.status !== 'succeeded') return;
+      clearInterval(poll);
+      clearTimeout(timeout);
+      resolve();
+    }, 5);
+  });
 
   const result = q.getJobResult(job_id);
-  assert.ok(result, 'job deve existir apesar do listener ruim');
+  assert.equal(result.status, 'succeeded', 'job deve concluir apesar do listener ruim');
 
   assert.equal(unhandled.length, 0, 'nenhuma unhandled rejection');
 });

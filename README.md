@@ -246,6 +246,16 @@ approval_mode = "approve"
 Isso evita `user cancelled MCP tool call` quando não há interface para responder
 ao prompt. Não use aprovação global irrestrita como atalho.
 
+Para também aprovar `verboo_validate`, primeiro habilite deliberadamente
+`VERBOO_AGENT_VERIFY_ENABLED=1` no ambiente do bridge. Só então adicione:
+
+```toml
+[mcp_servers.verboo-bridge.tools.verboo_validate]
+approval_mode = "approve"
+```
+
+Sem esse gate, `verboo_validate` falha fechado.
+
 ### Claude Desktop
 
 O Claude Desktop está disponível para macOS e Windows. Abra

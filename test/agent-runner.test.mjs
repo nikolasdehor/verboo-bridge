@@ -183,10 +183,14 @@ test('invocação nativa usa Verboo Code headless com ferramentas delimitadas', 
   );
   assert.ok(invocation.args.includes('Read,Glob,Grep,Edit,Write'));
   assert.ok(!invocation.args.includes('--allowedTools'));
-  assert.equal(
-    invocation.args[invocation.args.indexOf('--disallowed-tools') + 1],
-    'Bash,WebFetch,WebSearch,Task',
-  );
+  const disallowed = invocation.args[
+    invocation.args.indexOf('--disallowed-tools') + 1
+  ].split(',');
+  assert.ok(['Bash', 'WebFetch', 'Task', 'ToolSearch'].every(
+    (tool) => disallowed.includes(tool),
+  ));
+  assert.ok(!disallowed.includes('Edit'));
+  assert.ok(!disallowed.includes('Write'));
   assert.equal(invocation.args.at(-2), '--');
   assert.equal(invocation.args.at(-1), request.prompt);
 
@@ -198,6 +202,7 @@ test('invocação nativa usa Verboo Code headless com ferramentas delimitadas', 
   assert.ok(settings.permissions.allow.includes('Write(/repo/**)'));
   assert.ok(settings.permissions.deny.includes('Read(/repo/**/.env.*)'));
   assert.ok(settings.permissions.deny.includes('Bash'));
+  assert.ok(settings.permissions.deny.includes('ToolSearch'));
 });
 
 test('invocação nativa read_only usa bypass sem liberar escrita', () => {
@@ -215,16 +220,29 @@ test('invocação nativa read_only usa bypass sem liberar escrita', () => {
     invocation.args[invocation.args.indexOf('--tools') + 1],
     'Read,Glob,Grep',
   );
-  assert.equal(
-    invocation.args[invocation.args.indexOf('--disallowed-tools') + 1],
-    'Edit,Write,Bash,WebFetch,WebSearch,Task',
-  );
+  const disallowed = invocation.args[
+    invocation.args.indexOf('--disallowed-tools') + 1
+  ].split(',');
+  assert.ok([
+    'Edit',
+    'Write',
+    'Bash',
+    'MultiEdit',
+    'NotebookEdit',
+    'TodoWrite',
+    'Skill',
+    'ToolSearch',
+    'AskUserQuestion',
+    'EnterPlanMode',
+    'ListMcpResourcesTool',
+  ].every((tool) => disallowed.includes(tool)));
   const settings = JSON.parse(invocation.args[invocation.args.indexOf('--settings') + 1]);
   assert.equal(settings.disableAllHooks, true);
   assert.equal(settings.permissions.defaultMode, 'bypassPermissions');
   assert.ok(settings.permissions.deny.includes('Edit'));
   assert.ok(settings.permissions.deny.includes('Write'));
   assert.ok(settings.permissions.deny.includes('Bash'));
+  assert.ok(settings.permissions.deny.includes('ToolSearch'));
 });
 
 test('subprocesso desativa config de projeto e recebe apenas ambiente necessário', () => {
@@ -2230,7 +2248,7 @@ test('parseVerbooCodeEvents remove bloco think dividido entre multiplos fragment
   assert.equal(parsed.result, 'Analise:\nSucesso.');
 });
 
-test('buildProgressOnLine correlaciona tool_use sem id por ferramenta e contexto sem duplicar', () => {
+test('buildProgressOnLine correlaciona tool_use sem id por sessão e ferramenta', () => {
   const updates = [];
   const cb = buildProgressOnLine(
     (update) => { updates.push(update); },
@@ -2245,7 +2263,10 @@ test('buildProgressOnLine correlaciona tool_use sem id por ferramenta e contexto
   cb(JSON.stringify({
     type: 'tool_use',
     sessionID: 'ses_anon',
-    part: { tool: 'read', state: { status: 'completed', input: { path: 'a.js' } } },
+    part: {
+      tool: 'read',
+      state: { status: 'completed', input: { path: 'a.js', bytes: 120 } },
+    },
   }));
 
   cb(JSON.stringify({
@@ -2262,6 +2283,57 @@ test('buildProgressOnLine correlaciona tool_use sem id por ferramenta e contexto
   const last = updates.at(-1).tool_counts;
   assert.deepEqual(last.total, { total: 2, succeeded: 2, failed: 0 });
   assert.deepEqual(last.Read, { total: 2, succeeded: 2, failed: 0 });
+});
+
+test('buildProgressOnLine finaliza content tool_call concorrente na ordem da sessão', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0, executor: 'opencode' },
+  );
+
+  cb(JSON.stringify({
+    type: 'content',
+    content_type: 'tool_call',
+    sessionID: 'ses_content',
+    name: 'read',
+  }));
+  cb(JSON.stringify({
+    type: 'content',
+    content_type: 'tool_call',
+    sessionID: 'ses_content',
+    name: 'read',
+  }));
+  cb(JSON.stringify({
+    type: 'content',
+    content_type: 'tool_call',
+    sessionID: 'ses_content',
+    name: 'glob',
+  }));
+  cb(JSON.stringify({
+    type: 'tool_result',
+    sessionID: 'ses_content',
+    call_id: 'id-primeiro-adicionado-no-resultado',
+  }));
+  cb(JSON.stringify({
+    type: 'tool_result',
+    sessionID: 'ses_content',
+    call_id: 'id-segundo-adicionado-no-resultado',
+  }));
+  cb(JSON.stringify({
+    type: 'tool_result',
+    sessionID: 'ses_content',
+    call_id: 'id-terceiro-adicionado-no-resultado',
+  }));
+
+  assert.deepEqual(
+    updates.at(-1).tool_counts.Read,
+    { total: 2, succeeded: 2, failed: 0 },
+  );
+  assert.deepEqual(
+    updates.at(-1).tool_counts.Glob,
+    { total: 1, succeeded: 1, failed: 0 },
+  );
 });
 
 // ── onLine incremental tool_counts ──────────────────────────────────────

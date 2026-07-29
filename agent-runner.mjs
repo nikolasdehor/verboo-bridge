@@ -22,6 +22,25 @@ const DEFAULT_AGENT_CONCURRENCY = 4;
 const MAX_AGENT_CONCURRENCY = 8;
 const KILL_GRACE_MS = 2_000;
 const AGENT_NAME = 'verboo-bridge-agent';
+const NATIVE_ALWAYS_DISALLOWED_TOOLS = [
+  'Bash',
+  'WebFetch',
+  'WebSearch',
+  'Task',
+  'TaskOutput',
+  'TaskStop',
+  'MultiEdit',
+  'NotebookEdit',
+  'TodoWrite',
+  'Skill',
+  'ToolSearch',
+  'AskUserQuestion',
+  'EnterPlanMode',
+  'ExitPlanMode',
+  'ListMcpResourcesTool',
+  'ReadMcpResourceTool',
+  'LSP',
+];
 let activeAgentRuns = 0;
 let slotWaiters = [];
 
@@ -453,6 +472,13 @@ function nativePathPattern(cwd, suffix = '**') {
   return `${escaped.replace(/\/+$/, '')}/${suffix}`;
 }
 
+function nativeDisallowedToolsForMode(mode) {
+  return [
+    ...(mode === 'read_only' ? ['Edit', 'Write'] : []),
+    ...NATIVE_ALWAYS_DISALLOWED_TOOLS,
+  ];
+}
+
 function nativePermissionSettings(request) {
   const write = request.mode === 'write';
   const projectFiles = nativePathPattern(request.cwd);
@@ -472,11 +498,7 @@ function nativePermissionSettings(request) {
     ...secretFiles.map((pattern) => `Read(${pattern})`),
     ...secretFiles.map((pattern) => `Edit(${pattern})`),
     ...secretFiles.map((pattern) => `Write(${pattern})`),
-    ...(!write ? ['Edit', 'Write'] : []),
-    'Bash',
-    'WebFetch',
-    'WebSearch',
-    'Task',
+    ...nativeDisallowedToolsForMode(request.mode),
   ];
   return JSON.stringify({
     disableAllHooks: true,
@@ -503,14 +525,7 @@ export function buildVerbooCodeInvocation(
 ) {
   const allowedTools = allowedToolsForMode(request.mode, 'native');
   const tools = allowedTools.join(',');
-  const disallowedTools = [
-    'Edit',
-    'Write',
-    'Bash',
-    'WebFetch',
-    'WebSearch',
-    'Task',
-  ].filter((tool) => !allowedTools.includes(tool)).join(',');
+  const disallowedTools = nativeDisallowedToolsForMode(request.mode).join(',');
   const args = [];
   if (entrypoint) args.push(entrypoint);
   args.push(
@@ -651,16 +666,6 @@ function createThinkFilter() {
   return filter;
 }
 
-function safeContextString(context) {
-  if (context === undefined || context === null) return '';
-  if (typeof context === 'string') return context.slice(0, 200);
-  try {
-    return JSON.stringify(context).slice(0, 200);
-  } catch {
-    return String(context).slice(0, 200);
-  }
-}
-
 function categorizeTool(name) {
   const n = (name ?? '').toLowerCase();
   if (n === 'read') return 'Read';
@@ -700,6 +705,8 @@ export function buildProgressOnLine(
   const anonymousActiveKeys = new Map();
   const anonymousActiveKeysByFullKey = new Map();
   const anonymousCounts = new Map();
+  const toolAliases = new Map();
+  const pendingContentToolsBySession = new Map();
   let lastEmitAt = Number.NEGATIVE_INFINITY;
   let pending = false;
   let closed = false;
@@ -740,16 +747,17 @@ export function buildProgressOnLine(
       key = String(id);
     } else {
       const sessionId = String(sessionContext.sessionId ?? 'global');
-      const ctxStr = safeContextString(sessionContext.context);
-      const baseKey = `anon:${sessionId}:${name}:${ctxStr}`;
-      if (anonymousActiveKeys.has(baseKey)) {
+      const baseKey = `anon:${sessionId}:${name}`;
+      if (!sessionContext.forceNewAnonymous && anonymousActiveKeys.has(baseKey)) {
         key = anonymousActiveKeys.get(baseKey);
       } else {
         const count = (anonymousCounts.get(baseKey) ?? 0) + 1;
         anonymousCounts.set(baseKey, count);
         key = `${baseKey}:${count}`;
-        anonymousActiveKeys.set(baseKey, key);
-        anonymousActiveKeysByFullKey.set(key, baseKey);
+        if (!sessionContext.forceNewAnonymous) {
+          anonymousActiveKeys.set(baseKey, key);
+          anonymousActiveKeysByFullKey.set(key, baseKey);
+        }
       }
     }
 
@@ -780,8 +788,22 @@ export function buildProgressOnLine(
       anonymousActiveKeys.delete(baseKey);
       anonymousActiveKeysByFullKey.delete(key);
     }
+    for (const [alias, mappedKey] of toolAliases) {
+      if (mappedKey === key) toolAliases.delete(alias);
+    }
     phase = 'processing_result';
     pending = true;
+  };
+
+  const takePendingContentTool = (sessionId) => {
+    const sessionKey = String(sessionId ?? 'global');
+    const queue = pendingContentToolsBySession.get(sessionKey) ?? [];
+    while (queue.length > 0) {
+      const key = queue.shift();
+      if (pendingTools.has(key)) return key;
+    }
+    pendingContentToolsBySession.delete(sessionKey);
+    return null;
   };
 
   const onLine = (line) => {
@@ -815,7 +837,15 @@ export function buildProgressOnLine(
         }
       } else if (event.type === 'content' && event.content_type === 'tool_call' && typeof event.name === 'string') {
         const id = event.id ?? event.call_id ?? event.tool_use_id;
-        startTool(event.name, id, { sessionId: sessionID, context: event.input ?? event.arguments });
+        const key = startTool(event.name, id, {
+          sessionId: sessionID,
+          forceNewAnonymous: !id,
+        });
+        if (id) toolAliases.set(String(id), key);
+        const sessionKey = String(sessionID ?? 'global');
+        const queue = pendingContentToolsBySession.get(sessionKey) ?? [];
+        if (!queue.includes(key)) queue.push(key);
+        pendingContentToolsBySession.set(sessionKey, queue);
       }
 
       for (const block of nativeEventBlocks(event)) {
@@ -826,8 +856,13 @@ export function buildProgressOnLine(
         }
       }
       if (event.type === 'tool_result') {
+        const id = event.tool_use_id ?? event.call_id ?? event.part?.tool_use_id;
+        const directKey = id && pendingTools.has(String(id)) ? String(id) : null;
+        const aliasedKey = id ? toolAliases.get(String(id)) : null;
         finishTool(
-          event.tool_use_id ?? event.call_id ?? event.part?.tool_use_id,
+          directKey
+            ?? aliasedKey
+            ?? takePendingContentTool(sessionID),
           event.is_error === true || event.part?.is_error === true,
         );
       }
