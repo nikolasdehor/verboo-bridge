@@ -12,6 +12,7 @@ import { MODEL_CATALOG } from '../model-router.mjs';
 
 test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   const repo = path.resolve('.');
+  const outside = path.dirname(repo);
   const memoryDir = await mkdtemp(path.join(os.tmpdir(), 'verboo-mcp-memory-'));
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -129,7 +130,7 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
 
   const result = await client.callTool({
     name: 'verboo_agent',
-    arguments: { prompt: 'audite', cwd: '/etc', mode: 'read_only' },
+    arguments: { prompt: 'audite', cwd: outside, mode: 'read_only' },
   });
   assert.equal(result.isError, true);
   const payload = JSON.parse(result.content[0].text);
@@ -312,6 +313,172 @@ test('MCP verboo_agent_start enfileira e verboo_job cancela execução em andame
   const missingPayload = JSON.parse(missingResult.content[0].text);
   assert.equal(missingPayload.error, 'NOT_FOUND');
   assert.equal(missingResult.isError, true);
+});
+
+test('MCP SIGTERM repetido encerra uma vez, persiste jobs e não deixa runner órfão', {
+  skip: process.platform === 'win32',
+}, async (t) => {
+  const repo = path.resolve('.');
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'verboo-mcp-shutdown-'));
+  const storeDir = path.join(fixture, 'jobs');
+  const fakeAgent = path.join(fixture, 'fake-agent.mjs');
+  const runnerPidFile = path.join(fixture, 'runner.pid');
+  const bridgeExitFile = path.join(fixture, 'bridge-exit.json');
+  const bridgeWrapper = path.join(fixture, 'bridge-wrapper.mjs');
+  await writeFile(
+    fakeAgent,
+    [
+      "import { writeFileSync } from 'node:fs';",
+      `writeFileSync(${JSON.stringify(runnerPidFile)}, String(process.pid));`,
+      "process.on('SIGTERM', () => process.exit(0));",
+      'setInterval(() => {}, 1000);',
+    ].join('\n'),
+  );
+  await writeFile(
+    bridgeWrapper,
+    [
+      "import { spawn } from 'node:child_process';",
+      "import { writeFileSync } from 'node:fs';",
+      `const child = spawn(process.execPath, [${JSON.stringify(path.join(repo, 'index.mjs'))}], {`,
+      "  env: process.env,",
+      "  stdio: 'inherit',",
+      '});',
+      "process.on('SIGTERM', () => child.kill('SIGTERM'));",
+      "child.on('exit', (code, signal) => {",
+      `  writeFileSync(${JSON.stringify(bridgeExitFile)}, JSON.stringify({ code, signal }));`,
+      '  process.exitCode = code ?? 1;',
+      '});',
+    ].join('\n'),
+  );
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [bridgeWrapper],
+    env: {
+      ...process.env,
+      VERBOO_API_KEY: 'test-key',
+      VERBOO_AGENT_ALLOWED_ROOTS: repo,
+      VERBOO_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+      VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-flash',
+      VERBOO_MODEL_TIERS: 'pro',
+      VERBOO_MEMORY_ENABLED: '0',
+      VERBOO_CODE_BIN: process.execPath,
+      VERBOO_CODE_ENTRYPOINT: fakeAgent,
+      VERBOO_AGENT_MAX_CONCURRENCY: '1',
+      VERBOO_JOB_STORE_DIR: storeDir,
+      VERBOO_JOB_SHUTDOWN_TIMEOUT_MS: '1',
+    },
+    stderr: 'pipe',
+  });
+  const client = new Client(
+    { name: 'verboo-bridge-test', version: '1.0.0' },
+    { capabilities: {} },
+  );
+  let stderr = '';
+  transport.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  t.after(async () => {
+    try { await client.close(); } catch {}
+    await import('node:fs/promises').then(({ rm }) => rm(fixture, { recursive: true, force: true }));
+  });
+  await client.connect(transport);
+
+  const running = JSON.parse((await client.callTool({
+    name: 'verboo_agent_start',
+    arguments: { prompt: 'running', cwd: repo, mode: 'read_only', timeout_seconds: 30 },
+  })).content[0].text);
+  let runningStatus;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    runningStatus = JSON.parse((await client.callTool({
+      name: 'verboo_job',
+      arguments: { action: 'status', job_id: running.job_id },
+    })).content[0].text);
+    if (runningStatus.status === 'running') break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(runningStatus.status, 'running');
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      await access(runnerPidFile);
+      break;
+    } catch {
+      if (attempt === 199) throw new Error('runner fake não iniciou');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  const queued = JSON.parse((await client.callTool({
+    name: 'verboo_agent_start',
+    arguments: { prompt: 'queued', cwd: repo, mode: 'read_only', timeout_seconds: 30 },
+  })).content[0].text);
+  const wrapperPid = transport.pid;
+  const closed = new Promise((resolve) => { client.onclose = resolve; });
+  process.kill(wrapperPid, 'SIGTERM');
+  process.kill(wrapperPid, 'SIGTERM');
+  await Promise.race([
+    closed,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error('bridge não encerrou após SIGTERM')),
+      5_000,
+    )),
+  ]);
+
+  assert.throws(() => process.kill(wrapperPid, 0), { code: 'ESRCH' });
+  assert.match(stderr, /Shutdown da fila excedeu o tempo limite/);
+  const { readFile } = await import('node:fs/promises');
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      await access(bridgeExitFile);
+      break;
+    } catch {
+      if (attempt === 99) throw new Error('wrapper não registrou a saída do bridge');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  assert.deepEqual(JSON.parse(await readFile(bridgeExitFile, 'utf8')), {
+    code: 1,
+    signal: null,
+  });
+  for (const jobId of [running.job_id, queued.job_id]) {
+    const stored = JSON.parse(await readFile(path.join(storeDir, `${jobId}.json`), 'utf8'));
+    assert.equal(stored.status, 'cancelled');
+    assert.equal(stored.error.code, 'BRIDGE_SHUTDOWN');
+  }
+  const runnerPid = Number(await readFile(runnerPidFile, 'utf8'));
+  assert.throws(() => process.kill(runnerPid, 0), { code: 'ESRCH' });
+});
+
+test('MCP transport close aciona um único shutdown', async (t) => {
+  const repo = path.resolve('.');
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(repo, 'index.mjs')],
+    env: {
+      ...process.env,
+      VERBOO_API_KEY: 'test-key',
+      VERBOO_MEMORY_ENABLED: '0',
+    },
+    stderr: 'pipe',
+  });
+  const client = new Client(
+    { name: 'verboo-bridge-test', version: '1.0.0' },
+    { capabilities: {} },
+  );
+  t.after(async () => {
+    try { await client.close(); } catch {}
+  });
+  let stderr = '';
+  transport.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  await client.connect(transport);
+
+  const stderrEnded = new Promise((resolve) => transport.stderr.once('end', resolve));
+  const closed = new Promise((resolve) => { client.onclose = resolve; });
+  await transport.close();
+  await closed;
+  await stderrEnded;
+  assert.equal(
+    stderr.match(/Encerrando bridge/g)?.length,
+    1,
+    `shutdown deveria iniciar uma vez, stderr: ${stderr}`,
+  );
 });
 
 test('MCP verboo://status resource contem capacity/queued/running/total', async (t) => {

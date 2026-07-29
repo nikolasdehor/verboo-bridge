@@ -5,7 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-test('vb combina prompt posicional com stdin sem chamada de rede', async () => {
+test('vb combina prompt posicional com stdin sem chamada de rede', {
+  skip: process.platform === 'win32',
+}, async () => {
   const fakeBin = await mkdtemp(path.join(os.tmpdir(), 'verboo-vb-'));
   const fakeCurl = path.join(fakeBin, 'curl');
   await writeFile(

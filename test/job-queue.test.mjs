@@ -415,7 +415,7 @@ test('JobQueue: persistencia armazena apenas metadados seguros', async () => {
 test('JobQueue: resultado duravel exige opt-in na escrita e recuperacao', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-result-'));
   const { readFile, rm } = await import('node:fs/promises');
-  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  const q = new JobQueue({ concurrency: 1, persistResults: true, platform: 'linux' });
   q.setRunner(async () => ({
     ...fakeResult({ output: 'Resultado proprietário.' }),
     memory: {
@@ -448,14 +448,22 @@ test('JobQueue: resultado duravel exige opt-in na escrita e recuperacao', async 
   assert.equal(stored.runnerData, undefined);
   assert.equal(stored.env, undefined);
 
-  const recoveredEnabled = new JobQueue({ concurrency: 1, persistResults: true });
+  const recoveredEnabled = new JobQueue({
+    concurrency: 1,
+    persistResults: true,
+    platform: 'linux',
+  });
   await recoveredEnabled.initStore(dir);
   assert.equal(
     recoveredEnabled.getJobResult(job_id).result.output,
     'Resultado proprietário.',
   );
 
-  const recoveredDisabled = new JobQueue({ concurrency: 1, persistResults: false });
+  const recoveredDisabled = new JobQueue({
+    concurrency: 1,
+    persistResults: false,
+    platform: 'linux',
+  });
   await recoveredDisabled.initStore(dir);
   assert.equal(recoveredDisabled.getJobResult(job_id).result, null);
   stored = JSON.parse(await readFile(file, 'utf8'));
@@ -467,10 +475,37 @@ test('JobQueue: resultado duravel exige opt-in na escrita e recuperacao', async 
   await rm(dir, { recursive: true, force: true });
 });
 
+test('JobQueue: Windows não persiste resultado terminal, mas preserva metadados no restart', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-windows-safe-store-'));
+  const { readFile, rm } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1, persistResults: true, platform: 'win32' });
+  q.setRunner(async () => fakeResult({ output: 'Não pode sobreviver ao restart.' }));
+  await q.initStore(dir);
+
+  const { job_id } = await q.enqueuePersisted({ runnerData: { prompt: 'segredo' } });
+  await new Promise((resolve) => q.once('completed', resolve));
+  await q.waitForPersistence(job_id);
+
+  const stored = JSON.parse(await readFile(path.join(dir, `${job_id}.json`), 'utf8'));
+  assert.equal(q.status.persist_results, false);
+  assert.equal(stored.status, 'succeeded');
+  assert.ok(stored.created_at);
+  assert.equal(stored.result, undefined);
+
+  const recovered = new JobQueue({ concurrency: 1, persistResults: true, platform: 'win32' });
+  await recovered.initStore(dir);
+  assert.equal(recovered.getJobResult(job_id).status, 'succeeded');
+  assert.equal(recovered.getJobResult(job_id).result, null);
+
+  q.dispose();
+  recovered.dispose();
+  await rm(dir, { recursive: true, force: true });
+});
+
 test('JobQueue: resultado duravel recupera warning failed e cancelled', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-states-'));
   const { readFile, rm } = await import('node:fs/promises');
-  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  const q = new JobQueue({ concurrency: 1, persistResults: true, platform: 'linux' });
   await q.initStore(dir);
   q.setRunner(async (_job, signal, data) => {
     if (data.kind === 'warning') {
@@ -512,7 +547,11 @@ test('JobQueue: resultado duravel recupera warning failed e cancelled', async ()
     'cancel só confirma depois de persistir o estado terminal',
   );
 
-  const recovered = new JobQueue({ concurrency: 1, persistResults: true });
+  const recovered = new JobQueue({
+    concurrency: 1,
+    persistResults: true,
+    platform: 'linux',
+  });
   await recovered.initStore(dir);
   assert.equal(recovered.getJobResult(warning.job_id).status, 'warning');
   assert.equal(recovered.getJobResult(warning.job_id).result.output, 'parcial');
@@ -563,7 +602,7 @@ test('JobQueue: schema desconhecido e legado nunca recuperam resultado', async (
 test('JobQueue: falha ao gravar resultado nunca publica sucesso falso', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-failure-'));
   const { rm, writeFile } = await import('node:fs/promises');
-  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  const q = new JobQueue({ concurrency: 1, persistResults: true, platform: 'linux' });
   let release;
   q.setRunner(async () => {
     await new Promise((resolve) => { release = resolve; });
@@ -1080,7 +1119,7 @@ test('JobQueue: rejeicao inesperada em listener nao causa unhandled rejection', 
 test('JobQueue: persistencia opt-in sanitiza artifacts absolutos', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-artifact-privacy-'));
   const { readFile, rm } = await import('node:fs/promises');
-  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  const q = new JobQueue({ concurrency: 1, persistResults: true, platform: 'linux' });
   q.setRunner(async () => ({
     ...fakeResult({ output: 'resultado' }),
     artifacts: [
@@ -1106,4 +1145,187 @@ test('JobQueue: persistencia opt-in sanitiza artifacts absolutos', async () => {
 
   q.dispose();
   await rm(dir, { recursive: true, force: true });
+});
+
+test('JobQueue: shutdown duplo e idempotente cancela running e queued', async () => {
+  const q = new JobQueue({ concurrency: 1, shutdownTimeoutMs: 200 });
+  const started = [];
+  let aborts = 0;
+  q.setRunner(async (_job, signal, data) => {
+    started.push(data.prompt);
+    await new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        aborts += 1;
+        reject(Object.assign(new Error('interrompido'), { code: 'CANCELLED' }));
+      }, { once: true });
+    });
+    return fakeResult();
+  });
+
+  const running = q.enqueue({ runnerData: { prompt: 'running' } });
+  const queued = q.enqueue({ runnerData: { prompt: 'queued' } });
+  await new Promise((resolve) => q.once('started', resolve));
+
+  const first = q.shutdown();
+  const second = q.shutdown();
+  assert.strictEqual(second, first, 'shutdown repetido deve compartilhar a mesma Promise');
+  await first;
+
+  assert.deepEqual(started, ['running'], 'job queued não pode iniciar durante shutdown');
+  assert.equal(aborts, 1, 'runner em voo deve receber um único abort');
+  assert.equal(q.getJobResult(running.job_id).status, 'cancelled');
+  assert.equal(q.getJobResult(running.job_id).error.code, 'BRIDGE_SHUTDOWN');
+  assert.equal(q.getJobResult(queued.job_id).status, 'cancelled');
+  assert.equal(q.status.running, 0);
+  assert.equal(q.status.queued, 0);
+  assert.equal(q.enqueue({}).error, 'QUEUE_DISPOSED');
+});
+
+test('JobQueue: shutdown aguarda persistência terminal de running e queued', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-shutdown-store-'));
+  const { readFile, rm } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1, shutdownTimeoutMs: 500 });
+  q.setRunner(async (_job, signal) => {
+    await new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        reject(Object.assign(new Error('interrompido'), { code: 'CANCELLED' }));
+      }, { once: true });
+    });
+    return fakeResult();
+  });
+  await q.initStore(dir);
+
+  const running = await q.enqueuePersisted({ runnerData: { prompt: 'running' } });
+  await new Promise((resolve) => q.once('started', resolve));
+  const queued = await q.enqueuePersisted({ runnerData: { prompt: 'queued' } });
+
+  await q.shutdown();
+
+  for (const jobId of [running.job_id, queued.job_id]) {
+    const stored = JSON.parse(await readFile(path.join(dir, `${jobId}.json`), 'utf8'));
+    assert.equal(stored.status, 'cancelled');
+    assert.equal(stored.error.code, 'BRIDGE_SHUTDOWN');
+  }
+
+  const recovered = new JobQueue({ concurrency: 1 });
+  await recovered.initStore(dir);
+  assert.equal(recovered.getJobResult(running.job_id).status, 'cancelled');
+  assert.equal(recovered.getJobResult(queued.job_id).status, 'cancelled');
+  await recovered.shutdown();
+  await rm(dir, { recursive: true, force: true });
+});
+
+test('JobQueue: shutdown limita runner resistente sem unhandled rejection tardia', async (t) => {
+  const q = new JobQueue({ concurrency: 1, shutdownTimeoutMs: 25 });
+  const unhandled = [];
+  let release;
+  q.setRunner(async () => new Promise((resolve) => { release = resolve; }));
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.removeListener('unhandledRejection', onUnhandled));
+
+  const { job_id } = q.enqueue({});
+  await new Promise((resolve) => q.once('started', resolve));
+  const startedAt = Date.now();
+  const outcome = await q.shutdown();
+
+  assert.equal(outcome.timed_out, true);
+  assert.ok(Date.now() - startedAt < 250, 'shutdown deve respeitar o limite configurado');
+  assert.equal(q.getJobResult(job_id).status, 'cancelled');
+  assert.equal(q.status.running, 0);
+
+  release(fakeResult());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(unhandled, []);
+});
+
+test('JobQueue: shutdown propaga falha determinística de persistência', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-shutdown-store-fail-'));
+  const { rm, writeFile } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1, shutdownTimeoutMs: 500 });
+  q.setRunner(async (_job, signal) => {
+    await new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        reject(Object.assign(new Error('interrompido'), { code: 'CANCELLED' }));
+      }, { once: true });
+    });
+    return fakeResult();
+  });
+  await q.initStore(dir);
+  const { job_id } = await q.enqueuePersisted({});
+  await new Promise((resolve) => q.once('started', resolve));
+  await q.waitForPersistence(job_id);
+
+  await rm(dir, { recursive: true, force: true });
+  await writeFile(dir, '');
+
+  await assert.rejects(
+    q.shutdown(),
+    (error) => error?.code === 'SHUTDOWN_STORE_WRITE_FAILED',
+  );
+  assert.equal(q.getJobResult(job_id).status, 'cancelled');
+  await rm(dir, { force: true });
+});
+
+test('JobQueue: shutdown inclui store tail já em voo de job terminal', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-shutdown-tail-fail-'));
+  const { rm, writeFile } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1, shutdownTimeoutMs: 500 });
+  q.setRunner(async (_job, signal) => {
+    await new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        reject(Object.assign(new Error('interrompido'), { code: 'CANCELLED' }));
+      }, { once: true });
+    });
+    return fakeResult();
+  });
+  await q.initStore(dir);
+  const { job_id } = await q.enqueuePersisted({});
+  await new Promise((resolve) => q.once('started', resolve));
+  await q.waitForPersistence(job_id);
+
+  await rm(dir, { recursive: true, force: true });
+  await writeFile(dir, '');
+  const cancellation = q.cancel(job_id);
+
+  await assert.rejects(
+    q.shutdown(),
+    (error) => error?.code === 'SHUTDOWN_STORE_WRITE_FAILED',
+  );
+  assert.equal((await cancellation).error, 'JOB_STORE_WRITE_FAILED');
+  await rm(dir, { force: true });
+});
+
+test('JobQueue: dispose legado absorve falha de store sem unhandled rejection', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-dispose-store-fail-'));
+  const { rm, writeFile } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1, shutdownTimeoutMs: 500 });
+  q.setRunner(async (_job, signal) => {
+    await new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        reject(Object.assign(new Error('interrompido'), { code: 'CANCELLED' }));
+      }, { once: true });
+    });
+    return fakeResult();
+  });
+  await q.initStore(dir);
+  const { job_id } = await q.enqueuePersisted({});
+  await new Promise((resolve) => q.once('started', resolve));
+  await q.waitForPersistence(job_id);
+  await rm(dir, { recursive: true, force: true });
+  await writeFile(dir, '');
+
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.removeListener('unhandledRejection', onUnhandled));
+
+  assert.equal(q.dispose(), undefined);
+  await q.shutdown().catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(q.status.disposed, true);
+  assert.equal(q.getJobResult(job_id).status, 'cancelled');
+  assert.deepEqual(unhandled, []);
+  await rm(dir, { force: true });
 });

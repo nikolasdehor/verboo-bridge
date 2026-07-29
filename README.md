@@ -173,8 +173,15 @@ command -v npx
 command -v verboo
 ```
 
-Use esses caminhos nos exemplos abaixo. `$HOME`, `~` e `$(command -v ...)` não
-são expandidos dentro de JSON ou TOML.
+No Windows, descubra `node.exe` e a raiz global do npm pelo PowerShell:
+
+```powershell
+(Get-Command node.exe).Source
+npm root --global
+```
+
+Use esses caminhos nos exemplos abaixo. Variáveis, `~` e substituições de
+comando não são expandidas dentro de JSON ou TOML.
 
 | Cliente | Configuração | Como validar |
 |---|---|---|
@@ -211,6 +218,48 @@ No Codex App, também é possível abrir **Settings → MCP servers → Add serv
 escolher **STDIO** e preencher os mesmos valores. Salve e reinicie o App. Na
 extensão IDE, reinicie a extensão. Consulte a
 [documentação oficial de MCP do Codex](https://developers.openai.com/codex/mcp).
+
+No Codex App para Windows, instale os dois pacotes uma vez:
+
+```powershell
+npm install --global verboo-bridge@latest @verboo/code
+```
+
+> O CI Windows cobre a suíte de testes, não a integração com o Codex App.
+> O smoke no Codex App Windows real ainda não foi executado.
+
+Então use os caminhos absolutos retornados pelos comandos acima. Este exemplo
+evita os shims `npx.cmd` e `verboo.cmd`, que não podem ser iniciados diretamente
+com `shell: false`:
+
+```toml
+[mcp_servers.verboo-bridge]
+command = 'C:\Program Files\nodejs\node.exe'
+args = ['C:\Users\SEU_USUARIO\AppData\Roaming\npm\node_modules\verboo-bridge\index.mjs']
+startup_timeout_sec = 60
+tool_timeout_sec = 1800
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.verboo-bridge.env]
+VERBOO_AGENT_ALLOWED_ROOTS = 'C:\Users\SEU_USUARIO\Projects;D:\Work'
+VERBOO_JOB_STORE_DIR = 'C:\Users\SEU_USUARIO\AppData\Local\verboo-bridge\jobs'
+VERBOO_AGENT_EXECUTOR = "native"
+VERBOO_CODE_BIN = 'C:\Program Files\nodejs\node.exe'
+VERBOO_CODE_ENTRYPOINT = 'C:\Users\SEU_USUARIO\AppData\Roaming\npm\node_modules\@verboo\code\dist\cli.mjs'
+```
+
+Substitua `C:\Program Files\nodejs\node.exe` pela saída de
+`(Get-Command node.exe).Source` e a raiz
+`C:\Users\SEU_USUARIO\AppData\Roaming\npm\node_modules` pela saída de
+`npm root --global`. Com nvm-windows, fnm, Volta, Scoop ou um prefixo global
+customizado, esses caminhos são diferentes.
+
+No Windows, separe múltiplas raízes permitidas com `;`. O diretório do store
+deve ser absoluto: metadados seguros e marcadores de `RESTART` persistem, mas
+resultados públicos não são gravados porque o Node não garante uma ACL privada.
+Eles podem conter código proprietário. `npx --yes verboo-bridge@latest` continua
+suportado em terminais e clientes que executam shims `.cmd`; a configuração direta
+acima é a opção previsível para o Codex App.
 
 Alternativa pela CLI no macOS ou Linux:
 
@@ -678,8 +727,8 @@ O servidor também expõe **recursos** e **prompts**:
 | `VERBOO_AGENT_ALLOWED_ROOTS` | — | Raízes repo-aware separadas pelo delimitador de paths do SO; sem valor, `verboo_agent` falha fechado |
 | `VERBOO_AGENT_WRITE_ENABLED` | — | Defina `1` para habilitar `write`; por padrão, somente `read_only` é aceito |
 | `VERBOO_AGENT_MAX_CONCURRENCY` | `4` | Execuções simultâneas globais, incluindo jobs assíncronos; inteiro entre 1 e 8, valores inválidos usam 4 |
-| `VERBOO_JOB_STORE_DIR` | — | Diretório privado 0700/0600 para persistência atômica de metadados seguros e recuperação de jobs interrompidos |
-| `VERBOO_JOB_PERSIST_RESULTS` | — | Defina `1` junto com `VERBOO_JOB_STORE_DIR` para persistir e recuperar o resultado público terminal. Pode conter código proprietário; use somente diretório privado. Nunca grava prompt, runner data, cwd, env, raciocínio, memory note ou mensagens de erro |
+| `VERBOO_JOB_STORE_DIR` | — | Diretório para persistência atômica de metadados seguros e recuperação de jobs interrompidos; em macOS/Linux, use diretório privado 0700/0600 |
+| `VERBOO_JOB_PERSIST_RESULTS` | — | Em macOS/Linux, defina `1` com `VERBOO_JOB_STORE_DIR` privado 0700/0600 para persistir e recuperar o resultado público terminal. No Windows falha fechado: resultados não são gravados porque o Node não garante ACL privada. Pode conter código proprietário; nunca grava prompt, runner data, cwd, env, raciocínio, memory note ou mensagens de erro |
 | `VERBOO_JOB_TTL_MS` | `1800000` (30 min) | TTL em ms para jobs finalizados sem resultado |
 | `VERBOO_JOB_RESULT_TTL_MS` | `600000` (10 min) | TTL em ms para resultados de jobs |
 | `VERBOO_JOB_MAX_RESULTS` | `100` | Máximo de resultados mantidos em memória (até 500) |

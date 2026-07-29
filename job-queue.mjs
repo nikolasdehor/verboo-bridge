@@ -20,6 +20,8 @@ const DEFAULT_RESULT_TTL_MS = 10 * 60 * 1000;
 const MAX_RESULTS_HARD = 500;
 const MAX_QUEUED_HARD = 500;
 const DEFAULT_PRUNE_INTERVAL_MS = 60_000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+const MAX_SHUTDOWN_TIMEOUT_MS = 30_000;
 const STORE_MARKER = 'verboo-bridge-job-v1';
 const STORE_SCHEMA_VERSION = 2;
 const VALID_STATUSES = new Set([
@@ -92,6 +94,13 @@ function configuredMax(envVar, fallback, hard) {
 function configuredTTL(envVar, fallback) {
   const v = Number(process.env[envVar] ?? fallback);
   return Number.isFinite(v) && v >= 0 ? v : fallback;
+}
+
+function shutdownTimeout(value) {
+  const v = Number(value ?? process.env.VERBOO_JOB_SHUTDOWN_TIMEOUT_MS ?? DEFAULT_SHUTDOWN_TIMEOUT_MS);
+  return Number.isFinite(v) && v >= 1 && v <= MAX_SHUTDOWN_TIMEOUT_MS
+    ? v
+    : DEFAULT_SHUTDOWN_TIMEOUT_MS;
 }
 
 function safeJSON(val, fallback) {
@@ -249,6 +258,9 @@ export class JobQueue extends EventEmitter {
   #progress = new Map();
   #heartbeats = new Map();
   #heartbeatMs;
+  #shutdownTimeoutMs;
+  #shutdownPromise = null;
+  #executions = new Set();
 
   constructor(options = {}) {
     super();
@@ -261,9 +273,11 @@ export class JobQueue extends EventEmitter {
     this.#resultTtl = options.resultTtl ?? configuredTTL('VERBOO_JOB_RESULT_TTL_MS', DEFAULT_RESULT_TTL_MS);
     this.#maxResults = options.maxResults ?? configuredMax('VERBOO_JOB_MAX_RESULTS', 100, MAX_RESULTS_HARD);
     this.#maxQueued = options.maxQueued ?? configuredMax('VERBOO_JOB_MAX_QUEUED', 50, MAX_QUEUED_HARD);
-    this.#persistResults = options.persistResults
-      ?? process.env.VERBOO_JOB_PERSIST_RESULTS === '1';
+    const platform = options.platform ?? process.platform;
+    this.#persistResults = platform !== 'win32' && (options.persistResults
+      ?? process.env.VERBOO_JOB_PERSIST_RESULTS === '1');
     this.#heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS;
+    this.#shutdownTimeoutMs = shutdownTimeout(options.shutdownTimeoutMs);
     this.#startPruneTimer(options.pruneIntervalMs ?? DEFAULT_PRUNE_INTERVAL_MS);
   }
 
@@ -274,34 +288,70 @@ export class JobQueue extends EventEmitter {
   }
 
   dispose() {
-    if (this.#disposed) return;
+    void this.shutdown().catch(() => {});
+  }
+
+  shutdown({ timeoutMs = this.#shutdownTimeoutMs } = {}) {
+    if (this.#shutdownPromise) return this.#shutdownPromise;
     this.#disposed = true;
     clearInterval(this.#pruneTimer);
     this.#pruneTimer = null;
+    this.#shutdownPromise = this.#finishShutdown(shutdownTimeout(timeoutMs));
+    return this.#shutdownPromise;
+  }
 
+  async #finishShutdown(timeoutMs) {
     const timestamp = nowISO();
-    for (const [jobId, entry] of this.#running) {
-      const job = this.#jobs.get(jobId);
-      if (job && !TERMINAL_STATUSES.has(job.status)) {
+    const cancellationWrites = [];
+    for (const job of this.#jobs.values()) {
+      if (!TERMINAL_STATUSES.has(job.status)) {
         job.status = 'cancelled';
         job.updated_at = timestamp;
         job.finished_at = timestamp;
-        this.#persistJob(job).catch(() => {});
+        job.result = null;
+        job.error = {
+          code: 'BRIDGE_SHUTDOWN',
+          message: 'Bridge encerrado antes da conclusão do job.',
+        };
+        cancellationWrites.push(this.#persistJob(job));
       }
-      entry.controller.abort();
+      this.#clearProgress(job.job_id);
     }
-    for (const jobId of this.#queue) {
-      const job = this.#jobs.get(jobId);
-      if (job?.status !== 'queued') continue;
-      job.status = 'cancelled';
-      job.updated_at = timestamp;
-      job.finished_at = timestamp;
-      this.#persistJob(job).catch(() => {});
+    for (const entry of this.#running.values()) {
+      entry.controller.abort();
     }
     this.#running.clear();
     this.#queue = [];
     this.#runnerData.clear();
-    for (const jobId of this.#progress.keys()) this.#clearProgress(jobId);
+
+    const persistence = [
+      ...cancellationWrites,
+      ...this.#storeTails.values(),
+    ];
+    const waitForPersistence = Promise.allSettled(persistence).then((results) => {
+      if (results.some((result) => result.status === 'rejected')) {
+        throw Object.assign(
+          new Error('Falha ao persistir estado terminal durante shutdown.'),
+          { code: 'SHUTDOWN_STORE_WRITE_FAILED' },
+        );
+      }
+    });
+    const settled = Promise.all([
+      Promise.allSettled(this.#executions),
+      waitForPersistence,
+    ]);
+    let timer;
+    try {
+      const timedOut = await Promise.race([
+        settled.then(() => false),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(true), timeoutMs);
+        }),
+      ]);
+      return { timed_out: timedOut };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   get capacity() {
@@ -502,7 +552,7 @@ export class JobQueue extends EventEmitter {
 
       this.emit('started', jobId);
 
-      this.#executeJob(job, controller.signal).then(async (result) => {
+      const execution = this.#executeJob(job, controller.signal).then(async (result) => {
         this.#running.delete(jobId);
 
         // Late-result guard: cancel() externo já marcou cancelled —
@@ -572,6 +622,8 @@ export class JobQueue extends EventEmitter {
         try { this.emit('completed', jobId); } catch { /* suppress */ }
         if (!this.#disposed) this.#drain();
       });
+      this.#executions.add(execution);
+      void execution.finally(() => this.#executions.delete(execution)).catch(() => {});
     }
   }
 
