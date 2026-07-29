@@ -19,9 +19,10 @@ export const MIN_TIMEOUT_SECONDS = 10;
 export const MAX_TIMEOUT_SECONDS = 1800;
 
 const MAX_STDOUT_BYTES = 4 * 1024 * 1024;
+const MAX_STREAM_BYTES = 32 * 1024 * 1024;
 const MAX_STDERR_BYTES = 256 * 1024;
-// Streaming: nenhum teto para o volume cumulativo de eventos, mas cada
-// linha JSONL e o texto público retido têm limites próprios e bounded.
+// Streaming mantém limites independentes para o volume cumulativo, cada
+// linha JSONL e o texto público retido.
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_RESULT_TEXT_BYTES = 4 * 1024 * 1024;
 const MAX_TRACKED_ITEMS = 4_096;
@@ -723,6 +724,10 @@ function policyToolName(name) {
   const normalized = String(name ?? '').toLowerCase();
   if (normalized === 'apply_diff' || normalized === 'apply_patch') return 'edit';
   return normalized;
+}
+
+function toolCategories(names) {
+  return sortedStrings(new Set(names.map(categorizeTool)));
 }
 
 function addBounded(set, value, label) {
@@ -1760,17 +1765,16 @@ function execute(invocation, options) {
 
     child.stdout?.on('data', (chunk) => {
       if (terminationError) return;
-      if (retainStdout) {
-        stdoutBytes += chunk.length;
-        if (stdoutBytes > MAX_STDOUT_BYTES) {
-          terminate(
-            agentError(
-              'OUTPUT_LIMIT',
-              `Saída do ${invocation.label} excedeu 4 MiB e foi interrompida.`,
-            ),
-          );
-          return;
-        }
+      stdoutBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+      const stdoutLimit = retainStdout ? MAX_STDOUT_BYTES : MAX_STREAM_BYTES;
+      if (stdoutBytes > stdoutLimit) {
+        terminate(
+          agentError(
+            'OUTPUT_LIMIT',
+            `Saída do ${invocation.label} excedeu ${stdoutLimit / 1024 / 1024} MiB e foi interrompida.`,
+          ),
+        );
+        return;
       }
       consumeStdoutText(stdoutDecoder.write(chunk));
     });
@@ -1899,25 +1903,46 @@ async function executeAgentAttempt(
     onLine.flush = progressOnLine.flush;
     onLine.close = progressOnLine.close;
   }
-  await execute(invocation, {
-    cwd: request.cwd,
-    timeoutSeconds,
-    env: options.env,
-    spawnImpl: options.spawnImpl,
-    killImpl: options.killImpl,
-    killTreeImpl: options.killTreeImpl,
-    killGraceMs: options.killGraceMs,
-    platform: options.platform,
-    timeoutMs: options.timeoutMs,
-    signal: options.signal,
-    onLine,
-    retainStdout: false,
-  });
-  if (options.onProgress) options.onProgress({ phase: 'processing_result' });
+  let timeoutError = null;
+  try {
+    await execute(invocation, {
+      cwd: request.cwd,
+      timeoutSeconds,
+      env: options.env,
+      spawnImpl: options.spawnImpl,
+      killImpl: options.killImpl,
+      killTreeImpl: options.killTreeImpl,
+      killGraceMs: options.killGraceMs,
+      platform: options.platform,
+      timeoutMs: options.timeoutMs,
+      signal: options.signal,
+      onLine,
+      retainStdout: false,
+    });
+  } catch (error) {
+    if (error.code !== 'TIMEOUT') throw error;
+    timeoutError = error;
+  }
+  if (!timeoutError && options.onProgress) {
+    options.onProgress({ phase: 'processing_result' });
+  }
   const parsed = parser.finish();
+  if (timeoutError) {
+    // ponytail: descarta texto livre até existir um redator auditado para parciais.
+    parsed.result = '';
+    const hasPartialResult = parsed.successfulTools.length > 0;
+    if (!hasPartialResult) throw timeoutError;
+  }
   const forbiddenUsed = parsed.toolsUsed.filter(
     (tool) => !allowedTools.has(policyToolName(tool)),
   );
+  if (timeoutError) {
+    // Progresso de stream é não confiável: só categorias concluídas são públicas.
+    parsed.toolsUsed = toolCategories(parsed.successfulTools);
+    parsed.successfulTools = parsed.toolsUsed;
+    parsed.artifacts = [];
+    parsed.sessionId = null;
+  }
   if (forbiddenUsed.length > 0) {
     const forbiddenAttempts = (parsed.nativeToolAttempts ?? []).filter(
       ({ tool }) => !allowedTools.has(policyToolName(tool)),
@@ -1932,21 +1957,26 @@ async function executeAgentAttempt(
         && permissionDenialKeys.has(attempt.denialKey)
       ));
     if (allForbiddenAttemptsRejected) {
-      return { parsed, status: 'warning', warningReason: 'forbidden_tools_rejected' };
+      parsed.toolsUsed = toolCategories(parsed.toolsUsed);
+      if (!timeoutError) {
+        return { parsed, status: 'warning', warningReason: 'forbidden_tools_rejected' };
+      }
+    } else {
+      throw agentError(
+        'FORBIDDEN_TOOL_USED',
+        `${invocation.label} executou ${forbiddenUsed.length} ferramenta(s) proibida(s) pela política (categorias: ${toolCategories(forbiddenUsed).join(', ')}).`,
+      );
     }
-    throw agentError(
-      'FORBIDDEN_TOOL_USED',
-      `${invocation.label} executou ferramenta proibida pela política: ${forbiddenUsed.join(', ')}.`,
-    );
   }
   const hasWriteExecution = parsed.successfulTools.some((tool) => (
     ['apply_patch', 'edit', 'write'].includes(tool.toLowerCase())
   ));
   return {
     parsed,
-    status: request.mode === 'write' && !hasWriteExecution
+    status: timeoutError || (request.mode === 'write' && !hasWriteExecution)
       ? 'warning'
       : 'success',
+    warningReason: timeoutError ? 'timeout_partial' : undefined,
   };
 }
 
@@ -2003,7 +2033,11 @@ function successfulAgentResult({
   return {
     status,
     summary: status === 'warning'
-      ? warningReason === 'forbidden_tools_rejected'
+      ? warningReason === 'timeout_partial'
+        ? hasConfirmedWrite
+          ? 'O agente não concluiu antes do timeout; há resultado parcial para revisão e uma alteração foi confirmada.'
+          : 'O agente não concluiu antes do timeout; há resultado parcial para revisão. Nenhuma mudança foi confirmada.'
+        : warningReason === 'forbidden_tools_rejected'
         ? hasConfirmedWrite
           ? 'As ferramentas proibidas solicitadas foram negadas; uma alteração foi confirmada. Revise os artefatos.'
           : request.mode === 'write'
@@ -2025,6 +2059,9 @@ function successfulAgentResult({
       : ['Revise a análise e delegue escrita somente se a mudança estiver autorizada.'],
     artifacts: parsed.artifacts,
     tools_used: parsed.toolsUsed,
+    ...(warningReason === 'timeout_partial'
+      ? { warnings: [{ code: 'TIMEOUT', message: 'O agente excedeu o tempo limite; o resultado parcial está disponível para revisão.' }] }
+      : {}),
     session_id: parsed.sessionId,
     model,
     mode: request.mode,

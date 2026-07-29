@@ -1116,6 +1116,36 @@ test('JobQueue: rejeicao inesperada em listener nao causa unhandled rejection', 
   assert.equal(unhandled.length, 0, 'nenhuma unhandled rejection');
 });
 
+test('JobQueue: warning timeout_partial terminaliza com resultado público', async () => {
+  const q = new JobQueue({ concurrency: 1 });
+  q.setRunner(async () => ({
+    ...fakeResult({ output: 'Diagnóstico parcial sanitizado.' }),
+    status: 'warning',
+    model: 'deepseek-v4-flash',
+    executor: 'native',
+    warnings: [{ code: 'TIMEOUT', message: 'Tempo esgotado após progresso material.' }],
+  }));
+
+  const { job_id } = q.enqueue({
+    model: 'deepseek-v4-flash',
+    executor: 'native',
+    runnerData: { prompt: 'revise' },
+  });
+  await new Promise((resolve) => q.once('completed', resolve));
+
+  const terminal = q.getJobResult(job_id);
+  assert.equal(terminal.status, 'warning');
+  assert.ok(terminal.result, 'warning parcial não pode perder o resultado');
+  assert.equal(terminal.result.output, 'Diagnóstico parcial sanitizado.');
+  assert.deepEqual(terminal.result.warnings, [{
+    code: 'TIMEOUT',
+    message: 'Tempo esgotado após progresso material.',
+  }]);
+  assert.equal(terminal.model, 'deepseek-v4-flash');
+  assert.equal(terminal.executor, 'native');
+  q.dispose();
+});
+
 test('JobQueue: persistencia opt-in sanitiza artifacts absolutos', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-artifact-privacy-'));
   const { readFile, rm } = await import('node:fs/promises');
