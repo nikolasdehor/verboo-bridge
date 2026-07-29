@@ -5,6 +5,7 @@ import {
   chmod,
   mkdtemp,
   mkdir,
+  readFile,
   realpath,
   symlink,
   writeFile,
@@ -58,6 +59,49 @@ function spawnJsonlFixture(events) {
     });
     return child;
   };
+}
+
+function spawnNativeTimeoutFixture(events, trailingLine = '') {
+  return () => {
+    const child = new EventEmitter();
+    child.pid = 45123;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    process.nextTick(() => {
+      child.stdout.write(`${events.map(JSON.stringify).join('\n')}\n${trailingLine}`);
+    });
+    return child;
+  };
+}
+
+async function createStreamingJsonlFixture(base) {
+  const script = path.join(base, 'stream-jsonl.mjs');
+  await writeFile(script, [
+    "import { once } from 'node:events';",
+    'const targetBytes = Number(process.argv[2]);',
+    'const lineFor = (padding) => JSON.stringify({ type: "system", subtype: "heartbeat", padding: "x".repeat(padding) }) + "\\n";',
+    'const overhead = Buffer.byteLength(lineFor(0));',
+    'const unitBytes = 64 * 1024;',
+    'const unitLine = lineFor(unitBytes - overhead);',
+    'let unitCount = Math.floor(targetBytes / unitBytes);',
+    'let remainder = targetBytes - (unitCount * unitBytes);',
+    'if (remainder > 0 && remainder < overhead) { unitCount -= 1; remainder += unitBytes; }',
+    'const emit = async (line) => { if (!process.stdout.write(line)) await once(process.stdout, "drain"); };',
+    'for (let index = 0; index < unitCount; index += 1) await emit(unitLine);',
+    'if (remainder > 0) await emit(lineFor(remainder - overhead));',
+    'await emit(JSON.stringify({ type: "result", session_id: "stream_limit", result: "Fluxo concluído." }) + "\\n");',
+    'process.stdout.end();',
+  ].join('\n'));
+  return script;
+}
+
+function spawnStreamingJsonlFixture(script, targetBytes) {
+  return (_command, _args, options) => spawn(
+    process.execPath,
+    [script, String(targetBytes)],
+    options,
+  );
 }
 
 test('normaliza request com defaults seguros', () => {
@@ -623,6 +667,8 @@ test('runVerbooAgent seleciona executor nativo e retorna contrato E2E', async ()
   await writeFile(
     fakeVerboo,
     `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+writeFileSync('status.txt', 'updated');
 process.stdout.write(JSON.stringify({
   type: 'system',
   subtype: 'init',
@@ -686,6 +732,7 @@ process.stdout.write(JSON.stringify({
   assert.equal(result.session_id, 'native_run');
   assert.deepEqual(result.tools_used, ['Edit']);
   assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'status.txt')]);
+  assert.equal(await readFile(path.join(base, 'status.txt'), 'utf8'), 'updated');
 });
 
 test('issue #14 / PR #17: Edit real e Bash negada preservam contrato para revisão', async () => {
@@ -1690,7 +1737,10 @@ test('executor nativo falha fechado se reportar ferramenta proibida', async () =
 test('OpenCode falha fechado para tool_call fora da allowlist efetiva', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-opencode-forbidden-'));
 
-  for (const [mode, tool] of [['read_only', 'bash'], ['write', 'Write']]) {
+  for (const [mode, tool, category] of [
+    ['read_only', 'bash', 'Bash'],
+    ['write', 'Write', 'Write'],
+  ]) {
     const spawnImpl = () => {
       const child = new EventEmitter();
       child.stdout = new PassThrough();
@@ -1730,7 +1780,10 @@ test('OpenCode falha fechado para tool_call fora da allowlist efetiva', async ()
           spawnImpl,
         },
       ),
-      (error) => error.code === 'FORBIDDEN_TOOL_USED' && error.message.includes(tool),
+      (error) => (
+        error.code === 'FORBIDDEN_TOOL_USED'
+        && error.message.includes(`categorias: ${category}`)
+      ),
     );
   }
 });
@@ -4322,50 +4375,7 @@ test('texto público acumulado além do limite falha bounded com OUTPUT_LIMIT', 
 
 test('fluxo cumulativo acima de 4 MiB com resultado pequeno conclui sem OUTPUT_LIMIT', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-bigstream-'));
-  const bigToolOutput = 'x'.repeat(64 * 1024);
-  const events = [
-    { type: 'system', subtype: 'init', session_id: 'big_stream' },
-  ];
-  for (let i = 0; i < 70; i += 1) {
-    events.push({
-      type: 'assistant',
-      session_id: 'big_stream',
-      message: { content: [{
-        type: 'tool_use',
-        id: `read_${i}`,
-        name: 'Read',
-        input: { file_path: 'src/a.js' },
-      }] },
-    });
-    events.push({
-      type: 'user',
-      session_id: 'big_stream',
-      message: { content: [{
-        type: 'tool_result',
-        tool_use_id: `read_${i}`,
-        content: bigToolOutput,
-      }] },
-    });
-  }
-  events.push({ type: 'result', session_id: 'big_stream', result: 'Leitura concluída.' });
-  const streamPayload = `${events.map(JSON.stringify).join('\n')}\n`;
-  assert.ok(
-    Buffer.byteLength(streamPayload) > 4 * 1024 * 1024,
-    'o fluxo de teste precisa exceder o antigo teto de 4 MiB',
-  );
-
-  const spawnImpl = () => {
-    const child = new EventEmitter();
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.kill = () => true;
-    setImmediate(() => {
-      child.stdout.end(streamPayload);
-      child.stderr.end();
-      child.emit('close', 0);
-    });
-    return child;
-  };
+  const script = await createStreamingJsonlFixture(base);
 
   const result = await runVerbooAgent(
     {
@@ -4382,15 +4392,43 @@ test('fluxo cumulativo acima de 4 MiB com resultado pequeno conclui sem OUTPUT_L
         ...process.env,
         VERBOO_AGENT_ALLOWED_ROOTS: base,
       },
-      spawnImpl,
+      spawnImpl: spawnStreamingJsonlFixture(script, (4 * 1024 * 1024) + 1),
     },
   );
 
   assert.equal(result.status, 'success');
-  assert.equal(result.result, 'Leitura concluída.');
-  assert.equal(result.session_id, 'big_stream');
-  assert.deepEqual(result.tools_used, ['Read']);
-  assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'src/a.js')]);
+  assert.equal(result.result, 'Fluxo concluído.');
+  assert.equal(result.session_id, 'stream_limit');
+  assert.deepEqual(result.tools_used, []);
+  assert.deepEqual(result.artifacts, []);
+});
+
+test('fluxo cumulativo um byte acima de 32 MiB falha com OUTPUT_LIMIT antes do timeout', {
+  timeout: 5_000,
+}, async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-stream-limit-'));
+  const script = await createStreamingJsonlFixture(base);
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'processe o fluxo',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'deepseek-v4-flash',
+        timeout_seconds: 30,
+      },
+      {
+        availableModels: MODELS,
+        env: { ...process.env, VERBOO_AGENT_ALLOWED_ROOTS: base },
+        spawnImpl: spawnStreamingJsonlFixture(script, (32 * 1024 * 1024) + 1),
+        killGraceMs: 0,
+        platform: 'linux',
+      },
+    ),
+    (error) => error.code === 'OUTPUT_LIMIT',
+  );
 });
 
 test('OpenCode processa mais de 4 MiB e correlaciona tools por part.sessionID', async () => {
@@ -4642,4 +4680,426 @@ test('último evento sem newline rejeita se exceder texto público acumulado', a
     (error) => error.code === 'OUTPUT_LIMIT',
   );
   assert.ok(signals.some(([pid, signal]) => signal === 'SIGTERM' && pid === -61235));
+});
+
+test('timeout nativo com Read e texto seguro retorna apenas fallback factual', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-partial-'));
+  const freeText = 'Diagnóstico seguro.';
+  const result = await runVerbooAgent(
+    {
+      prompt: 'revise o projeto',
+      cwd: base,
+      executor: 'native',
+      mode: 'read_only',
+      model: 'deepseek-v4-flash',
+      timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { ...process.env, VERBOO_AGENT_ALLOWED_ROOTS: base },
+      spawnImpl: spawnNativeTimeoutFixture(
+        [
+          { type: 'system', subtype: 'init', session_id: 'timeout_partial' },
+          { type: 'assistant', session_id: 'timeout_partial', message: { content: [
+            { type: 'tool_use', id: 'read_1', name: 'Read', input: { file_path: 'README.md' } },
+          ] } },
+          { type: 'user', session_id: 'timeout_partial', message: { content: [
+            { type: 'tool_result', tool_use_id: 'read_1', content: 'ok' },
+          ] } },
+          { type: 'assistant', session_id: 'timeout_partial', message: { content: [
+            { type: 'text', text: freeText },
+          ] } },
+        ],
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"vazamento incompleto',
+      ),
+      timeoutMs: 20,
+      killGraceMs: 0,
+      platform: 'linux',
+    },
+  );
+
+  assert.equal(result.status, 'warning');
+  assert.match(result.result, /Read/);
+  assert.ok(!result.result.includes(freeText));
+  assert.deepEqual(result.warnings.map(({ code }) => code), ['TIMEOUT']);
+  assert.deepEqual(result.tools_used, ['Read']);
+  assert.equal(result.session_id, null);
+  assert.deepEqual(result.artifacts, []);
+  assert.ok(!result.tools_used.includes('Edit'));
+  assert.ok(!result.tools_used.includes('Write'));
+  assert.ok(!result.result.includes('vazamento incompleto'));
+});
+
+test('timeout parcial preserva cooldown do modelo para a próxima rota auto', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-cooldown-'));
+  const prompt = 'Faça uma auditoria de segurança complexa da arquitetura.';
+  const availableModels = ['glm-5.2', 'deepseek-v4-flash'];
+  const env = {
+    ...process.env,
+    VERBOO_AGENT_ALLOWED_ROOTS: base,
+    VERBOO_MODEL_COOLDOWN_SECONDS: '3600',
+  };
+
+  const partial = await runVerbooAgent(
+    {
+      prompt,
+      cwd: base,
+      executor: 'native',
+      mode: 'read_only',
+      model: 'glm-5.2',
+      timeout_seconds: 10,
+    },
+    {
+      availableModels,
+      env,
+      spawnImpl: spawnNativeTimeoutFixture([
+        { type: 'assistant', session_id: 'timeout_cooldown', message: { content: [
+          { type: 'tool_use', id: 'read_1', name: 'Read', input: { file_path: 'README.md' } },
+        ] } },
+        { type: 'user', session_id: 'timeout_cooldown', message: { content: [
+          { type: 'tool_result', tool_use_id: 'read_1', content: 'ok' },
+        ] } },
+      ]),
+      timeoutMs: 20,
+      killGraceMs: 0,
+      platform: 'linux',
+    },
+  );
+  assert.equal(partial.status, 'warning');
+  assert.deepEqual(partial.warnings.map(({ code }) => code), ['TIMEOUT']);
+
+  let routedModel;
+  const spawnImpl = (_command, args) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    routedModel = args[args.indexOf('--model') + 1];
+    setImmediate(() => {
+      child.stdout.end(`${JSON.stringify({
+        type: 'result',
+        session_id: 'after_timeout',
+        result: 'Concluído.',
+      })}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+  const next = await runVerbooAgent(
+    {
+      prompt,
+      cwd: base,
+      executor: 'native',
+      mode: 'read_only',
+      model: 'auto',
+      timeout_seconds: 10,
+    },
+    { availableModels, env, spawnImpl },
+  );
+
+  assert.equal(routedModel, 'deepseek-v4-flash');
+  assert.equal(next.model, 'deepseek-v4-flash');
+  assert.ok(next.routing.ranking
+    .find(({ model }) => model === 'glm-5.2')
+    .penalties.some((penalty) => penalty.includes('cooldown')));
+});
+
+test('timeout nativo ignora session_id e artefato inexistente controlados pelo stream', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-untrusted-fields-'));
+  const sessionSecret = 'session-secret-REDACT-ME';
+  const artifactSecret = 'artifact-secret-REDACT-ME.txt';
+  const result = await runVerbooAgent(
+    {
+      prompt: 'revise o projeto', cwd: base, executor: 'native', mode: 'write',
+      model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { ...process.env, VERBOO_AGENT_ALLOWED_ROOTS: base, VERBOO_AGENT_WRITE_ENABLED: '1' },
+      spawnImpl: spawnNativeTimeoutFixture([
+        { type: 'assistant', session_id: sessionSecret, message: { content: [
+          { type: 'tool_use', id: 'write_1', name: 'Write', input: { file_path: artifactSecret } },
+        ] } },
+        { type: 'user', session_id: sessionSecret, message: { content: [
+          { type: 'tool_result', tool_use_id: 'write_1', content: 'ok' },
+        ] } },
+      ]),
+      timeoutMs: 20, killGraceMs: 0, platform: 'linux',
+    },
+  );
+
+  assert.equal(result.status, 'warning');
+  assert.equal(result.session_id, null);
+  assert.deepEqual(result.artifacts, []);
+  assert.deepEqual(result.tools_used, ['Write']);
+  assert.ok(!JSON.stringify(result).includes(sessionSecret));
+  assert.ok(!JSON.stringify(result).includes(artifactSecret));
+});
+
+test('timeout com ferramenta proibida negada ainda sanitiza o resultado parcial', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-denied-tool-'));
+  const sessionSecret = 'session-denied-secret-REDACT-ME';
+  const artifactSecret = 'artifact-denied-secret-REDACT-ME.txt';
+  const result = await runVerbooAgent(
+    {
+      prompt: 'revise o projeto', cwd: base, executor: 'native', mode: 'read_only',
+      model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { ...process.env, VERBOO_AGENT_ALLOWED_ROOTS: base },
+      spawnImpl: spawnNativeTimeoutFixture([
+        { type: 'assistant', session_id: sessionSecret, message: { content: [
+          { type: 'tool_use', id: 'read_1', name: 'Read', input: { file_path: artifactSecret } },
+        ] } },
+        { type: 'user', session_id: sessionSecret, message: { content: [
+          { type: 'tool_result', tool_use_id: 'read_1', content: 'ok' },
+        ] } },
+        { type: 'assistant', session_id: sessionSecret, message: { content: [
+          { type: 'tool_use', id: 'bash_1', name: 'Bash', input: {} },
+        ] } },
+        { type: 'user', session_id: sessionSecret, message: { content: [
+          { type: 'tool_result', tool_use_id: 'bash_1', content: 'denied', is_error: true },
+        ] } },
+        {
+          type: 'result',
+          session_id: sessionSecret,
+          result: 'texto não confiável',
+          permission_denials: [{ tool_name: 'Bash', tool_use_id: 'bash_1' }],
+        },
+      ]),
+      timeoutMs: 20, killGraceMs: 0, platform: 'linux',
+    },
+  );
+
+  assert.equal(result.status, 'warning');
+  assert.deepEqual(result.warnings.map(({ code }) => code), ['TIMEOUT']);
+  assert.equal(result.session_id, null);
+  assert.deepEqual(result.artifacts, []);
+  assert.deepEqual(result.tools_used, ['Read']);
+  assert.ok(!JSON.stringify(result).includes(sessionSecret));
+  assert.ok(!JSON.stringify(result).includes(artifactSecret));
+});
+
+test('negação comprovada sem timeout categoriza nome adversarial em tools_used', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-denied-tool-secret-'));
+  const toolSecret = 'tool-secret-REDACT-ME';
+  const finalText = 'Análise legítima preservada.';
+  const result = await runVerbooAgent(
+    {
+      prompt: 'revise o projeto', cwd: base, executor: 'native', mode: 'read_only',
+      model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { ...process.env, VERBOO_AGENT_ALLOWED_ROOTS: base },
+      spawnImpl: spawnJsonlFixture([
+        { type: 'assistant', session_id: 'safe', message: { content: [
+          { type: 'tool_use', id: 'read_1', name: 'Read', input: {} },
+        ] } },
+        { type: 'user', session_id: 'safe', message: { content: [
+          { type: 'tool_result', tool_use_id: 'read_1', content: 'ok' },
+        ] } },
+        { type: 'assistant', session_id: 'safe', message: { content: [
+          { type: 'tool_use', id: 'denied_1', name: toolSecret, input: {} },
+        ] } },
+        { type: 'user', session_id: 'safe', message: { content: [
+          { type: 'tool_result', tool_use_id: 'denied_1', content: 'denied', is_error: true },
+        ] } },
+        {
+          type: 'result',
+          session_id: 'safe',
+          result: finalText,
+          permission_denials: [{ tool_name: toolSecret, tool_use_id: 'denied_1' }],
+        },
+      ]),
+    },
+  );
+
+  assert.equal(result.status, 'warning');
+  assert.equal(result.result, finalText);
+  assert.deepEqual(result.tools_used, ['Other', 'Read']);
+  assert.equal(result.warnings, undefined);
+  assert.ok(!JSON.stringify(result).includes(toolSecret));
+  assert.ok(!JSON.stringify(result.routing).includes(toolSecret));
+});
+
+test('ferramenta proibida não publica nome controlado pelo stream', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-forbidden-tool-secret-'));
+  const toolSecret = 'tool-secret-REDACT-ME';
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'revise o projeto', cwd: base, executor: 'native', mode: 'read_only',
+        model: 'deepseek-v4-flash', timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: { ...process.env, VERBOO_AGENT_ALLOWED_ROOTS: base },
+        spawnImpl: spawnJsonlFixture([
+          { type: 'assistant', session_id: 'safe', message: { content: [
+            { type: 'tool_use', id: 'forbidden_1', name: toolSecret, input: {} },
+          ] } },
+          { type: 'user', session_id: 'safe', message: { content: [
+            { type: 'tool_result', tool_use_id: 'forbidden_1', content: 'ok' },
+          ] } },
+        ]),
+      },
+    ),
+    (error) => (
+      error.code === 'FORBIDDEN_TOOL_USED'
+      && !error.message.includes(toolSecret)
+      && !JSON.stringify(error.routing).includes(toolSecret)
+      && error.routing.attempts[0].summary.includes('categorias: Other')
+    ),
+  );
+});
+
+test('timeout nativo sem conteúdo material continua rejeitando TIMEOUT', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-empty-'));
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'revise o projeto',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'deepseek-v4-flash',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: { ...process.env, VERBOO_AGENT_ALLOWED_ROOTS: base },
+        spawnImpl: spawnNativeTimeoutFixture(
+          [{ type: 'system', subtype: 'init', session_id: 'timeout_empty' }],
+          '{"type":"assistant","message":{"content":[',
+        ),
+        timeoutMs: 20,
+        killGraceMs: 0,
+        platform: 'linux',
+      },
+    ),
+    (error) => error.code === 'TIMEOUT' && error.result === undefined,
+  );
+});
+
+const TIMEOUT_REDACTION_CASES = [
+  ['sk-live', 'sk-live-REDACT-ME-123456'],
+  ['sk-live multilinha', 'sk-live-\nREDACT-ME-123456'],
+  ['Bearer multilinha', 'Authorization: Bearer\nZXlKaGJHY2lPaJIUzI1NiJ9'],
+  ['TOKEN', 'TOKEN=nao-expor-123456'],
+  ['api_key', 'marcador-api-key-sem-credencial'],
+  ['password', 'password=nao-expor-123456'],
+];
+
+for (const [label, secret] of TIMEOUT_REDACTION_CASES) {
+  test(`timeout nativo com apenas conteúdo ${label} continua TIMEOUT`, async () => {
+    const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-secret-only-'));
+
+    await assert.rejects(
+      () => runVerbooAgent(
+        {
+          prompt: 'revise o projeto',
+          cwd: base,
+          executor: 'native',
+          mode: 'read_only',
+          model: 'deepseek-v4-flash',
+          timeout_seconds: 10,
+        },
+        {
+          availableModels: MODELS,
+          env: { ...process.env, VERBOO_AGENT_ALLOWED_ROOTS: base },
+          spawnImpl: spawnNativeTimeoutFixture([
+            { type: 'assistant', session_id: 'secret_only', message: { content: [
+              { type: 'text', text: secret },
+            ] } },
+          ]),
+          timeoutMs: 20,
+          killGraceMs: 0,
+          platform: 'linux',
+        },
+      ),
+      (error) => (
+        error.code === 'TIMEOUT'
+        && error.result === undefined
+        && !error.message.includes(secret)
+      ),
+    );
+  });
+}
+
+for (const [label, secret] of TIMEOUT_REDACTION_CASES) {
+  test(`timeout nativo com Read e conteúdo ${label} usa apenas fallback factual`, async () => {
+    const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-secret-mixed-'));
+    const freeText = `Diagnóstico do modelo. ${secret}`;
+
+    const result = await runVerbooAgent(
+      {
+        prompt: 'revise o projeto',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'deepseek-v4-flash',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: { ...process.env, VERBOO_AGENT_ALLOWED_ROOTS: base },
+        spawnImpl: spawnNativeTimeoutFixture([
+          { type: 'assistant', session_id: 'secret_mixed', message: { content: [
+            { type: 'tool_use', id: 'read_secret', name: 'Read', input: { file_path: 'README.md' } },
+          ] } },
+          { type: 'user', session_id: 'secret_mixed', message: { content: [
+            { type: 'tool_result', tool_use_id: 'read_secret', content: 'ok' },
+          ] } },
+          { type: 'assistant', session_id: 'secret_mixed', message: { content: [
+            { type: 'text', text: freeText },
+          ] } },
+        ]),
+        timeoutMs: 20,
+        killGraceMs: 0,
+        platform: 'linux',
+      },
+    );
+
+    assert.equal(result.status, 'warning');
+    assert.match(result.result, /Read/);
+    assert.ok(!result.result.includes('Diagnóstico do modelo.'));
+    assert.ok(!result.result.includes(secret));
+    assert.deepEqual(result.tools_used, ['Read']);
+    assert.deepEqual(result.warnings.map(({ code }) => code), ['TIMEOUT']);
+  });
+}
+
+test('timeout nativo com apenas texto benigno continua TIMEOUT', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-benign-token-'));
+  const text = 'Análise de sk-security-review concluída com segurança.';
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'revise o projeto',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'deepseek-v4-flash',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: { ...process.env, VERBOO_AGENT_ALLOWED_ROOTS: base },
+        spawnImpl: spawnNativeTimeoutFixture([
+          { type: 'assistant', session_id: 'benign_token', message: { content: [
+            { type: 'text', text },
+          ] } },
+        ]),
+        timeoutMs: 20,
+        killGraceMs: 0,
+        platform: 'linux',
+      },
+    ),
+    (error) => error.code === 'TIMEOUT' && !error.message.includes(text),
+  );
 });
