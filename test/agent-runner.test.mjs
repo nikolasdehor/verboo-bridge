@@ -683,6 +683,8 @@ process.stdout.write(JSON.stringify({
 test('issue #14: tentativas Bash negadas retornam warning sem perder o contrato nativo', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-denied-bash-'));
   const artifact = path.join(base, 'src', 'audit.md');
+  await mkdir(path.dirname(artifact), { recursive: true });
+  await writeFile(artifact, 'audit');
   const spawnImpl = () => {
     const child = new EventEmitter();
     child.stdout = new PassThrough();
@@ -1115,6 +1117,7 @@ test('issue #14 high: IDs nativos excedentes falham bounded sem evicção', asyn
 test('issue #14 high: memory_note isolada mantém fallback factual da execução', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-memory-fallback-'));
   const artifact = path.join(base, 'status.txt');
+  await writeFile(artifact, 'status');
   const events = [
     { type: 'assistant', session_id: 's1', message: { content: [
       { type: 'tool_use', id: 'edit_1', name: 'Edit', input: { file_path: artifact } },
