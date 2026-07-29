@@ -636,6 +636,7 @@ test('OpenCode falha fechado para tool_call fora da allowlist efetiva', async ()
             ...process.env,
             VERBOO_AGENT_ALLOWED_ROOTS: base,
             VERBOO_AGENT_WRITE_ENABLED: '1',
+            VERBOO_API_KEY: 'test-key',
           },
           spawnImpl,
         },
