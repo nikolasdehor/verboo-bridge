@@ -225,6 +225,9 @@ No Codex App para Windows, instale os dois pacotes uma vez:
 npm install --global verboo-bridge@latest @verboo/code
 ```
 
+> O CI Windows cobre a suíte de testes, não a integração com o Codex App.
+> O smoke no Codex App Windows real ainda não foi executado.
+
 Então use os caminhos absolutos retornados pelos comandos acima. Este exemplo
 evita os shims `npx.cmd` e `verboo.cmd`, que não podem ser iniciados diretamente
 com `shell: false`:
@@ -244,6 +247,12 @@ VERBOO_AGENT_EXECUTOR = "native"
 VERBOO_CODE_BIN = 'C:\Program Files\nodejs\node.exe'
 VERBOO_CODE_ENTRYPOINT = 'C:\Users\SEU_USUARIO\AppData\Roaming\npm\node_modules\@verboo\code\dist\cli.mjs'
 ```
+
+Substitua `C:\Program Files\nodejs\node.exe` pela saída de
+`(Get-Command node.exe).Source` e a raiz
+`C:\Users\SEU_USUARIO\AppData\Roaming\npm\node_modules` pela saída de
+`npm root --global`. Com nvm-windows, fnm, Volta, Scoop ou um prefixo global
+customizado, esses caminhos são diferentes.
 
 No Windows, separe múltiplas raízes permitidas com `;`. O diretório do store
 deve ser absoluto: metadados seguros e marcadores de `RESTART` persistem, mas

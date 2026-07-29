@@ -1321,6 +1321,13 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
 // ── Start / Shutdown ───────────────────────────────────────────────────
 
 let shutdownPromise = null;
+let forcedExitTimer = null;
+function scheduleForcedExit() {
+  if (forcedExitTimer) return;
+  forcedExitTimer = setTimeout(() => process.exit(1), 2_500);
+  forcedExitTimer.unref?.();
+}
+
 function shutdown(reason) {
   if (shutdownPromise) return shutdownPromise;
   shutdownPromise = Promise.resolve().then(async () => {
@@ -1341,6 +1348,7 @@ function shutdown(reason) {
       if (index === 0 && result.status === 'fulfilled' && result.value?.timed_out) {
         log('error', 'Shutdown da fila excedeu o tempo limite.');
         process.exitCode = 1;
+        scheduleForcedExit();
         failure ??= Object.assign(
           new Error('Shutdown da fila excedeu o tempo limite.'),
           { code: 'SHUTDOWN_TIMEOUT' },
@@ -1366,7 +1374,7 @@ server.onclose = () => { void shutdown('server_close').catch(() => {}); };
 if (!storeReady) {
   console.error('FATAL: Job store configurado mas nao inicializou. Abortando.');
   process.exitCode = 1;
-  await shutdown('store_init_failed');
+  await shutdown('store_init_failed').catch(() => {});
 } else {
   try {
     const transport = new StdioServerTransport();
@@ -1375,6 +1383,6 @@ if (!storeReady) {
   } catch (err) {
     console.error('FATAL:', err.message);
     process.exitCode = 1;
-    await shutdown('server_start_failed');
+    await shutdown('server_start_failed').catch(() => {});
   }
 }

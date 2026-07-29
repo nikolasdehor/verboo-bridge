@@ -298,8 +298,12 @@ test('subprocesso desativa config de projeto e recebe apenas ambiente necessári
 });
 
 test('taskkill usa árvore, força encerramento e não abre shell', () => {
-  assert.deepEqual(buildTaskkillInvocation(321), {
-    command: 'taskkill.exe',
+  const invocation = buildTaskkillInvocation(321, {
+    env: { SystemRoot: '/windows' },
+    realpathImpl: (value) => value,
+  });
+  assert.deepEqual(invocation, {
+    command: path.join('/windows', 'System32', 'taskkill.exe'),
     args: ['/pid', '321', '/t', '/f'],
     options: {
       shell: false,
@@ -307,6 +311,15 @@ test('taskkill usa árvore, força encerramento e não abre shell', () => {
       stdio: 'ignore',
     },
   });
+  assert.throws(
+    () => buildTaskkillInvocation(321, {
+      env: { SystemRoot: '/windows' },
+      realpathImpl: (value) => (
+        value.endsWith('taskkill.exe') ? '/tmp/taskkill.exe' : value
+      ),
+    }),
+    (error) => error.code === 'TASKKILL_INVALID',
+  );
 });
 
 test('executor nativo herda OAuth pelo HOME sem receber API key', () => {
@@ -1782,15 +1795,19 @@ test('cancelamento Windows encerra árvore mesmo se a raiz fechar logo depois', 
   assert.deepEqual(killedTrees, [24680]);
 });
 
-test('timeout Windows chama taskkill uma vez e encerra sem close da raiz', async () => {
+test('timeout Windows chama taskkill e força a raiz se o helper não encerrar', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-windows-timeout-'));
   const killedTrees = [];
+  const signals = [];
   const spawnImpl = () => {
     const child = new EventEmitter();
     child.pid = 13579;
     child.stdout = new PassThrough();
     child.stderr = new PassThrough();
-    child.kill = () => assert.fail('não deve usar child.kill quando taskkill está disponível');
+    child.kill = (signal) => {
+      signals.push(signal);
+      return true;
+    };
     return child;
   };
 
@@ -1820,6 +1837,64 @@ test('timeout Windows chama taskkill uma vez e encerra sem close da raiz', async
     (error) => error.code === 'TIMEOUT',
   );
   assert.deepEqual(killedTrees, [13579]);
+  assert.deepEqual(signals, ['SIGKILL']);
+});
+
+test('falha assíncrona do taskkill força a raiz uma única vez', async () => {
+  for (const failure of ['close', 'error_then_close']) {
+    const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-windows-taskkill-exit-'));
+    const signals = [];
+    let child;
+    const spawnImpl = () => {
+      child = new EventEmitter();
+      child.pid = 86420;
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = (signal) => {
+        signals.push(signal);
+        setImmediate(() => child.emit('close', null));
+        return true;
+      };
+      return child;
+    };
+    const killTreeImpl = () => {
+      const treeKill = new EventEmitter();
+      setImmediate(() => {
+        if (failure === 'error_then_close') {
+          treeKill.emit('error', new Error('taskkill falhou'));
+        }
+        treeKill.emit('close', 1);
+      });
+      return treeKill;
+    };
+
+    await assert.rejects(
+      () => runVerbooAgent(
+        {
+          prompt: 'aguarde',
+          cwd: base,
+          executor: 'opencode',
+          mode: 'read_only',
+          model: 'deepseek-v4-flash',
+          timeout_seconds: 10,
+        },
+        {
+          availableModels: MODELS,
+          env: {
+            VERBOO_AGENT_ALLOWED_ROOTS: base,
+            VERBOO_API_KEY: 'test-key',
+          },
+          spawnImpl,
+          killTreeImpl,
+          killGraceMs: 50,
+          platform: 'win32',
+          timeoutMs: 0,
+        },
+      ),
+      (error) => error.code === 'TIMEOUT',
+    );
+    assert.deepEqual(signals, ['SIGKILL'], failure);
+  }
 });
 
 test('falha síncrona do taskkill usa TERM/KILL no processo raiz', async () => {
@@ -2443,6 +2518,48 @@ test('onProgress processa linha JSON dividida entre chunks', async () => {
   assert.ok(toolUpdate);
   assert.equal(toolUpdate.phase, 'executing_tool');
   assert.equal(toolUpdate.tool_counts.Read.total, 1);
+});
+
+test('stream preserva UTF-8 quando um code point cruza chunks', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-utf8-chunks-'));
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      const payload = Buffer.from(`${JSON.stringify({
+        type: 'result',
+        session_id: 'utf8_chunks',
+        result: 'Ação 🚀 concluída.',
+      })}\n`);
+      const emojiOffset = payload.indexOf(Buffer.from('🚀'));
+      child.stdout.write(payload.subarray(0, emojiOffset + 1));
+      child.stdout.end(payload.subarray(emojiOffset + 1));
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const result = await runVerbooAgent(
+    {
+      prompt: 'Revise.',
+      cwd: base,
+      executor: 'native',
+      mode: 'read_only',
+      model: 'deepseek-v4-flash',
+      timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+      spawnImpl,
+    },
+  );
+
+  assert.equal(result.result, 'Ação 🚀 concluída.');
+  assert.equal(result.session_id, 'utf8_chunks');
 });
 
 // ── Parser multi-bloco (Gate 1) ─────────────────────────────────────────
@@ -3451,15 +3568,12 @@ test('parser nativo limita coleção de tools pendentes', () => {
   );
 });
 
-test('parser limita quantidade de fragmentos de texto público', () => {
+test('parser agrega muitos fragmentos pequenos dentro do limite de bytes', () => {
   const raw = Array.from({ length: 4_097 }, () => JSON.stringify({
     type: 'assistant',
     message: { content: [{ type: 'text', text: 'x' }] },
   })).join('\n');
-  assert.throws(
-    () => parseVerbooCodeEvents(raw, '/repo'),
-    (error) => error.code === 'OUTPUT_LIMIT',
-  );
+  assert.equal(parseVerbooCodeEvents(raw, '/repo').result, 'x'.repeat(4_097));
 });
 
 test('linha JSONL individual excessiva falha bounded com OUTPUT_LIMIT', async () => {

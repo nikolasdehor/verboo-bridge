@@ -1,6 +1,8 @@
 import { realpath } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 
 import { MODEL_CATALOG, selectModelForTask } from './model-router.mjs';
 import {
@@ -22,7 +24,6 @@ const MAX_STDERR_BYTES = 256 * 1024;
 // linha JSONL e o texto público retido têm limites próprios e bounded.
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_RESULT_TEXT_BYTES = 4 * 1024 * 1024;
-const MAX_RESULT_PARTS = 4_096;
 const MAX_TRACKED_ITEMS = 4_096;
 const DEFAULT_AGENT_CONCURRENCY = 4;
 const MAX_AGENT_CONCURRENCY = 8;
@@ -1058,7 +1059,7 @@ function createEventParserState(cwd) {
   return {
     cwd,
     sessionId: null,
-    resultParts: [],
+    resultText: '',
     resultBytes: 0,
     canonicalResult: null,
     artifacts: new Set(),
@@ -1070,16 +1071,13 @@ function createEventParserState(cwd) {
 
 function pushResultPart(state, text) {
   const bytes = Buffer.byteLength(text);
-  if (
-    state.resultBytes + bytes > MAX_RESULT_TEXT_BYTES
-    || state.resultParts.length >= MAX_RESULT_PARTS
-  ) {
+  if (state.resultBytes + bytes > MAX_RESULT_TEXT_BYTES) {
     throw agentError(
       'OUTPUT_LIMIT',
-      `Texto público do agente excedeu o limite de ${MAX_RESULT_TEXT_BYTES} bytes ou ${MAX_RESULT_PARTS} fragmentos.`,
+      `Texto público do agente excedeu o limite de ${MAX_RESULT_TEXT_BYTES} bytes.`,
     );
   }
-  state.resultParts.push(text);
+  state.resultText += text;
   state.resultBytes += bytes;
 }
 
@@ -1097,7 +1095,7 @@ function setCanonicalResult(state, text) {
     );
   }
   state.canonicalResult = visible;
-  state.resultParts = [];
+  state.resultText = '';
   state.resultBytes = 0;
 }
 
@@ -1109,7 +1107,7 @@ function finishEventParser(state) {
   if (state.canonicalResult == null) appendVisibleText(state, state.filter.flush());
   return {
     sessionId: state.sessionId,
-    result: (state.canonicalResult ?? state.resultParts.join('')).trim(),
+    result: (state.canonicalResult ?? state.resultText).trim(),
     artifacts: sortedStrings(state.artifacts),
     toolsUsed: sortedStrings(state.toolsUsed),
     successfulTools: sortedStrings(state.successfulTools),
@@ -1359,9 +1357,21 @@ export function formatAgentFailure(error) {
   return failure;
 }
 
-export function buildTaskkillInvocation(pid) {
+export function buildTaskkillInvocation(
+  pid,
+  {
+    env = process.env,
+    realpathImpl = realpathSync,
+  } = {},
+) {
+  const systemRoot = realpathImpl(env.SystemRoot || String.raw`C:\Windows`);
+  const command = realpathImpl(path.join(systemRoot, 'System32', 'taskkill.exe'));
+  const systemRootPrefix = `${systemRoot.toLowerCase()}${path.sep}`;
+  if (!command.toLowerCase().startsWith(systemRootPrefix)) {
+    throw agentError('TASKKILL_INVALID', 'taskkill.exe fora de SystemRoot.');
+  }
   return {
-    command: 'taskkill.exe',
+    command,
     args: ['/pid', String(pid), '/t', '/f'],
     options: {
       shell: false,
@@ -1410,6 +1420,9 @@ function execute(invocation, options) {
     let timer;
     let lineBuffer = '';
     let windowsTreeKillRequested = false;
+    let windowsRootForceKillRequested = false;
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
 
     const child = spawnImpl(invocation.command, invocation.args, {
       cwd,
@@ -1440,14 +1453,24 @@ function execute(invocation, options) {
       callback(value);
     };
 
+    const forceKillWindowsRoot = () => {
+      if (settled || windowsRootForceKillRequested) return;
+      windowsRootForceKillRequested = true;
+      child.kill('SIGKILL');
+    };
+
     const signalTree = (signal) => {
       if (platform === 'win32' && child.pid) {
-        if (windowsTreeKillRequested) return;
+        if (windowsTreeKillRequested) {
+          if (signal === 'SIGKILL') forceKillWindowsRoot();
+          return;
+        }
         windowsTreeKillRequested = true;
         try {
           const treeKill = killTreeImpl(child.pid);
-          treeKill?.once?.('error', () => {
-            if (!settled) child.kill('SIGKILL');
+          treeKill?.once?.('error', forceKillWindowsRoot);
+          treeKill?.once?.('close', (code) => {
+            if (code !== 0) forceKillWindowsRoot();
           });
           return;
         } catch {
@@ -1500,9 +1523,42 @@ function execute(invocation, options) {
       }
     };
 
+    const consumeStdoutText = (text) => {
+      if (!text || terminationError) return;
+      if (retainStdout) stdout += text;
+      if (!onLine) return;
+      lineBuffer += text;
+      const lines = lineBuffer.split('\n');
+      lineBuffer = lines.pop() ?? '';
+      // O teto é por linha/evento individual: um buffer com muitas linhas
+      // válidas não dispara, mas uma única linha excessiva (completa ou
+      // ainda sem '\n') falha bounded.
+      if (Buffer.byteLength(lineBuffer) > maxLineBytes) {
+        terminate(
+          agentError(
+            'OUTPUT_LIMIT',
+            `Evento do ${invocation.label} excedeu ${maxLineBytes} bytes em uma única linha e foi interrompido.`,
+          ),
+        );
+        return;
+      }
+      for (const line of lines) {
+        if (Buffer.byteLength(line) > maxLineBytes) {
+          terminate(
+            agentError(
+              'OUTPUT_LIMIT',
+              `Evento do ${invocation.label} excedeu ${maxLineBytes} bytes em uma única linha e foi interrompido.`,
+            ),
+          );
+          return;
+        }
+        deliverLine(line);
+        if (terminationError) return;
+      }
+    };
+
     child.stdout?.on('data', (chunk) => {
       if (terminationError) return;
-      const text = chunk.toString();
       if (retainStdout) {
         stdoutBytes += chunk.length;
         if (stdoutBytes > MAX_STDOUT_BYTES) {
@@ -1514,44 +1570,15 @@ function execute(invocation, options) {
           );
           return;
         }
-        stdout += text;
       }
-      if (onLine) {
-        lineBuffer += text;
-        const lines = lineBuffer.split('\n');
-        lineBuffer = lines.pop() ?? '';
-        // O teto é por linha/evento individual: um buffer com muitas linhas
-        // válidas não dispara, mas uma única linha excessiva (completa ou
-        // ainda sem '\n') falha bounded.
-        if (Buffer.byteLength(lineBuffer) > maxLineBytes) {
-          terminate(
-            agentError(
-              'OUTPUT_LIMIT',
-              `Evento do ${invocation.label} excedeu ${maxLineBytes} bytes em uma única linha e foi interrompido.`,
-            ),
-          );
-          return;
-        }
-        for (const line of lines) {
-          if (Buffer.byteLength(line) > maxLineBytes) {
-            terminate(
-              agentError(
-                'OUTPUT_LIMIT',
-                `Evento do ${invocation.label} excedeu ${maxLineBytes} bytes em uma única linha e foi interrompido.`,
-              ),
-            );
-            return;
-          }
-          deliverLine(line);
-          if (terminationError) return;
-        }
-      }
+      consumeStdoutText(stdoutDecoder.write(chunk));
     });
 
     child.stderr?.on('data', (chunk) => {
       if (terminationError) return;
       stderrBytes += chunk.length;
-      if (stderrBytes <= MAX_STDERR_BYTES) stderr += chunk.toString();
+      const text = stderrDecoder.write(chunk);
+      if (stderrBytes <= MAX_STDERR_BYTES) stderr += text;
     });
 
     child.on('error', (error) => {
@@ -1569,6 +1596,8 @@ function execute(invocation, options) {
     });
 
     child.on('close', (code) => {
+      consumeStdoutText(stdoutDecoder.end());
+      if (stderrBytes <= MAX_STDERR_BYTES) stderr += stderrDecoder.end();
       if (terminationError) {
         const processGroupMayRemain = platform !== 'win32' && child.pid;
         finish(reject, terminationError, !processGroupMayRemain);
