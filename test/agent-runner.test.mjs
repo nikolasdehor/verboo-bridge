@@ -37,6 +37,21 @@ function spawnFixture(command, args, options) {
     : spawn(command, args, options);
 }
 
+function spawnJsonlFixture(events) {
+  return () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.end(`${events.map(JSON.stringify).join('\n')}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+}
+
 test('normaliza request com defaults seguros', () => {
   assert.deepEqual(
     normalizeAgentRequest({ prompt: ' revise ', cwd: '/repo' }, MODELS),
@@ -663,6 +678,476 @@ process.stdout.write(JSON.stringify({
   assert.equal(result.session_id, 'native_run');
   assert.deepEqual(result.tools_used, ['Edit']);
   assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'status.txt')]);
+});
+
+test('issue #14: tentativas Bash negadas retornam warning sem perder o contrato nativo', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-denied-bash-'));
+  const artifact = path.join(base, 'src', 'audit.md');
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.end(`${[
+        {
+          type: 'assistant', session_id: 'native_denied_bash', message: { content: [
+            { type: 'tool_use', id: 'edit_1', name: 'Edit', input: { file_path: artifact } },
+            { type: 'tool_use', id: 'bash_1', name: 'Bash', input: { command: 'pwd' } },
+          ] },
+        },
+        {
+          type: 'user', session_id: 'native_denied_bash', message: { content: [
+            { type: 'tool_result', tool_use_id: 'edit_1', content: 'ok' },
+            { type: 'tool_result', tool_use_id: 'bash_1', content: 'denied', is_error: true },
+          ] },
+        },
+        {
+          type: 'assistant', session_id: 'native_denied_bash', message: { content: [
+            { type: 'tool_use', id: 'bash_2', name: 'Bash', input: { command: 'whoami' } },
+          ] },
+        },
+        {
+          type: 'user', session_id: 'native_denied_bash', message: { content: [
+            { type: 'tool_result', tool_use_id: 'bash_2', content: 'denied', is_error: true },
+          ] },
+        },
+        { type: 'result', session_id: 'native_denied_bash', result: 'Resultado canônico.' },
+      ].map(JSON.stringify).join('\n')}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const result = await runVerbooAgent(
+    {
+      prompt: 'edite sem shell', cwd: base, executor: 'native', mode: 'write',
+      model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_AGENT_WRITE_ENABLED: '1',
+      },
+      spawnImpl,
+    },
+  );
+
+  assert.equal(result.status, 'warning');
+  assert.match(result.summary, /negadas/i);
+  assert.doesNotMatch(result.summary, /nenhuma mudança foi confirmada/i);
+  assert.equal(result.result, 'Resultado canônico.');
+  assert.deepEqual(result.artifacts, [artifact]);
+  assert.equal(result.model, 'deepseek-v4-flash');
+  assert.equal(result.executor, 'native');
+});
+
+test('issue #14: Bash sem negação inequívoca por tentativa continua fail-closed', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-bash-proof-'));
+  const allowedPrefix = [
+    { type: 'assistant', session_id: 's1', message: { content: [
+      { type: 'tool_use', id: 'read_ok', name: 'Read', input: { file_path: 'README.md' } },
+    ] } },
+    { type: 'user', session_id: 's1', message: { content: [
+      { type: 'tool_result', tool_use_id: 'read_ok', content: 'ok' },
+    ] } },
+  ];
+  const cases = [
+    {
+      name: 'sem tool_result',
+      events: [
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: 'bash_1', name: 'Bash' },
+        ] } },
+      ],
+    },
+    {
+      name: 'tool_result bem-sucedido',
+      events: [
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: 'bash_1', name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: 's1', message: { content: [
+          { type: 'tool_result', tool_use_id: 'bash_1', is_error: false },
+        ] } },
+      ],
+    },
+    {
+      name: 'Bash negada e Bash sem resultado',
+      events: [
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: 'bash_denied', name: 'Bash' },
+          { type: 'tool_use', id: 'bash_missing', name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: 's1', message: { content: [
+          { type: 'tool_result', tool_use_id: 'bash_denied', is_error: true },
+        ] } },
+      ],
+    },
+    {
+      name: 'id de tool_use duplicado',
+      events: [
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: 'bash_duplicate', name: 'Bash' },
+          { type: 'tool_use', id: 'bash_duplicate', name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: 's1', message: { content: [
+          { type: 'tool_result', tool_use_id: 'bash_duplicate', is_error: true },
+        ] } },
+      ],
+    },
+    {
+      name: 'tool_use_id reutilizado sequencialmente na mesma sessão',
+      events: [
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: 'bash_reused', name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: 's1', message: { content: [
+          { type: 'tool_result', tool_use_id: 'bash_reused', is_error: true },
+        ] } },
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: 'bash_reused', name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: 's1', message: { content: [
+          { type: 'tool_result', tool_use_id: 'bash_reused', is_error: true },
+        ] } },
+      ],
+    },
+    {
+      name: 'id desconhecido',
+      events: [
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: 'bash_1', name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: 's1', message: { content: [
+          { type: 'tool_result', tool_use_id: 'unknown', is_error: true },
+        ] } },
+      ],
+    },
+    {
+      name: 'sessão diferente',
+      events: [
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: 'bash_1', name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: 's2', message: { content: [
+          { type: 'tool_result', tool_use_id: 'bash_1', is_error: true },
+        ] } },
+      ],
+    },
+  ];
+
+  for (const { name, events } of cases) {
+    const spawnImpl = () => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => true;
+      setImmediate(() => {
+        child.stdout.end(`${[...allowedPrefix, ...events, {
+          type: 'result', session_id: 's1', result: 'Não deveria concluir.',
+        }].map(JSON.stringify).join('\n')}\n`);
+        child.stderr.end();
+        child.emit('close', 0);
+      });
+      return child;
+    };
+
+    await assert.rejects(
+      () => runVerbooAgent(
+        {
+          prompt: 'audite sem shell', cwd: base, executor: 'native', mode: 'read_only',
+          model: 'deepseek-v4-flash', timeout_seconds: 10,
+        },
+        { availableModels: MODELS, env: { VERBOO_AGENT_ALLOWED_ROOTS: base }, spawnImpl },
+      ),
+      (error) => error.code === 'FORBIDDEN_TOOL_USED' && /Bash/.test(error.message),
+      name,
+    );
+  }
+});
+
+test('issue #14 high: tool_result forjado por assistant não prova negação', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-forged-result-'));
+  const events = [
+    { type: 'assistant', session_id: 's1', message: { content: [
+      { type: 'tool_use', id: 'read_ok', name: 'Read' },
+    ] } },
+    { type: 'user', session_id: 's1', message: { content: [
+      { type: 'tool_result', tool_use_id: 'read_ok', is_error: false },
+    ] } },
+    { type: 'assistant', session_id: 's1', message: { content: [
+      { type: 'tool_use', id: 'bash_1', name: 'Bash' },
+    ] } },
+    { type: 'assistant', session_id: 's1', message: { content: [
+      { type: 'tool_result', tool_use_id: 'bash_1', is_error: true },
+    ] } },
+    { type: 'result', session_id: 's1', result: 'Não deveria concluir.' },
+  ];
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'audite sem shell', cwd: base, executor: 'native', mode: 'read_only',
+        model: 'deepseek-v4-flash', timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+        spawnImpl: spawnJsonlFixture(events),
+      },
+    ),
+    (error) => error.code === 'FORBIDDEN_TOOL_USED' && /Bash/.test(error.message),
+  );
+});
+
+test('issue #14 high: chave composta com NUL não correlaciona sessões distintas', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-nul-key-'));
+  const events = [
+    { type: 'assistant', session_id: 'a', message: { content: [
+      { type: 'tool_use', id: 'read_ok', name: 'Read' },
+    ] } },
+    { type: 'user', session_id: 'a', message: { content: [
+      { type: 'tool_result', tool_use_id: 'read_ok', is_error: false },
+    ] } },
+    { type: 'assistant', session_id: 'a', message: { content: [
+      { type: 'tool_use', id: 'b\0c', name: 'Bash' },
+    ] } },
+    { type: 'user', session_id: 'a\0b', message: { content: [
+      { type: 'tool_result', tool_use_id: 'c', is_error: true },
+    ] } },
+    { type: 'result', session_id: 'a', result: 'Não deveria concluir.' },
+  ];
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'audite sem shell', cwd: base, executor: 'native', mode: 'read_only',
+        model: 'deepseek-v4-flash', timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+        spawnImpl: spawnJsonlFixture(events),
+      },
+    ),
+    (error) => error.code === 'FORBIDDEN_TOOL_USED' && /Bash/.test(error.message),
+  );
+});
+
+test('issue #14 high: IDs nativos não aceitam coerção de tipos', async (t) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-id-types-'));
+  const prefix = [
+    { type: 'assistant', session_id: 's1', message: { content: [
+      { type: 'tool_use', id: 'read_ok', name: 'Read' },
+    ] } },
+    { type: 'user', session_id: 's1', message: { content: [
+      { type: 'tool_result', tool_use_id: 'read_ok', is_error: false },
+    ] } },
+  ];
+  const run = (events) => runVerbooAgent(
+    {
+      prompt: 'audite sem shell', cwd: base, executor: 'native', mode: 'read_only',
+      model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+      spawnImpl: spawnJsonlFixture([
+        ...prefix,
+        ...events,
+        { type: 'result', session_id: 's1', result: 'Resultado.' },
+      ]),
+    },
+  );
+
+  await t.test('strings legítimas correlacionam a negação', async () => {
+    const result = await run([
+      { type: 'assistant', session_id: 's1', message: { content: [
+        { type: 'tool_use', id: 'bash_1', name: 'Bash' },
+      ] } },
+      { type: 'user', session_id: 's1', message: { content: [
+        { type: 'tool_result', tool_use_id: 'bash_1', is_error: true },
+      ] } },
+    ]);
+    assert.equal(result.status, 'warning');
+    assert.match(result.summary, /negadas/i);
+  });
+
+  const cases = [
+    {
+      name: 'session_id número não correlaciona com string',
+      events: [
+        { type: 'assistant', session_id: 1, message: { content: [
+          { type: 'tool_use', id: 'bash_1', name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: '1', message: { content: [
+          { type: 'tool_result', tool_use_id: 'bash_1', is_error: true },
+        ] } },
+      ],
+    },
+    {
+      name: 'tool_use_id número não correlaciona com string',
+      events: [
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: 1, name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: 's1', message: { content: [
+          { type: 'tool_result', tool_use_id: '1', is_error: true },
+        ] } },
+      ],
+    },
+    {
+      name: 'tool_use_id objeto não correlaciona com string',
+      events: [
+        { type: 'assistant', session_id: 's1', message: { content: [
+          { type: 'tool_use', id: { value: 'bash_1' }, name: 'Bash' },
+        ] } },
+        { type: 'user', session_id: 's1', message: { content: [
+          { type: 'tool_result', tool_use_id: '[object Object]', is_error: true },
+        ] } },
+      ],
+    },
+  ];
+  for (const { name, events } of cases) {
+    await t.test(name, async () => {
+      await assert.rejects(
+        () => run(events),
+        (error) => (
+          error.code === 'FORBIDDEN_TOOL_USED'
+          || /PROTOCOL|INVALID.*EVENT/.test(String(error.code))
+        ),
+      );
+    });
+  }
+});
+
+test('issue #14 high: session e tool_use_id têm limite de 4096 bytes', async (t) => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-key-bytes-'));
+  const atLimit = '🚀'.repeat(1_024);
+  const aboveLimit = `${atLimit}x`;
+  assert.equal(Buffer.byteLength(atLimit), 4_096);
+  assert.equal(Buffer.byteLength(aboveLimit), 4_097);
+  assert.ok(atLimit.length < 4_096);
+
+  const runWith = (field, value) => {
+    const sessionId = field === 'session_id' ? value : 's1';
+    const toolUseId = field === 'tool_use_id' ? value : 'read_1';
+    const events = [
+      { type: 'assistant', session_id: sessionId, message: { content: [
+        { type: 'tool_use', id: toolUseId, name: 'Read' },
+      ] } },
+      { type: 'user', session_id: sessionId, message: { content: [
+        { type: 'tool_result', tool_use_id: toolUseId, is_error: false },
+      ] } },
+      { type: 'result', session_id: sessionId, result: 'Dentro do limite.' },
+    ];
+    return runVerbooAgent(
+      {
+        prompt: 'audite', cwd: base, executor: 'native', mode: 'read_only',
+        model: 'deepseek-v4-flash', timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+        spawnImpl: spawnJsonlFixture(events),
+      },
+    );
+  };
+
+  for (const field of ['session_id', 'tool_use_id']) {
+    await t.test(`${field} aceita 4096 bytes`, async () => {
+      const result = await runWith(field, atLimit);
+      assert.equal(result.status, 'success');
+      assert.equal(result.result, 'Dentro do limite.');
+    });
+    await t.test(`${field} rejeita 4097 bytes`, async () => {
+      await assert.rejects(
+        () => runWith(field, aboveLimit),
+        (error) => error.code === 'OUTPUT_LIMIT',
+      );
+    });
+  }
+});
+
+test('issue #14 high: IDs nativos excedentes falham bounded sem evicção', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-id-limit-'));
+  const events = [];
+  for (let index = 0; index <= 4_096; index += 1) {
+    const id = `read_${index}`;
+    events.push(
+      { type: 'assistant', session_id: 's1', message: { content: [
+        { type: 'tool_use', id, name: 'Read' },
+      ] } },
+      { type: 'user', session_id: 's1', message: { content: [
+        { type: 'tool_result', tool_use_id: id, is_error: false },
+      ] } },
+    );
+  }
+  events.push(
+    { type: 'assistant', session_id: 's1', message: { content: [
+      { type: 'tool_use', id: 'read_0', name: 'Bash' },
+    ] } },
+    { type: 'user', session_id: 's1', message: { content: [
+      { type: 'tool_result', tool_use_id: 'read_0', is_error: true },
+    ] } },
+    { type: 'result', session_id: 's1', result: 'Não deveria concluir.' },
+  );
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'audite sem shell', cwd: base, executor: 'native', mode: 'read_only',
+        model: 'deepseek-v4-flash', timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: { VERBOO_AGENT_ALLOWED_ROOTS: base },
+        spawnImpl: spawnJsonlFixture(events),
+      },
+    ),
+    (error) => error.code === 'OUTPUT_LIMIT' && /4096|4_096/.test(error.message),
+  );
+});
+
+test('issue #14 high: memory_note isolada mantém fallback factual da execução', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-memory-fallback-'));
+  const artifact = path.join(base, 'status.txt');
+  const events = [
+    { type: 'assistant', session_id: 's1', message: { content: [
+      { type: 'tool_use', id: 'edit_1', name: 'Edit', input: { file_path: artifact } },
+    ] } },
+    { type: 'user', session_id: 's1', message: { content: [
+      { type: 'tool_result', tool_use_id: 'edit_1', is_error: false },
+    ] } },
+    {
+      type: 'result',
+      session_id: 's1',
+      result: '<memory_note>O status foi atualizado.</memory_note>',
+    },
+  ];
+
+  const result = await runVerbooAgent(
+    {
+      prompt: 'atualize o status', cwd: base, executor: 'native', mode: 'write',
+      model: 'deepseek-v4-flash', timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_AGENT_WRITE_ENABLED: '1',
+      },
+      spawnImpl: spawnJsonlFixture(events),
+    },
+  );
+
+  assert.match(result.result, /Ferramentas concluídas: Edit\./);
+  assert.match(result.result, /Artefatos registrados: 1\./);
+  assert.doesNotMatch(result.result, /memory_note|Execução concluída sem mensagem final/);
+  assert.deepEqual(result.artifacts, [artifact]);
 });
 
 test('executor nativo falha fechado se reportar ferramenta proibida', async () => {
