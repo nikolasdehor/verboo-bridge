@@ -415,7 +415,7 @@ test('JobQueue: persistencia armazena apenas metadados seguros', async () => {
 test('JobQueue: resultado duravel exige opt-in na escrita e recuperacao', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-result-'));
   const { readFile, rm } = await import('node:fs/promises');
-  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  const q = new JobQueue({ concurrency: 1, persistResults: true, platform: 'linux' });
   q.setRunner(async () => ({
     ...fakeResult({ output: 'Resultado proprietário.' }),
     memory: {
@@ -448,14 +448,22 @@ test('JobQueue: resultado duravel exige opt-in na escrita e recuperacao', async 
   assert.equal(stored.runnerData, undefined);
   assert.equal(stored.env, undefined);
 
-  const recoveredEnabled = new JobQueue({ concurrency: 1, persistResults: true });
+  const recoveredEnabled = new JobQueue({
+    concurrency: 1,
+    persistResults: true,
+    platform: 'linux',
+  });
   await recoveredEnabled.initStore(dir);
   assert.equal(
     recoveredEnabled.getJobResult(job_id).result.output,
     'Resultado proprietário.',
   );
 
-  const recoveredDisabled = new JobQueue({ concurrency: 1, persistResults: false });
+  const recoveredDisabled = new JobQueue({
+    concurrency: 1,
+    persistResults: false,
+    platform: 'linux',
+  });
   await recoveredDisabled.initStore(dir);
   assert.equal(recoveredDisabled.getJobResult(job_id).result, null);
   stored = JSON.parse(await readFile(file, 'utf8'));
@@ -497,7 +505,7 @@ test('JobQueue: Windows não persiste resultado terminal, mas preserva metadados
 test('JobQueue: resultado duravel recupera warning failed e cancelled', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-states-'));
   const { readFile, rm } = await import('node:fs/promises');
-  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  const q = new JobQueue({ concurrency: 1, persistResults: true, platform: 'linux' });
   await q.initStore(dir);
   q.setRunner(async (_job, signal, data) => {
     if (data.kind === 'warning') {
@@ -539,7 +547,11 @@ test('JobQueue: resultado duravel recupera warning failed e cancelled', async ()
     'cancel só confirma depois de persistir o estado terminal',
   );
 
-  const recovered = new JobQueue({ concurrency: 1, persistResults: true });
+  const recovered = new JobQueue({
+    concurrency: 1,
+    persistResults: true,
+    platform: 'linux',
+  });
   await recovered.initStore(dir);
   assert.equal(recovered.getJobResult(warning.job_id).status, 'warning');
   assert.equal(recovered.getJobResult(warning.job_id).result.output, 'parcial');
@@ -590,7 +602,7 @@ test('JobQueue: schema desconhecido e legado nunca recuperam resultado', async (
 test('JobQueue: falha ao gravar resultado nunca publica sucesso falso', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-failure-'));
   const { rm, writeFile } = await import('node:fs/promises');
-  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  const q = new JobQueue({ concurrency: 1, persistResults: true, platform: 'linux' });
   let release;
   q.setRunner(async () => {
     await new Promise((resolve) => { release = resolve; });
@@ -1107,7 +1119,7 @@ test('JobQueue: rejeicao inesperada em listener nao causa unhandled rejection', 
 test('JobQueue: persistencia opt-in sanitiza artifacts absolutos', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-artifact-privacy-'));
   const { readFile, rm } = await import('node:fs/promises');
-  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  const q = new JobQueue({ concurrency: 1, persistResults: true, platform: 'linux' });
   q.setRunner(async () => ({
     ...fakeResult({ output: 'resultado' }),
     artifacts: [

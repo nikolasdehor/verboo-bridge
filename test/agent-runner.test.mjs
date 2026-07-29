@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { chmod, mkdtemp, mkdir, realpath, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -29,6 +30,12 @@ import {
 import { readProjectMemory } from '../memory-store.mjs';
 
 const MODELS = ['deepseek-v4-flash', 'glm-5.2'];
+
+function spawnFixture(command, args, options) {
+  return process.platform === 'win32'
+    ? spawn(process.execPath, [command, ...args], options)
+    : spawn(command, args, options);
+}
 
 test('normaliza request com defaults seguros', () => {
   assert.deepEqual(
@@ -327,7 +334,9 @@ test('executor nativo herda OAuth pelo HOME sem receber API key', () => {
 });
 
 test('parser retorna resposta final, sessão e artefatos internos', () => {
-  const cwd = '/repo';
+  const cwd = path.resolve('/repo');
+  const artifact = path.join(cwd, 'src', 'app.js');
+  const outside = path.join(path.parse(cwd).root, 'outside', 'passwd');
   const raw = [
     JSON.stringify({ type: 'step_start', sessionID: 'ses_123' }),
     JSON.stringify({
@@ -335,7 +344,7 @@ test('parser retorna resposta final, sessão e artefatos internos', () => {
       sessionID: 'ses_123',
       part: {
         tool: 'read',
-        state: { status: 'completed', input: { filePath: '/repo/src/app.js' } },
+        state: { status: 'completed', input: { filePath: artifact } },
       },
     }),
     JSON.stringify({
@@ -343,7 +352,7 @@ test('parser retorna resposta final, sessão e artefatos internos', () => {
       sessionID: 'ses_123',
       part: {
         tool: 'read',
-        state: { status: 'completed', input: { filePath: '/etc/passwd' } },
+        state: { status: 'completed', input: { filePath: outside } },
       },
     }),
     JSON.stringify({
@@ -356,14 +365,16 @@ test('parser retorna resposta final, sessão e artefatos internos', () => {
   assert.deepEqual(parseOpenCodeEvents(raw, cwd), {
     sessionId: 'ses_123',
     result: 'Concluído.',
-    artifacts: ['/repo/src/app.js'],
+    artifacts: [artifact],
     toolsUsed: ['read'],
     successfulTools: ['read'],
   });
 });
 
 test('parser nativo confirma somente ferramentas concluídas e artefatos internos', () => {
-  const cwd = '/repo';
+  const cwd = path.resolve('/repo');
+  const artifact = path.join(cwd, 'src', 'app.js');
+  const outside = path.join(path.parse(cwd).root, 'outside', 'passwd');
   const raw = [
     JSON.stringify({ type: 'system', subtype: 'init', session_id: 'native_123' }),
     JSON.stringify({
@@ -375,13 +386,13 @@ test('parser nativo confirma somente ferramentas concluídas e artefatos interno
             type: 'tool_use',
             id: 'tool_ok',
             name: 'Edit',
-            input: { file_path: '/repo/src/app.js' },
+            input: { file_path: artifact },
           },
           {
             type: 'tool_use',
             id: 'tool_failed',
             name: 'Read',
-            input: { file_path: '/etc/passwd' },
+            input: { file_path: outside },
           },
         ],
       },
@@ -411,7 +422,7 @@ test('parser nativo confirma somente ferramentas concluídas e artefatos interno
   assert.deepEqual(parseVerbooCodeEvents(raw, cwd), {
     sessionId: 'native_123',
     result: 'Concluído nativamente.',
-    artifacts: ['/repo/src/app.js'],
+    artifacts: [artifact],
     toolsUsed: ['Edit', 'Read'],
     successfulTools: ['Edit'],
   });
@@ -462,6 +473,7 @@ process.stdout.write(JSON.stringify({
         VERBOO_API_KEY: 'test-key',
         VERBOO_OPENCODE_BIN: fakeOpenCode,
       },
+      spawnImpl: spawnFixture,
     },
   );
 
@@ -626,6 +638,7 @@ process.stdout.write(JSON.stringify({
         VERBOO_AGENT_EXECUTOR: 'opencode',
         VERBOO_CODE_BIN: fakeVerboo,
       },
+      spawnImpl: spawnFixture,
     },
   );
 
@@ -786,7 +799,7 @@ process.stdout.write(JSON.stringify({
       model: 'deepseek-v4-flash',
       timeout_seconds: 10,
     },
-    { availableModels: MODELS, env },
+    { availableModels: MODELS, env, spawnImpl: spawnFixture },
   );
   const second = await runVerbooAgent(
     {
@@ -797,7 +810,7 @@ process.stdout.write(JSON.stringify({
       model: 'deepseek-v4-flash',
       timeout_seconds: 10,
     },
-    { availableModels: MODELS, env },
+    { availableModels: MODELS, env, spawnImpl: spawnFixture },
   );
 
   assert.equal(first.result, 'Decisão concluída.');
@@ -843,6 +856,7 @@ process.stdout.write(JSON.stringify({
         VERBOO_MEMORY_ENABLED: '1',
         VERBOO_MEMORY_DIR: blockedMemoryPath,
       },
+      spawnImpl: spawnFixture,
     },
   );
 
@@ -1438,6 +1452,7 @@ process.exit(1);
           VERBOO_CODE_BIN: fakeVerboo,
           VERBOO_MODEL_COOLDOWN_SECONDS: '3600',
         },
+        spawnImpl: spawnFixture,
       },
     ),
     (error) => {
@@ -1514,6 +1529,7 @@ process.exit(1);
           VERBOO_AGENT_ALLOWED_ROOTS: base,
           VERBOO_CODE_BIN: fakeVerboo,
         },
+        spawnImpl: spawnFixture,
       },
     ),
     (error) => {
@@ -3391,6 +3407,8 @@ test('OpenCode processa mais de 4 MiB e correlaciona tools por part.sessionID', 
 });
 
 test('parser nativo limpa tool pendente após tool_result', () => {
+  const cwd = path.resolve('/repo');
+  const artifact = path.join(cwd, 'src', 'a.js');
   const events = [];
   for (let i = 0; i < 5_000; i += 1) {
     events.push(
@@ -3400,7 +3418,7 @@ test('parser nativo limpa tool pendente após tool_result', () => {
           type: 'tool_use',
           id: `read_${i}`,
           name: 'Read',
-          input: { file_path: '/repo/src/a.js' },
+          input: { file_path: artifact },
         }] },
       },
       {
@@ -3412,9 +3430,9 @@ test('parser nativo limpa tool pendente após tool_result', () => {
       },
     );
   }
-  const parsed = parseVerbooCodeEvents(events.map(JSON.stringify).join('\n'), '/repo');
+  const parsed = parseVerbooCodeEvents(events.map(JSON.stringify).join('\n'), cwd);
   assert.deepEqual(parsed.successfulTools, ['Read']);
-  assert.deepEqual(parsed.artifacts, ['/repo/src/a.js']);
+  assert.deepEqual(parsed.artifacts, [artifact]);
 });
 
 test('parser nativo limita coleção de tools pendentes', () => {
@@ -3487,6 +3505,7 @@ test('linha JSONL individual excessiva falha bounded com OUTPUT_LIMIT', async ()
         spawnImpl,
         killImpl,
         killGraceMs: 5,
+        platform: 'linux',
       },
     ),
     (error) => error.code === 'OUTPUT_LIMIT',
@@ -3545,6 +3564,7 @@ test('último evento sem newline rejeita se exceder texto público acumulado', a
         spawnImpl,
         killImpl,
         killGraceMs: 5,
+        platform: 'linux',
       },
     ),
     (error) => error.code === 'OUTPUT_LIMIT',

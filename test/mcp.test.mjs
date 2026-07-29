@@ -12,6 +12,7 @@ import { MODEL_CATALOG } from '../model-router.mjs';
 
 test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   const repo = path.resolve('.');
+  const outside = path.dirname(repo);
   const memoryDir = await mkdtemp(path.join(os.tmpdir(), 'verboo-mcp-memory-'));
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -129,7 +130,7 @@ test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
 
   const result = await client.callTool({
     name: 'verboo_agent',
-    arguments: { prompt: 'audite', cwd: '/etc', mode: 'read_only' },
+    arguments: { prompt: 'audite', cwd: outside, mode: 'read_only' },
   });
   assert.equal(result.isError, true);
   const payload = JSON.parse(result.content[0].text);
