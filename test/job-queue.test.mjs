@@ -1321,7 +1321,8 @@ test('JobQueue: dispose legado absorve falha de store sem unhandled rejection', 
   t.after(() => process.removeListener('unhandledRejection', onUnhandled));
 
   assert.equal(q.dispose(), undefined);
-  await new Promise((resolve) => setTimeout(resolve, 25));
+  await q.shutdown().catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(q.status.disposed, true);
   assert.equal(q.getJobResult(job_id).status, 'cancelled');

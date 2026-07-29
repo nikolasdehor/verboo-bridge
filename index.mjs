@@ -1332,15 +1332,26 @@ function shutdown(reason) {
   if (shutdownPromise) return shutdownPromise;
   shutdownPromise = Promise.resolve().then(async () => {
     log('info', `Encerrando bridge (${reason}).`);
+    let serverCloseTimer;
+    const closeServer = Promise.race([
+      Promise.resolve().then(() => server.close()),
+      new Promise((_, reject) => {
+        serverCloseTimer = setTimeout(() => reject(Object.assign(
+          new Error('Fechamento do servidor excedeu o tempo limite.'),
+          { code: 'SERVER_CLOSE_TIMEOUT' },
+        )), 2_500);
+      }),
+    ]).finally(() => clearTimeout(serverCloseTimer));
     const results = await Promise.allSettled([
       jobQueue.shutdown(),
-      server.close(),
+      closeServer,
     ]);
     let failure = null;
     results.forEach((result, index) => {
       if (result.status === 'rejected') {
         log('error', `Falha durante shutdown: ${result.reason?.message ?? result.reason}`);
         process.exitCode = 1;
+        scheduleForcedExit();
         failure ??= result.reason instanceof Error
           ? result.reason
           : new Error('Falha durante shutdown.');

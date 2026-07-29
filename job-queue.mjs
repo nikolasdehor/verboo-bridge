@@ -337,7 +337,7 @@ export class JobQueue extends EventEmitter {
       }
     });
     const settled = Promise.all([
-      Promise.allSettled([...this.#executions]),
+      Promise.allSettled(this.#executions),
       waitForPersistence,
     ]);
     let timer;

@@ -409,10 +409,10 @@ test('MCP SIGTERM repetido encerra uma vez, persiste jobs e não deixa runner ó
     name: 'verboo_agent_start',
     arguments: { prompt: 'queued', cwd: repo, mode: 'read_only', timeout_seconds: 30 },
   })).content[0].text);
-  const bridgePid = transport.pid;
+  const wrapperPid = transport.pid;
   const closed = new Promise((resolve) => { client.onclose = resolve; });
-  process.kill(bridgePid, 'SIGTERM');
-  process.kill(bridgePid, 'SIGTERM');
+  process.kill(wrapperPid, 'SIGTERM');
+  process.kill(wrapperPid, 'SIGTERM');
   await Promise.race([
     closed,
     new Promise((_, reject) => setTimeout(
@@ -421,9 +421,18 @@ test('MCP SIGTERM repetido encerra uma vez, persiste jobs e não deixa runner ó
     )),
   ]);
 
-  assert.throws(() => process.kill(bridgePid, 0), { code: 'ESRCH' });
+  assert.throws(() => process.kill(wrapperPid, 0), { code: 'ESRCH' });
   assert.match(stderr, /Shutdown da fila excedeu o tempo limite/);
   const { readFile } = await import('node:fs/promises');
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      await access(bridgeExitFile);
+      break;
+    } catch {
+      if (attempt === 99) throw new Error('wrapper não registrou a saída do bridge');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
   assert.deepEqual(JSON.parse(await readFile(bridgeExitFile, 'utf8')), {
     code: 1,
     signal: null,
@@ -460,9 +469,11 @@ test('MCP transport close aciona um único shutdown', async (t) => {
   transport.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
   await client.connect(transport);
 
+  const stderrEnded = new Promise((resolve) => transport.stderr.once('end', resolve));
   const closed = new Promise((resolve) => { client.onclose = resolve; });
   await transport.close();
   await closed;
+  await stderrEnded;
   assert.equal(
     stderr.match(/Encerrando bridge/g)?.length,
     1,
