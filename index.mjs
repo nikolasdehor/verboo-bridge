@@ -501,6 +501,53 @@ function runVerifyCommand(command, cwd, env, timeoutMs) {
   });
 }
 
+function verifyCommandFailed(result) {
+  return Boolean(result.error) || result.timed_out || result.exit_code !== 0;
+}
+
+async function executeVerifyBatch({
+  normalized,
+  cwd,
+  isolatedHome,
+  perCommandMs,
+  stopOnFailure,
+}) {
+  const deadline = Date.now()
+    + Math.min(perCommandMs * normalized.length, VERIFY_TOTAL_MAX_SECONDS * 1000);
+  const results = [];
+  let stoppedEarly = false;
+  let stopReason = null;
+  for (const command of normalized) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      stoppedEarly = true;
+      stopReason = 'total_timeout';
+      break;
+    }
+    const recheckError = recheckVerifyTarget(command);
+    const result = recheckError
+      ? { ...emptyVerifyResult(), error: recheckError }
+      : await runVerifyCommand(
+        command,
+        cwd,
+        verifyChildEnv(isolatedHome, command.cmd),
+        Math.min(perCommandMs, remainingMs),
+      );
+    results.push({ cmd: command.cmd, args: command.args, ...result });
+    if (verifyCommandFailed(result) && stopOnFailure && results.length < normalized.length) {
+      stoppedEarly = true;
+      stopReason = 'failure';
+      break;
+    }
+  }
+  return {
+    stoppedEarly,
+    stopReason,
+    results,
+    anyFailure: stoppedEarly || results.some(verifyCommandFailed),
+  };
+}
+
 async function runVerbooValidate(args) {
   if (!VERIFY_ENABLED) {
     return {
@@ -554,38 +601,18 @@ async function runVerbooValidate(args) {
       return { status: 'error', error: err.message, executed: [] };
     }
     const perCommandMs = timeoutSeconds * 1000;
-    const deadline = Date.now()
-      + Math.min(perCommandMs * normalized.length, VERIFY_TOTAL_MAX_SECONDS * 1000);
-    const results = [];
-    let stoppedEarly = false;
-    let stopReason = null;
-    for (const command of normalized) {
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) {
-        stoppedEarly = true;
-        stopReason = 'total_timeout';
-        break;
-      }
-      const recheckError = recheckVerifyTarget(command);
-      const result = recheckError
-        ? { ...emptyVerifyResult(), error: recheckError }
-        : await runVerifyCommand(
-          command,
-          cwd,
-          verifyChildEnv(isolatedHome, command.cmd),
-          Math.min(perCommandMs, remainingMs),
-        );
-      results.push({ cmd: command.cmd, args: command.args, ...result });
-      const failed = Boolean(result.error) || result.timed_out || result.exit_code !== 0;
-      if (failed && stopOnFailure && results.length < normalized.length) {
-        stoppedEarly = true;
-        stopReason = stopReason ?? 'failure';
-        break;
-      }
-    }
-    const anyFailure = stoppedEarly || results.some(
-      (r) => Boolean(r.error) || r.timed_out || r.exit_code !== 0,
-    );
+    const {
+      stoppedEarly,
+      stopReason,
+      results,
+      anyFailure,
+    } = await executeVerifyBatch({
+      normalized,
+      cwd,
+      isolatedHome,
+      perCommandMs,
+      stopOnFailure,
+    });
     return {
       status: anyFailure ? 'failed' : 'ok',
       cwd,

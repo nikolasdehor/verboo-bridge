@@ -957,7 +957,7 @@ function takeSuccessfulOpenCodeContentTool(pendingBySession, event) {
   const matchedIndex = id == null
     ? -1
     : queue.findIndex((pending) => pending.id === String(id));
-  const [completed] = queue.splice(matchedIndex >= 0 ? matchedIndex : 0, 1);
+  const [completed] = queue.splice(Math.max(0, matchedIndex), 1);
   if (queue.length === 0) pendingBySession.delete(sessionKey);
   if (event.is_error === true || event.part?.is_error === true) return null;
   return completed.tool;
