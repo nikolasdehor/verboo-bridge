@@ -18,6 +18,12 @@ export const MAX_TIMEOUT_SECONDS = 1800;
 
 const MAX_STDOUT_BYTES = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES = 256 * 1024;
+// Streaming: nenhum teto para o volume cumulativo de eventos, mas cada
+// linha JSONL e o texto público retido têm limites próprios e bounded.
+const MAX_LINE_BYTES = 1024 * 1024;
+const MAX_RESULT_TEXT_BYTES = 4 * 1024 * 1024;
+const MAX_RESULT_PARTS = 4_096;
+const MAX_TRACKED_ITEMS = 4_096;
 const DEFAULT_AGENT_CONCURRENCY = 4;
 const MAX_AGENT_CONCURRENCY = 8;
 const KILL_GRACE_MS = 2_000;
@@ -71,17 +77,25 @@ export function resetModelRuntimeState() {
   modelRuntimeState = createModelRuntimeState();
 }
 const CHILD_ENV_ALLOWLIST = [
+  'APPDATA',
   'CI',
+  'ComSpec',
   'HOME',
   'LANG',
   'LC_ALL',
+  'LOCALAPPDATA',
   'LOGNAME',
   'NO_COLOR',
   'PATH',
+  'PATHEXT',
   'SHELL',
+  'SystemRoot',
+  'TEMP',
   'TERM',
+  'TMP',
   'TMPDIR',
   'USER',
+  'USERPROFILE',
   'XDG_CACHE_HOME',
   'XDG_CONFIG_HOME',
   'XDG_DATA_HOME',
@@ -694,6 +708,35 @@ function policyToolName(name) {
   return normalized;
 }
 
+function addBounded(set, value, label) {
+  if (set.has(value)) return;
+  if (set.size >= MAX_TRACKED_ITEMS) {
+    throw agentError(
+      'OUTPUT_LIMIT',
+      `${label} excedeu o limite de ${MAX_TRACKED_ITEMS} itens.`,
+    );
+  }
+  set.add(value);
+}
+
+function setBounded(map, key, value, label) {
+  if (!map.has(key) && map.size >= MAX_TRACKED_ITEMS) {
+    throw agentError(
+      'OUTPUT_LIMIT',
+      `${label} excedeu o limite de ${MAX_TRACKED_ITEMS} itens.`,
+    );
+  }
+  map.set(key, value);
+}
+
+function rememberRecent(set, value) {
+  if (set.has(value)) return;
+  // ponytail: dedupe guarda só IDs recentes; aumente o teto se duplicatas
+  // puderem reaparecer depois de mais de MAX_TRACKED_ITEMS ferramentas.
+  if (set.size >= MAX_TRACKED_ITEMS) set.delete(set.values().next().value);
+  set.add(value);
+}
+
 export function buildProgressOnLine(
   onProgress,
   {
@@ -715,9 +758,10 @@ export function buildProgressOnLine(
   const completedTools = new Set();
   const anonymousActiveKeys = new Map();
   const anonymousActiveKeysByFullKey = new Map();
-  const anonymousCounts = new Map();
   const toolAliases = new Map();
   const pendingContentToolsBySession = new Map();
+  let pendingContentToolCount = 0;
+  let anonymousSequence = 0;
   let lastEmitAt = Number.NEGATIVE_INFINITY;
   let pending = false;
   let closed = false;
@@ -762,25 +806,29 @@ export function buildProgressOnLine(
       if (!sessionContext.forceNewAnonymous && anonymousActiveKeys.has(baseKey)) {
         key = anonymousActiveKeys.get(baseKey);
       } else {
-        const count = (anonymousCounts.get(baseKey) ?? 0) + 1;
-        anonymousCounts.set(baseKey, count);
-        key = `${baseKey}:${count}`;
+        anonymousSequence += 1;
+        key = `${baseKey}:${anonymousSequence}`;
         if (!sessionContext.forceNewAnonymous) {
-          anonymousActiveKeys.set(baseKey, key);
-          anonymousActiveKeysByFullKey.set(key, baseKey);
+          setBounded(anonymousActiveKeys, baseKey, key, 'Ferramentas anônimas ativas');
+          setBounded(
+            anonymousActiveKeysByFullKey,
+            key,
+            baseKey,
+            'Ferramentas anônimas ativas',
+          );
         }
       }
     }
 
     if (pendingTools.has(key) || completedTools.has(key)) return key;
+    const category = categorizeTool(name);
+    setBounded(pendingTools, key, category, 'Ferramentas pendentes');
     if (!hasSeenToolUse) {
       hasSeenToolUse = true;
       phase = 'executing_tool';
-    } else if (phase === 'processing_result') {
+    } else if (phase === 'waiting_model') {
       phase = 'executing_tool';
     }
-    const category = categorizeTool(name);
-    pendingTools.set(key, category);
     counts[category].total += 1;
     pending = true;
     return key;
@@ -793,7 +841,7 @@ export function buildProgressOnLine(
     if (!category || completedTools.has(key)) return;
     counts[category][failed ? 'failed' : 'succeeded'] += 1;
     pendingTools.delete(key);
-    completedTools.add(key);
+    rememberRecent(completedTools, key);
     if (anonymousActiveKeysByFullKey.has(key)) {
       const baseKey = anonymousActiveKeysByFullKey.get(key);
       anonymousActiveKeys.delete(baseKey);
@@ -802,15 +850,20 @@ export function buildProgressOnLine(
     for (const [alias, mappedKey] of toolAliases) {
       if (mappedKey === key) toolAliases.delete(alias);
     }
-    phase = 'processing_result';
+    // tool_result devolve o turno ao modelo: a fase só vira
+    // processing_result quando o subprocesso fecha (executeAgentAttempt).
+    phase = 'waiting_model';
     pending = true;
   };
 
   const takePendingContentTool = (sessionId) => {
     const sessionKey = String(sessionId ?? 'global');
-    const queue = pendingContentToolsBySession.get(sessionKey) ?? [];
-    while (queue.length > 0) {
-      const key = queue.shift();
+    const queue = pendingContentToolsBySession.get(sessionKey);
+    while (queue?.size > 0) {
+      const key = queue.values().next().value;
+      queue.delete(key);
+      pendingContentToolCount -= 1;
+      if (queue.size === 0) pendingContentToolsBySession.delete(sessionKey);
       if (pendingTools.has(key)) return key;
     }
     pendingContentToolsBySession.delete(sessionKey);
@@ -839,15 +892,33 @@ export function buildProgressOnLine(
 
   const registerContentToolCall = (event, sessionId) => {
     const id = event.id ?? event.call_id ?? event.tool_use_id;
+    if (!id && pendingContentToolCount >= MAX_TRACKED_ITEMS) {
+      throw agentError(
+        'OUTPUT_LIMIT',
+        `Ferramentas content pendentes excederam ${MAX_TRACKED_ITEMS} itens.`,
+      );
+    }
     const key = startTool(event.name, id, {
       sessionId,
       forceNewAnonymous: !id,
     });
-    if (id) toolAliases.set(String(id), key);
+    if (id) {
+      setBounded(toolAliases, String(id), key, 'Aliases de ferramentas');
+      return;
+    }
     const sessionKey = String(sessionId ?? 'global');
-    const queue = pendingContentToolsBySession.get(sessionKey) ?? [];
-    if (!queue.includes(key)) queue.push(key);
-    pendingContentToolsBySession.set(sessionKey, queue);
+    let queue = pendingContentToolsBySession.get(sessionKey);
+    if (!queue) {
+      queue = new Set();
+      setBounded(
+        pendingContentToolsBySession,
+        sessionKey,
+        queue,
+        'Sessões com ferramentas pendentes',
+      );
+    }
+    queue.add(key);
+    pendingContentToolCount += 1;
   };
 
   const handleOpenCodeToolUse = (event, sessionId) => {
@@ -898,22 +969,25 @@ export function buildProgressOnLine(
 
   const onLine = (line) => {
     if (closed) return;
+    let event;
     try {
-      const event = JSON.parse(line);
-      pending = true;
-      const sessionId = event.sessionID
-        ?? event.part?.sessionID
-        ?? event.session_id
-        ?? event.sessionId;
-      if (handleStreamToolStart(event)) {
-        emitIfReady();
-        return;
-      }
-      handleOpenCodeToolUse(event, sessionId);
-      handleNativeBlocks(event, sessionId);
-      handleToolResult(event, sessionId);
+      event = JSON.parse(line);
+    } catch {
+      return;
+    }
+    pending = true;
+    const sessionId = event.sessionID
+      ?? event.part?.sessionID
+      ?? event.session_id
+      ?? event.sessionId;
+    if (handleStreamToolStart(event)) {
       emitIfReady();
-    } catch {}
+      return;
+    }
+    handleOpenCodeToolUse(event, sessionId);
+    handleNativeBlocks(event, sessionId);
+    handleToolResult(event, sessionId);
+    emitIfReady();
   };
   onLine.flush = emit;
   onLine.close = () => {
@@ -932,7 +1006,7 @@ function openCodeEventSessionId(event) {
     ?? null;
 }
 
-function registerOpenCodeContentTool(pendingBySession, event) {
+function registerOpenCodeContentTool(pendingState, event) {
   if (
     event.type !== 'content'
     || event.content_type !== 'tool_call'
@@ -941,85 +1015,173 @@ function registerOpenCodeContentTool(pendingBySession, event) {
     return null;
   }
   const sessionKey = String(openCodeEventSessionId(event) ?? 'global');
-  const queue = pendingBySession.get(sessionKey) ?? [];
+  const queue = pendingState.bySession.get(sessionKey) ?? [];
   const id = event.id ?? event.call_id ?? event.tool_use_id;
+  if (pendingState.size >= MAX_TRACKED_ITEMS) {
+    throw agentError(
+      'OUTPUT_LIMIT',
+      `Ferramentas OpenCode pendentes excederam ${MAX_TRACKED_ITEMS} itens.`,
+    );
+  }
   queue.push({ id: id == null ? null : String(id), tool: event.name });
-  pendingBySession.set(sessionKey, queue);
+  pendingState.size += 1;
+  setBounded(
+    pendingState.bySession,
+    sessionKey,
+    queue,
+    'Sessões OpenCode pendentes',
+  );
   return event.name;
 }
 
-function takeSuccessfulOpenCodeContentTool(pendingBySession, event) {
+function takeSuccessfulOpenCodeContentTool(pendingState, event) {
   if (event.type !== 'tool_result') return null;
   const sessionKey = String(openCodeEventSessionId(event) ?? 'global');
-  const queue = pendingBySession.get(sessionKey) ?? [];
+  const queue = pendingState.bySession.get(sessionKey) ?? [];
   if (queue.length === 0) return null;
   const id = event.tool_use_id ?? event.call_id ?? event.part?.tool_use_id;
-  const matchedIndex = id == null
+  let matchedIndex = id == null
     ? -1
     : queue.findIndex((pending) => pending.id === String(id));
-  const [completed] = queue.splice(Math.max(0, matchedIndex), 1);
-  if (queue.length === 0) pendingBySession.delete(sessionKey);
+  if (id != null && matchedIndex < 0) {
+    matchedIndex = queue.findIndex((pending) => pending.id == null);
+    if (matchedIndex < 0) return null;
+  }
+  const [completed] = queue.splice(id == null ? 0 : matchedIndex, 1);
+  pendingState.size -= 1;
+  if (queue.length === 0) pendingState.bySession.delete(sessionKey);
   if (event.is_error === true || event.part?.is_error === true) return null;
   return completed.tool;
 }
 
-export function parseOpenCodeEvents(raw, cwd) {
-  let sessionId = null;
-  const resultParts = [];
-  const artifacts = new Set();
-  const toolsUsed = new Set();
-  const successfulTools = new Set();
-  const pendingContentToolsBySession = new Map();
-  const filter = createThinkFilter();
+function createEventParserState(cwd) {
+  return {
+    cwd,
+    sessionId: null,
+    resultParts: [],
+    resultBytes: 0,
+    canonicalResult: null,
+    artifacts: new Set(),
+    toolsUsed: new Set(),
+    successfulTools: new Set(),
+    filter: createThinkFilter(),
+  };
+}
 
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    let event;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      continue;
-    }
-
-    sessionId ||= openCodeEventSessionId(event);
-    if (event.type === 'text') {
-      const candidate = filter(event.part?.text ?? '');
-      if (candidate) resultParts.push(candidate);
-    }
-
-    if (event.type === 'tool_use') {
-      if (event.part?.tool) toolsUsed.add(event.part.tool);
-      if (event.part?.state?.status !== 'completed') continue;
-      if (event.part?.tool) successfulTools.add(event.part.tool);
-      const input = event.part?.state?.input ?? {};
-      for (const value of [input.filePath, input.path]) {
-        if (typeof value !== 'string') continue;
-        const candidate = path.resolve(cwd, value);
-        if (isInside(cwd, candidate)) artifacts.add(candidate);
-      }
-    }
-    const contentTool = registerOpenCodeContentTool(
-      pendingContentToolsBySession,
-      event,
+function pushResultPart(state, text) {
+  const bytes = Buffer.byteLength(text);
+  if (
+    state.resultBytes + bytes > MAX_RESULT_TEXT_BYTES
+    || state.resultParts.length >= MAX_RESULT_PARTS
+  ) {
+    throw agentError(
+      'OUTPUT_LIMIT',
+      `Texto público do agente excedeu o limite de ${MAX_RESULT_TEXT_BYTES} bytes ou ${MAX_RESULT_PARTS} fragmentos.`,
     );
-    if (contentTool) toolsUsed.add(contentTool);
-    const completedContentTool = takeSuccessfulOpenCodeContentTool(
-      pendingContentToolsBySession,
-      event,
-    );
-    if (completedContentTool) successfulTools.add(completedContentTool);
   }
+  state.resultParts.push(text);
+  state.resultBytes += bytes;
+}
 
-  const remaining = filter.flush();
-  if (remaining) resultParts.push(remaining);
+function standaloneVisibleText(text) {
+  const filter = createThinkFilter();
+  return `${filter(text)}${filter.flush()}`;
+}
+
+function setCanonicalResult(state, text) {
+  const visible = standaloneVisibleText(text);
+  if (Buffer.byteLength(visible) > MAX_RESULT_TEXT_BYTES) {
+    throw agentError(
+      'OUTPUT_LIMIT',
+      `Texto público do agente excedeu ${MAX_RESULT_TEXT_BYTES} bytes e foi interrompido.`,
+    );
+  }
+  state.canonicalResult = visible;
+  state.resultParts = [];
+  state.resultBytes = 0;
+}
+
+function appendVisibleText(state, text) {
+  if (text) pushResultPart(state, text);
+}
+
+function finishEventParser(state) {
+  if (state.canonicalResult == null) appendVisibleText(state, state.filter.flush());
+  return {
+    sessionId: state.sessionId,
+    result: (state.canonicalResult ?? state.resultParts.join('')).trim(),
+    artifacts: sortedStrings(state.artifacts),
+    toolsUsed: sortedStrings(state.toolsUsed),
+    successfulTools: sortedStrings(state.successfulTools),
+  };
+}
+
+export function createOpenCodeEventParser(cwd) {
+  const state = createEventParserState(cwd);
+  const pendingContentTools = { bySession: new Map(), size: 0 };
 
   return {
-    sessionId,
-    result: resultParts.join('').trim(),
-    artifacts: sortedStrings(artifacts),
-    toolsUsed: sortedStrings(toolsUsed),
-    successfulTools: sortedStrings(successfulTools),
+    feed(line) {
+      if (!line.trim()) return;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+
+      state.sessionId ||= openCodeEventSessionId(event);
+      if (event.type === 'text') {
+        appendVisibleText(state, state.filter(event.part?.text ?? ''));
+      }
+
+      if (event.type === 'tool_use') {
+        if (event.part?.tool) addBounded(state.toolsUsed, event.part.tool, 'Ferramentas usadas');
+        if (event.part?.state?.status === 'completed') {
+          if (event.part?.tool) {
+            addBounded(
+              state.successfulTools,
+              event.part.tool,
+              'Ferramentas concluídas',
+            );
+          }
+          const input = event.part?.state?.input ?? {};
+          for (const value of [input.filePath, input.path]) {
+            if (typeof value !== 'string') continue;
+            const candidate = path.resolve(state.cwd, value);
+            if (isInside(state.cwd, candidate)) {
+              addBounded(state.artifacts, candidate, 'Artefatos');
+            }
+          }
+        }
+      }
+      const contentTool = registerOpenCodeContentTool(
+        pendingContentTools,
+        event,
+      );
+      if (contentTool) addBounded(state.toolsUsed, contentTool, 'Ferramentas usadas');
+      const completedContentTool = takeSuccessfulOpenCodeContentTool(
+        pendingContentTools,
+        event,
+      );
+      if (completedContentTool) {
+        addBounded(
+          state.successfulTools,
+          completedContentTool,
+          'Ferramentas concluídas',
+        );
+      }
+    },
+    finish() {
+      return finishEventParser(state);
+    },
   };
+}
+
+export function parseOpenCodeEvents(raw, cwd) {
+  const parser = createOpenCodeEventParser(cwd);
+  for (const line of raw.split('\n')) parser.feed(line);
+  return parser.finish();
 }
 
 function nativeEventBlocks(event) {
@@ -1027,71 +1189,83 @@ function nativeEventBlocks(event) {
   return Array.isArray(content) ? content : [];
 }
 
-export function parseVerbooCodeEvents(raw, cwd) {
-  let sessionId = null;
-  const resultParts = [];
-  const artifacts = new Set();
-  const toolsUsed = new Set();
-  const successfulTools = new Set();
+export function createNativeEventParser(cwd) {
+  const state = createEventParserState(cwd);
   const pendingTools = new Map();
-  const filter = createThinkFilter();
-
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    let event;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      continue;
-    }
-
-    sessionId ||= event.session_id ?? event.sessionId ?? null;
-    if (event.type === 'result' && typeof event.result === 'string') {
-      const candidate = filter(event.result);
-      if (candidate) resultParts.push(candidate);
-    }
-
-    for (const block of nativeEventBlocks(event)) {
-      if (block.type === 'text') {
-        const candidate = filter(block.text ?? '');
-        if (candidate) resultParts.push(candidate);
-        continue;
-      }
-      if (block.type === 'tool_use') {
-        const tool = String(block.name ?? '');
-        if (tool) toolsUsed.add(tool);
-        const paths = [];
-        for (const value of [
-          block.input?.file_path,
-          block.input?.filePath,
-          block.input?.path,
-        ]) {
-          if (typeof value !== 'string') continue;
-          const candidate = path.resolve(cwd, value);
-          if (isInside(cwd, candidate)) paths.push(candidate);
-        }
-        if (block.id) pendingTools.set(block.id, { tool, paths });
-        continue;
-      }
-      if (block.type === 'tool_result') {
-        const pending = pendingTools.get(block.tool_use_id);
-        if (!pending || block.is_error === true) continue;
-        if (pending.tool) successfulTools.add(pending.tool);
-        for (const artifact of pending.paths) artifacts.add(artifact);
-      }
-    }
-  }
-
-  const remaining = filter.flush();
-  if (remaining) resultParts.push(remaining);
 
   return {
-    sessionId,
-    result: resultParts.join('').trim(),
-    artifacts: sortedStrings(artifacts),
-    toolsUsed: sortedStrings(toolsUsed),
-    successfulTools: sortedStrings(successfulTools),
+    feed(line) {
+      if (!line.trim()) return;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+
+      state.sessionId ||= event.session_id ?? event.sessionId ?? null;
+      if (event.type === 'result' && typeof event.result === 'string') {
+        setCanonicalResult(state, event.result);
+      }
+
+      for (const block of nativeEventBlocks(event)) {
+        if (block.type === 'text') {
+          if (state.canonicalResult == null) {
+            appendVisibleText(state, state.filter(block.text ?? ''));
+          }
+          continue;
+        }
+        if (block.type === 'tool_use') {
+          const tool = String(block.name ?? '');
+          if (tool) addBounded(state.toolsUsed, tool, 'Ferramentas usadas');
+          const paths = [];
+          for (const value of [
+            block.input?.file_path,
+            block.input?.filePath,
+            block.input?.path,
+          ]) {
+            if (typeof value !== 'string') continue;
+            const candidate = path.resolve(state.cwd, value);
+            if (isInside(state.cwd, candidate)) paths.push(candidate);
+          }
+          if (block.id) {
+            setBounded(
+              pendingTools,
+              block.id,
+              { tool, paths },
+              'Ferramentas nativas pendentes',
+            );
+          }
+          continue;
+        }
+        if (block.type === 'tool_result') {
+          const pending = pendingTools.get(block.tool_use_id);
+          if (!pending) continue;
+          pendingTools.delete(block.tool_use_id);
+          if (block.is_error === true) continue;
+          if (pending.tool) {
+            addBounded(
+              state.successfulTools,
+              pending.tool,
+              'Ferramentas concluídas',
+            );
+          }
+          for (const artifact of pending.paths) {
+            addBounded(state.artifacts, artifact, 'Artefatos');
+          }
+        }
+      }
+    },
+    finish() {
+      return finishEventParser(state);
+    },
   };
+}
+
+export function parseVerbooCodeEvents(raw, cwd) {
+  const parser = createNativeEventParser(cwd);
+  for (const line of raw.split('\n')) parser.feed(line);
+  return parser.finish();
 }
 
 export function resolveAgentExecutor(requestedExecutor, env) {
@@ -1185,6 +1359,23 @@ export function formatAgentFailure(error) {
   return failure;
 }
 
+export function buildTaskkillInvocation(pid) {
+  return {
+    command: 'taskkill.exe',
+    args: ['/pid', String(pid), '/t', '/f'],
+    options: {
+      shell: false,
+      windowsHide: true,
+      stdio: 'ignore',
+    },
+  };
+}
+
+function killWindowsTree(pid) {
+  const invocation = buildTaskkillInvocation(pid);
+  return spawn(invocation.command, invocation.args, invocation.options);
+}
+
 function execute(invocation, options) {
   const {
     cwd,
@@ -1192,10 +1383,14 @@ function execute(invocation, options) {
     env,
     spawnImpl = spawn,
     killImpl = process.kill,
+    killTreeImpl = killWindowsTree,
     killGraceMs = KILL_GRACE_MS,
+    platform = process.platform,
     timeoutMs = timeoutSeconds * 1000,
     signal,
     onLine,
+    retainStdout = true,
+    maxLineBytes = MAX_LINE_BYTES,
   } = options;
 
   return new Promise((resolve, reject) => {
@@ -1214,11 +1409,12 @@ function execute(invocation, options) {
     let forceKillTimer;
     let timer;
     let lineBuffer = '';
+    let windowsTreeKillRequested = false;
 
     const child = spawnImpl(invocation.command, invocation.args, {
       cwd,
       env: buildChildEnv(env, invocation),
-      detached: process.platform !== 'win32',
+      detached: platform !== 'win32',
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -1245,7 +1441,20 @@ function execute(invocation, options) {
     };
 
     const signalTree = (signal) => {
-      if (process.platform !== 'win32' && child.pid) {
+      if (platform === 'win32' && child.pid) {
+        if (windowsTreeKillRequested) return;
+        windowsTreeKillRequested = true;
+        try {
+          const treeKill = killTreeImpl(child.pid);
+          treeKill?.once?.('error', () => {
+            if (!settled) child.kill('SIGKILL');
+          });
+          return;
+        } catch {
+          // Se taskkill nem iniciar, ainda encerramos pelo menos o processo raiz.
+          windowsTreeKillRequested = false;
+        }
+      } else if (child.pid) {
         try {
           killImpl(-child.pid, signal);
           return;
@@ -1273,25 +1482,69 @@ function execute(invocation, options) {
       ));
     }, timeoutMs);
 
+    // Um consumer de linha que lança (ex.: texto público além do limite)
+    // encerra o subprocesso de forma bounded, como qualquer outro OUTPUT_LIMIT.
+    const deliverLine = (line) => {
+      if (!onLine) return;
+      try {
+        onLine(line);
+      } catch (error) {
+        terminate(
+          error?.code
+            ? error
+            : agentError(
+                'OUTPUT_LIMIT',
+                `Falha ao processar evento do ${invocation.label}: ${error?.message ?? error}`,
+              ),
+        );
+      }
+    };
+
     child.stdout?.on('data', (chunk) => {
       if (terminationError) return;
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_STDOUT_BYTES) {
-        terminate(
-          agentError(
-            'OUTPUT_LIMIT',
-            `Saída do ${invocation.label} excedeu 4 MiB e foi interrompida.`,
-          ),
-        );
-        return;
-      }
       const text = chunk.toString();
-      stdout += text;
+      if (retainStdout) {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > MAX_STDOUT_BYTES) {
+          terminate(
+            agentError(
+              'OUTPUT_LIMIT',
+              `Saída do ${invocation.label} excedeu 4 MiB e foi interrompida.`,
+            ),
+          );
+          return;
+        }
+        stdout += text;
+      }
       if (onLine) {
         lineBuffer += text;
         const lines = lineBuffer.split('\n');
         lineBuffer = lines.pop() ?? '';
-        for (const line of lines) onLine(line);
+        // O teto é por linha/evento individual: um buffer com muitas linhas
+        // válidas não dispara, mas uma única linha excessiva (completa ou
+        // ainda sem '\n') falha bounded.
+        if (Buffer.byteLength(lineBuffer) > maxLineBytes) {
+          terminate(
+            agentError(
+              'OUTPUT_LIMIT',
+              `Evento do ${invocation.label} excedeu ${maxLineBytes} bytes em uma única linha e foi interrompido.`,
+            ),
+          );
+          return;
+        }
+        for (const line of lines) {
+          if (Buffer.byteLength(line) > maxLineBytes) {
+            terminate(
+              agentError(
+                'OUTPUT_LIMIT',
+                `Evento do ${invocation.label} excedeu ${maxLineBytes} bytes em uma única linha e foi interrompido.`,
+              ),
+            );
+            return;
+          }
+          deliverLine(line);
+          if (terminationError) return;
+        }
       }
     });
 
@@ -1317,7 +1570,7 @@ function execute(invocation, options) {
 
     child.on('close', (code) => {
       if (terminationError) {
-        const processGroupMayRemain = process.platform !== 'win32' && child.pid;
+        const processGroupMayRemain = platform !== 'win32' && child.pid;
         finish(reject, terminationError, !processGroupMayRemain);
         return;
       }
@@ -1359,7 +1612,12 @@ function execute(invocation, options) {
         );
         return;
       }
-      if (lineBuffer.trim() && onLine) onLine(lineBuffer);
+      if (lineBuffer.trim()) deliverLine(lineBuffer);
+      if (terminationError) {
+        const processGroupMayRemain = platform !== 'win32' && child.pid;
+        finish(reject, terminationError, !processGroupMayRemain);
+        return;
+      }
       finish(resolve, stdout);
     });
   });
@@ -1392,24 +1650,38 @@ async function executeAgentAttempt(
     });
   }
   const invocation = buildAgentInvocation(request, executor, options.env);
-  const onLine = options.onProgress
+  // Parsing incremental: o stdout bruto não é retido; só o estado sanitizado
+  // (texto público, artefatos internos e ferramentas) sobrevive ao stream.
+  const parser = executor === 'native'
+    ? createNativeEventParser(request.cwd)
+    : createOpenCodeEventParser(request.cwd);
+  const progressOnLine = options.onProgress
     ? buildProgressOnLine(options.onProgress, { mode: request.mode, executor })
     : undefined;
-  const raw = await execute(invocation, {
+  const onLine = (line) => {
+    progressOnLine?.(line);
+    parser.feed(line);
+  };
+  if (progressOnLine) {
+    onLine.flush = progressOnLine.flush;
+    onLine.close = progressOnLine.close;
+  }
+  await execute(invocation, {
     cwd: request.cwd,
     timeoutSeconds,
     env: options.env,
     spawnImpl: options.spawnImpl,
     killImpl: options.killImpl,
+    killTreeImpl: options.killTreeImpl,
     killGraceMs: options.killGraceMs,
+    platform: options.platform,
     timeoutMs: options.timeoutMs,
     signal: options.signal,
     onLine,
+    retainStdout: false,
   });
   if (options.onProgress) options.onProgress({ phase: 'processing_result' });
-  const parsed = executor === 'native'
-    ? parseVerbooCodeEvents(raw, request.cwd)
-    : parseOpenCodeEvents(raw, request.cwd);
+  const parsed = parser.finish();
   const allowedTools = new Set(
     allowedToolsForMode(request.mode, executor).map(policyToolName),
   );

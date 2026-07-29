@@ -33,7 +33,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test && bash -n bin/vb bin/verboo-mcp && node --check index.mjs && node --check agent-runner.mjs"
+    "test": "node --test && node --check index.mjs && node --check agent-runner.mjs",
+    "test:posix": "bash -n bin/vb bin/verboo-mcp"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0"

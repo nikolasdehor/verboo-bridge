@@ -11,6 +11,7 @@ import {
   assertGlobalModelAllowed,
   buildOpenCodeInvocation,
   buildProgressOnLine,
+  buildTaskkillInvocation,
   buildVerbooCodeInvocation,
   buildChildEnv,
   formatAgentFailure,
@@ -256,6 +257,14 @@ test('subprocesso desativa config de projeto e recebe apenas ambiente necessári
     {
       HOME: '/home/test',
       PATH: '/bin',
+      USERPROFILE: '/windows/profile',
+      APPDATA: '/windows/appdata',
+      LOCALAPPDATA: '/windows/localappdata',
+      SystemRoot: '/windows',
+      ComSpec: '/windows/cmd.exe',
+      TEMP: '/windows/temp',
+      TMP: '/windows/tmp',
+      PATHEXT: '.EXE;.CMD',
       VERBOO_API_KEY: 'vbk_test',
       GITHUB_TOKEN: 'nao-deve-vazar',
       AWS_SECRET_ACCESS_KEY: 'nao-deve-vazar',
@@ -267,9 +276,29 @@ test('subprocesso desativa config de projeto e recebe apenas ambiente necessári
   assert.deepEqual(env, {
     HOME: '/home/test',
     PATH: '/bin',
+    USERPROFILE: '/windows/profile',
+    APPDATA: '/windows/appdata',
+    LOCALAPPDATA: '/windows/localappdata',
+    SystemRoot: '/windows',
+    ComSpec: '/windows/cmd.exe',
+    TEMP: '/windows/temp',
+    TMP: '/windows/tmp',
+    PATHEXT: '.EXE;.CMD',
     VERBOO_API_KEY: 'vbk_test',
     OPENCODE_CONFIG_CONTENT: invocation.inlineConfig,
     OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+  });
+});
+
+test('taskkill usa árvore, força encerramento e não abre shell', () => {
+  assert.deepEqual(buildTaskkillInvocation(321), {
+    command: 'taskkill.exe',
+    args: ['/pid', '321', '/t', '/f'],
+    options: {
+      shell: false,
+      windowsHide: true,
+      stdio: 'ignore',
+    },
   });
 });
 
@@ -1684,6 +1713,142 @@ test('fechamento do processo direto após TERM não cancela KILL do grupo POSIX'
   ]);
 });
 
+test('cancelamento Windows encerra árvore mesmo se a raiz fechar logo depois', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-windows-abort-'));
+  const controller = new AbortController();
+  const killedTrees = [];
+  let spawnOptions;
+  let child;
+  let started;
+  const didStart = new Promise((resolve) => { started = resolve; });
+  const spawnImpl = (_command, _args, options) => {
+    spawnOptions = options;
+    child = new EventEmitter();
+    child.pid = 24680;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => assert.fail('não deve usar child.kill quando taskkill está disponível');
+    started();
+    return child;
+  };
+  const killTreeImpl = (pid) => {
+    killedTrees.push(pid);
+    setImmediate(() => child.emit('close', null));
+  };
+
+  const running = runVerbooAgent(
+    {
+      prompt: 'aguarde',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      model: 'deepseek-v4-flash',
+      timeout_seconds: 10,
+    },
+    {
+      availableModels: MODELS,
+      env: {
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_API_KEY: 'test-key',
+      },
+      spawnImpl,
+      killTreeImpl,
+      killGraceMs: 5,
+      platform: 'win32',
+      signal: controller.signal,
+    },
+  );
+
+  await didStart;
+  controller.abort();
+  await assert.rejects(running, (error) => error.code === 'CANCELLED');
+  assert.equal(spawnOptions.detached, false);
+  assert.deepEqual(killedTrees, [24680]);
+});
+
+test('timeout Windows chama taskkill uma vez e encerra sem close da raiz', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-windows-timeout-'));
+  const killedTrees = [];
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.pid = 13579;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => assert.fail('não deve usar child.kill quando taskkill está disponível');
+    return child;
+  };
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'aguarde',
+        cwd: base,
+        executor: 'opencode',
+        mode: 'read_only',
+        model: 'deepseek-v4-flash',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_API_KEY: 'test-key',
+        },
+        spawnImpl,
+        killTreeImpl: (pid) => { killedTrees.push(pid); },
+        killGraceMs: 0,
+        platform: 'win32',
+        timeoutMs: 0,
+      },
+    ),
+    (error) => error.code === 'TIMEOUT',
+  );
+  assert.deepEqual(killedTrees, [13579]);
+});
+
+test('falha síncrona do taskkill usa TERM/KILL no processo raiz', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-windows-taskkill-fallback-'));
+  const signals = [];
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.pid = 97531;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = (signal) => {
+      signals.push(signal);
+      return true;
+    };
+    return child;
+  };
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'aguarde',
+        cwd: base,
+        executor: 'opencode',
+        mode: 'read_only',
+        model: 'deepseek-v4-flash',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+          VERBOO_API_KEY: 'test-key',
+        },
+        spawnImpl,
+        killTreeImpl: () => { throw new Error('taskkill indisponível'); },
+        killGraceMs: 0,
+        platform: 'win32',
+        timeoutMs: 0,
+      },
+    ),
+    (error) => error.code === 'TIMEOUT',
+  );
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+});
+
 test('falha tem contrato de recuperação determinístico', () => {
   const error = new Error('OpenCode não encontrado');
   error.code = 'OPENCODE_NOT_FOUND';
@@ -2096,6 +2261,7 @@ test('onProgress recebe waiting_model, executing_tool e processing_result', asyn
   resetModelRuntimeState();
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-onprogress-phases-'));
   const updates = [];
+  let subprocessClosed = false;
   const spawnImpl = () => {
     const child = new EventEmitter();
     child.stdout = new PassThrough();
@@ -2120,6 +2286,7 @@ test('onProgress recebe waiting_model, executing_tool e processing_result', asyn
         },
       ].map(JSON.stringify).join('\n')}\n`);
       child.stderr.end();
+      subprocessClosed = true;
       child.emit('close', 0);
     });
     return child;
@@ -2133,7 +2300,9 @@ test('onProgress recebe waiting_model, executing_tool e processing_result', asyn
       mode: 'read_only',
       model: 'deepseek-v4-flash',
       timeout_seconds: 10,
-      __onProgress: (update) => { updates.push(update); },
+      __onProgress: (update) => {
+        updates.push({ ...update, subprocessClosed });
+      },
     },
     {
       availableModels: ['deepseek-v4-flash', 'glm-5.2'],
@@ -2148,6 +2317,12 @@ test('onProgress recebe waiting_model, executing_tool e processing_result', asyn
   assert.ok(phases.includes('waiting_model'));
   assert.ok(phases.includes('executing_tool'));
   assert.ok(phases.includes('processing_result'));
+  assert.ok(
+    updates
+      .filter((update) => update.phase === 'processing_result')
+      .every((update) => update.subprocessClosed),
+    'processing_result só pode ser emitido depois do close',
+  );
 });
 
 test('onProgress inclui attempt info em fallback', async () => {
@@ -2285,7 +2460,7 @@ test('parseOpenCodeEvents remove bloco think dividido entre multiplos fragmentos
   assert.equal(parsed.result, 'Início.\nResultado.');
 });
 
-test('parseVerbooCodeEvents preserva multiplos blocos text em ordem', () => {
+test('parseVerbooCodeEvents usa result canônico após múltiplos blocos assistant', () => {
   const cwd = '/repo';
   const raw = [
     JSON.stringify({ type: 'assistant', session_id: 's2', message: { content: [
@@ -2297,15 +2472,17 @@ test('parseVerbooCodeEvents preserva multiplos blocos text em ordem', () => {
     JSON.stringify({ type: 'result', session_id: 's2', result: 'Concluído.' }),
   ].join('\n');
   const parsed = parseVerbooCodeEvents(raw, cwd);
-  assert.equal(parsed.result, 'Analisei.\nEncontrei um bug.\nConcluído.');
+  assert.equal(parsed.result, 'Concluído.');
 });
 
-test('parseVerbooCodeEvents preserva espaço entre fragmentos adjacentes', () => {
+test('parseVerbooCodeEvents preserva espaço no fallback assistant sem result', () => {
   const raw = [
     JSON.stringify({ type: 'assistant', session_id: 's2', message: { content: [
       { type: 'text', text: 'This is ' },
     ] } }),
-    JSON.stringify({ type: 'result', session_id: 's2', result: 'an answer' }),
+    JSON.stringify({ type: 'assistant', session_id: 's2', message: { content: [
+      { type: 'text', text: 'an answer' },
+    ] } }),
   ].join('\n');
   assert.equal(parseVerbooCodeEvents(raw, '/repo').result, 'This is an answer');
 });
@@ -2409,6 +2586,58 @@ test('buildProgressOnLine finaliza content tool_call concorrente na ordem da ses
   assert.deepEqual(
     updates.at(-1).tool_counts.Glob,
     { total: 1, succeeded: 1, failed: 0 },
+  );
+});
+
+test('buildProgressOnLine limita fila content anônima de uma única sessão', () => {
+  const cb = buildProgressOnLine(
+    () => {},
+    { minIntervalMs: 0, executor: 'opencode' },
+  );
+
+  assert.throws(
+    () => {
+      for (let index = 0; index < 4_097; index += 1) {
+        cb(JSON.stringify({
+          type: 'content',
+          content_type: 'tool_call',
+          sessionID: 'ses_content_limit',
+          name: 'read',
+        }));
+      }
+    },
+    (error) => (
+      error.code === 'OUTPUT_LIMIT'
+      && error.message.includes('Ferramentas content pendentes')
+    ),
+  );
+});
+
+test('buildProgressOnLine libera limite ao consumir content tool_result', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { executor: 'opencode' },
+  );
+
+  for (let index = 0; index < 5_000; index += 1) {
+    cb(JSON.stringify({
+      type: 'content',
+      content_type: 'tool_call',
+      sessionID: 'ses_content_consumed',
+      name: 'read',
+    }));
+    cb(JSON.stringify({
+      type: 'tool_result',
+      sessionID: 'ses_content_consumed',
+      call_id: `result_${index}`,
+    }));
+  }
+  cb.flush();
+
+  assert.deepEqual(
+    updates.at(-1).tool_counts.Read,
+    { total: 5_000, succeeded: 5_000, failed: 0 },
   );
 });
 
@@ -2755,7 +2984,7 @@ test('buildProgressOnLine conta List do OpenCode como inspeção Glob', () => {
   assert.deepEqual(update.tool_counts.Glob, { total: 1, succeeded: 1, failed: 0 });
 });
 
-test('buildProgressOnLine transiciona executing_tool -> processing_result', () => {
+test('buildProgressOnLine transiciona executing_tool -> waiting_model após tool_result', () => {
   const updates = [];
   const cb = buildProgressOnLine(
     (update) => { updates.push(update); },
@@ -2774,7 +3003,44 @@ test('buildProgressOnLine transiciona executing_tool -> processing_result', () =
 
   const phases = updates.map((u) => u.phase);
   assert.ok(phases.includes('executing_tool'), 'deve ter executing_tool');
-  assert.ok(phases.includes('processing_result'), 'deve ter processing_result');
+  assert.equal(phases.at(-1), 'waiting_model', 'tool_result devolve a fase ao modelo');
+  assert.ok(
+    !phases.includes('processing_result'),
+    'processing_result é exclusivo do fechamento do subprocesso',
+  );
+});
+
+test('buildProgressOnLine alterna waiting_model/executing_tool em ciclos de ferramenta', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0, mode: 'read_only' },
+  );
+
+  cb(JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 't1', name: 'Read' }] },
+  }));
+  cb(JSON.stringify({
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: 't1' }] },
+  }));
+  cb(JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 't2', name: 'Grep' }] },
+  }));
+  cb(JSON.stringify({
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: 't2' }] },
+  }));
+
+  const phases = updates.map((u) => u.phase);
+  assert.deepEqual(phases, [
+    'executing_tool',
+    'waiting_model',
+    'executing_tool',
+    'waiting_model',
+  ]);
 });
 
 test('buildProgressOnLine processa stream_event content_block_start tool_use', () => {
@@ -2872,4 +3138,416 @@ test('buildProgressOnLine registra atividade sem expor thinking_delta nem texto'
   assert.ok(toolUpdates.every((update) => update.phase === 'waiting_model'));
   assert.ok(toolUpdates.every((update) => update.tool_counts.total.total === 0));
   assert.ok(toolUpdates.every((update) => !('text' in update) && !('thinking' in update)));
+});
+
+// ── Streaming parser: dedup assistant/result e limites bounded ────────────
+
+test('parseVerbooCodeEvents deduplica assistant idêntico ao result agregado', () => {
+  const raw = [
+    JSON.stringify({ type: 'assistant', session_id: 's9', message: { content: [
+      { type: 'text', text: 'Resposta final.' },
+    ] } }),
+    JSON.stringify({ type: 'result', session_id: 's9', result: 'Resposta final.' }),
+  ].join('\n');
+  assert.equal(parseVerbooCodeEvents(raw, '/repo').result, 'Resposta final.');
+});
+
+test('parseVerbooCodeEvents trata result que agrega múltiplos blocos assistant parciais', () => {
+  const raw = [
+    JSON.stringify({ type: 'assistant', session_id: 's9', message: { content: [
+      { type: 'text', text: 'Resposta' },
+    ] } }),
+    JSON.stringify({ type: 'assistant', session_id: 's9', message: { content: [
+      { type: 'text', text: ' final.' },
+    ] } }),
+    JSON.stringify({ type: 'result', session_id: 's9', result: 'Resposta final.' }),
+  ].join('\n');
+  assert.equal(parseVerbooCodeEvents(raw, '/repo').result, 'Resposta final.');
+});
+
+test('parseVerbooCodeEvents resolve sobreposição parcial de assistant para result', () => {
+  const raw = [
+    JSON.stringify({ type: 'assistant', session_id: 's9', message: { content: [
+      { type: 'text', text: 'Resposta fina' },
+    ] } }),
+    JSON.stringify({ type: 'result', session_id: 's9', result: 'Resposta final.' }),
+  ].join('\n');
+  assert.equal(parseVerbooCodeEvents(raw, '/repo').result, 'Resposta final.');
+});
+
+test('parseVerbooCodeEvents usa result canônico e preserva correlação de tools', () => {
+  const raw = [
+    JSON.stringify({ type: 'assistant', session_id: 's9', message: { content: [
+      { type: 'text', text: 'Primeira.\n' },
+    ] } }),
+    JSON.stringify({ type: 'assistant', session_id: 's9', message: { content: [
+      { type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: '/repo/a.js' } },
+    ] } }),
+    JSON.stringify({ type: 'user', session_id: 's9', message: { content: [
+      { type: 'tool_result', tool_use_id: 'r1', content: 'ok' },
+    ] } }),
+    JSON.stringify({ type: 'assistant', session_id: 's9', message: { content: [
+      { type: 'text', text: 'Segunda.' },
+    ] } }),
+    JSON.stringify({ type: 'result', session_id: 's9', result: 'Segunda.' }),
+  ].join('\n');
+  const parsed = parseVerbooCodeEvents(raw, '/repo');
+  assert.equal(parsed.result, 'Segunda.');
+  assert.deepEqual(parsed.successfulTools, ['Read']);
+});
+
+test('parseVerbooCodeEvents substitui texto assistant por result canônico distinto', () => {
+  const raw = [
+    JSON.stringify({ type: 'assistant', session_id: 's9', message: { content: [
+      { type: 'text', text: 'Análise.' },
+    ] } }),
+    JSON.stringify({ type: 'result', session_id: 's9', result: 'Conclusão diferente.' }),
+  ].join('\n');
+  assert.equal(parseVerbooCodeEvents(raw, '/repo').result, 'Conclusão diferente.');
+});
+
+test('parseVerbooCodeEvents filtra result canônico sem herdar think incompleto', () => {
+  const raw = [
+    JSON.stringify({ type: 'assistant', session_id: 's9', message: { content: [
+      { type: 'text', text: '<think>rascunho incompleto' },
+    ] } }),
+    JSON.stringify({ type: 'result', session_id: 's9', result: 'Resultado canônico.' }),
+  ].join('\n');
+  assert.equal(parseVerbooCodeEvents(raw, '/repo').result, 'Resultado canônico.');
+});
+
+test('texto público acumulado além do limite falha bounded com OUTPUT_LIMIT', () => {
+  const bigText = 'x'.repeat(512 * 1024);
+  const raw = Array.from({ length: 9 }, () => JSON.stringify({
+    type: 'assistant',
+    session_id: 's9',
+    message: { content: [{ type: 'text', text: bigText }] },
+  })).join('\n');
+  assert.throws(
+    () => parseVerbooCodeEvents(raw, '/repo'),
+    (error) => error.code === 'OUTPUT_LIMIT',
+  );
+});
+
+test('fluxo cumulativo acima de 4 MiB com resultado pequeno conclui sem OUTPUT_LIMIT', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-bigstream-'));
+  const bigToolOutput = 'x'.repeat(64 * 1024);
+  const events = [
+    { type: 'system', subtype: 'init', session_id: 'big_stream' },
+  ];
+  for (let i = 0; i < 70; i += 1) {
+    events.push({
+      type: 'assistant',
+      session_id: 'big_stream',
+      message: { content: [{
+        type: 'tool_use',
+        id: `read_${i}`,
+        name: 'Read',
+        input: { file_path: 'src/a.js' },
+      }] },
+    });
+    events.push({
+      type: 'user',
+      session_id: 'big_stream',
+      message: { content: [{
+        type: 'tool_result',
+        tool_use_id: `read_${i}`,
+        content: bigToolOutput,
+      }] },
+    });
+  }
+  events.push({ type: 'result', session_id: 'big_stream', result: 'Leitura concluída.' });
+  const streamPayload = `${events.map(JSON.stringify).join('\n')}\n`;
+  assert.ok(
+    Buffer.byteLength(streamPayload) > 4 * 1024 * 1024,
+    'o fluxo de teste precisa exceder o antigo teto de 4 MiB',
+  );
+
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.end(streamPayload);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const result = await runVerbooAgent(
+    {
+      prompt: 'leia os arquivos',
+      cwd: base,
+      executor: 'native',
+      mode: 'read_only',
+      model: 'deepseek-v4-flash',
+      timeout_seconds: 30,
+    },
+    {
+      availableModels: MODELS,
+      env: {
+        ...process.env,
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+      },
+      spawnImpl,
+    },
+  );
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result, 'Leitura concluída.');
+  assert.equal(result.session_id, 'big_stream');
+  assert.deepEqual(result.tools_used, ['Read']);
+  assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'src/a.js')]);
+});
+
+test('OpenCode processa mais de 4 MiB e correlaciona tools por part.sessionID', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-opencode-bigstream-'));
+  const bigToolOutput = 'x'.repeat(32 * 1024);
+  const events = [];
+  for (let i = 0; i < 70; i += 1) {
+    events.push(
+      {
+        type: 'content',
+        content_type: 'tool_call',
+        name: 'Read',
+        part: { sessionID: 'session_a' },
+      },
+      {
+        type: 'content',
+        content_type: 'tool_call',
+        name: 'Read',
+        part: { sessionID: 'session_b' },
+      },
+      {
+        type: 'tool_result',
+        part: { sessionID: 'session_b', is_error: false },
+        content: bigToolOutput,
+      },
+      {
+        type: 'tool_result',
+        part: { sessionID: 'session_a', is_error: false },
+        content: bigToolOutput,
+      },
+    );
+  }
+  events.push(
+    {
+      type: 'tool_use',
+      part: {
+        sessionID: 'session_b',
+        id: 'final_read',
+        tool: 'Read',
+        state: { status: 'completed', input: { filePath: 'src/a.js' } },
+      },
+    },
+    {
+      type: 'text',
+      part: { sessionID: 'session_b', text: 'Leitura OpenCode concluída.' },
+    },
+  );
+  const streamPayload = `${events.map(JSON.stringify).join('\n')}\n`;
+  assert.ok(Buffer.byteLength(streamPayload) > 4 * 1024 * 1024);
+
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.end(streamPayload);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const result = await runVerbooAgent(
+    {
+      prompt: 'leia os arquivos',
+      cwd: base,
+      executor: 'opencode',
+      mode: 'read_only',
+      model: 'deepseek-v4-flash',
+      timeout_seconds: 30,
+    },
+    {
+      availableModels: MODELS,
+      env: {
+        ...process.env,
+        VERBOO_AGENT_ALLOWED_ROOTS: base,
+        VERBOO_API_KEY: 'test-key',
+      },
+      spawnImpl,
+    },
+  );
+
+  assert.equal(result.status, 'success');
+  assert.equal(result.result, 'Leitura OpenCode concluída.');
+  assert.equal(result.session_id, 'session_a');
+  assert.deepEqual(result.tools_used, ['Read']);
+  assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'src/a.js')]);
+});
+
+test('parser nativo limpa tool pendente após tool_result', () => {
+  const events = [];
+  for (let i = 0; i < 5_000; i += 1) {
+    events.push(
+      {
+        type: 'assistant',
+        message: { content: [{
+          type: 'tool_use',
+          id: `read_${i}`,
+          name: 'Read',
+          input: { file_path: '/repo/src/a.js' },
+        }] },
+      },
+      {
+        type: 'user',
+        message: { content: [{
+          type: 'tool_result',
+          tool_use_id: `read_${i}`,
+        }] },
+      },
+    );
+  }
+  const parsed = parseVerbooCodeEvents(events.map(JSON.stringify).join('\n'), '/repo');
+  assert.deepEqual(parsed.successfulTools, ['Read']);
+  assert.deepEqual(parsed.artifacts, ['/repo/src/a.js']);
+});
+
+test('parser nativo limita coleção de tools pendentes', () => {
+  const raw = Array.from({ length: 4_097 }, (_, index) => JSON.stringify({
+    type: 'assistant',
+    message: { content: [{
+      type: 'tool_use',
+      id: `read_${index}`,
+      name: 'Read',
+      input: { file_path: '/repo/src/a.js' },
+    }] },
+  })).join('\n');
+  assert.throws(
+    () => parseVerbooCodeEvents(raw, '/repo'),
+    (error) => error.code === 'OUTPUT_LIMIT',
+  );
+});
+
+test('parser limita quantidade de fragmentos de texto público', () => {
+  const raw = Array.from({ length: 4_097 }, () => JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'text', text: 'x' }] },
+  })).join('\n');
+  assert.throws(
+    () => parseVerbooCodeEvents(raw, '/repo'),
+    (error) => error.code === 'OUTPUT_LIMIT',
+  );
+});
+
+test('linha JSONL individual excessiva falha bounded com OUTPUT_LIMIT', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-bigline-'));
+  const signals = [];
+  let child;
+  const spawnImpl = () => {
+    child = new EventEmitter();
+    child.pid = 61234;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.write(JSON.stringify({
+        type: 'assistant',
+        session_id: 'big_line',
+        message: { content: [{ type: 'text', text: 'x'.repeat(2 * 1024 * 1024) }] },
+      }));
+    });
+    return child;
+  };
+  const killImpl = (pid, signal) => {
+    signals.push([pid, signal]);
+    if (signal === 'SIGTERM') setImmediate(() => child.emit('close', null));
+  };
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'audite',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'deepseek-v4-flash',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          ...process.env,
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+        },
+        spawnImpl,
+        killImpl,
+        killGraceMs: 5,
+      },
+    ),
+    (error) => error.code === 'OUTPUT_LIMIT',
+  );
+  assert.ok(signals.some(([pid, signal]) => signal === 'SIGTERM' && pid === -61234));
+});
+
+test('último evento sem newline rejeita se exceder texto público acumulado', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-final-line-limit-'));
+  const signals = [];
+  const piece = 'x'.repeat(512 * 1024);
+  const completeLines = Array.from({ length: 8 }, () => JSON.stringify({
+    type: 'assistant',
+    session_id: 'final_line',
+    message: { content: [{ type: 'text', text: piece }] },
+  }));
+  const finalLine = JSON.stringify({
+    type: 'assistant',
+    session_id: 'final_line',
+    message: { content: [{ type: 'text', text: 'y' }] },
+  });
+  let child;
+  const spawnImpl = () => {
+    child = new EventEmitter();
+    child.pid = 61235;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.end(`${completeLines.join('\n')}\n${finalLine}`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+  const killImpl = (pid, signal) => {
+    signals.push([pid, signal]);
+  };
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'audite',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'deepseek-v4-flash',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          ...process.env,
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+        },
+        spawnImpl,
+        killImpl,
+        killGraceMs: 5,
+      },
+    ),
+    (error) => error.code === 'OUTPUT_LIMIT',
+  );
+  assert.ok(signals.some(([pid, signal]) => signal === 'SIGTERM' && pid === -61235));
 });

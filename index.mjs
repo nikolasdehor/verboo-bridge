@@ -638,6 +638,10 @@ const jobQueue = new JobQueue({
     ? MAX_CONCURRENCY_USER : 4,
 });
 
+if (process.platform === 'win32' && process.env.VERBOO_JOB_PERSIST_RESULTS === '1') {
+  log('warn', 'Persistência de resultados de jobs desabilitada no Windows.');
+}
+
 // Wire runner — runnerData contém agentArgs reais, nunca persistidos
 // Usa waitForAgentSlot para que jobs assíncronos aguardem o slot global
 // em vez de falhar com AGENT_BUSY quando chamadas síncronas ocuparem.
@@ -656,6 +660,7 @@ jobQueue.setRunner(async (job, signal, runnerData) => {
 let storeReady = true;
 if (
   process.env.VERBOO_JOB_PERSIST_RESULTS === '1'
+  && process.platform !== 'win32'
   && !process.env.VERBOO_JOB_STORE_DIR
 ) {
   log('error', 'VERBOO_JOB_PERSIST_RESULTS=1 exige VERBOO_JOB_STORE_DIR.');
@@ -1313,18 +1318,63 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
   throw new Error(`Resource desconhecido: ${req.params.uri}`);
 });
 
-// ── Start ───────────────────────────────────────────────────────────────
+// ── Start / Shutdown ───────────────────────────────────────────────────
+
+let shutdownPromise = null;
+function shutdown(reason) {
+  if (shutdownPromise) return shutdownPromise;
+  shutdownPromise = Promise.resolve().then(async () => {
+    log('info', `Encerrando bridge (${reason}).`);
+    const results = await Promise.allSettled([
+      jobQueue.shutdown(),
+      server.close(),
+    ]);
+    let failure = null;
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        log('error', `Falha durante shutdown: ${result.reason?.message ?? result.reason}`);
+        process.exitCode = 1;
+        failure ??= result.reason instanceof Error
+          ? result.reason
+          : new Error('Falha durante shutdown.');
+      }
+      if (index === 0 && result.status === 'fulfilled' && result.value?.timed_out) {
+        log('error', 'Shutdown da fila excedeu o tempo limite.');
+        process.exitCode = 1;
+        failure ??= Object.assign(
+          new Error('Shutdown da fila excedeu o tempo limite.'),
+          { code: 'SHUTDOWN_TIMEOUT' },
+        );
+      }
+    });
+    process.stdin.destroy();
+    if (failure) throw failure;
+  }).catch((err) => {
+    process.exitCode = 1;
+    process.stdin.destroy();
+    throw err;
+  });
+  return shutdownPromise;
+}
+
+const onSignal = (signal) => { void shutdown(signal).catch(() => {}); };
+process.on('SIGTERM', onSignal);
+process.on('SIGINT', onSignal);
+process.stdin.once('end', () => { void shutdown('stdin_eof').catch(() => {}); });
+server.onclose = () => { void shutdown('server_close').catch(() => {}); };
 
 if (!storeReady) {
   console.error('FATAL: Job store configurado mas nao inicializou. Abortando.');
-  process.exit(1);
-}
-
-try {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  log('info', `verboo-bridge ready | ${Object.keys(MODELS).length} models | ${BASE_URL}`);
-} catch (err) {
-  console.error('FATAL:', err.message);
-  process.exit(1);
+  process.exitCode = 1;
+  await shutdown('store_init_failed');
+} else {
+  try {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    log('info', `verboo-bridge ready | ${Object.keys(MODELS).length} models | ${BASE_URL}`);
+  } catch (err) {
+    console.error('FATAL:', err.message);
+    process.exitCode = 1;
+    await shutdown('server_start_failed');
+  }
 }
