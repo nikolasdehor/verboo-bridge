@@ -2030,33 +2030,43 @@ function successfulAgentResult({
     && parsed.successfulTools.some((tool) => (
       ['apply_patch', 'edit', 'write'].includes(tool.toLowerCase())
     ));
+  let summary = `Agente Verboo concluiu a tarefa em modo ${request.mode}.`;
+  if (status === 'warning') {
+    summary = 'O agente encerrou sem executar ferramenta de edição; nenhuma mudança foi confirmada.';
+    if (warningReason === 'timeout_partial') {
+      summary = 'O agente não concluiu antes do timeout; há resultado parcial para revisão. Nenhuma mudança foi confirmada.';
+      if (hasConfirmedWrite) {
+        summary = 'O agente não concluiu antes do timeout; há resultado parcial para revisão e uma alteração foi confirmada.';
+      }
+    } else if (warningReason === 'forbidden_tools_rejected') {
+      summary = 'O agente solicitou ferramentas proibidas, mas elas foram negadas pela política.';
+      if (request.mode === 'write') {
+        summary = 'As ferramentas proibidas solicitadas foram negadas; nenhuma mudança foi confirmada.';
+      }
+      if (hasConfirmedWrite) {
+        summary = 'As ferramentas proibidas solicitadas foram negadas; uma alteração foi confirmada. Revise os artefatos.';
+      }
+    }
+  }
+  let nextActions = [
+    'Revise a análise e delegue escrita somente se a mudança estiver autorizada.',
+  ];
+  if (status === 'warning') {
+    nextActions = [
+      'Não trate a tarefa como concluída.',
+      'Revise a instrução ou escolha manualmente outro modelo.',
+    ];
+  } else if (request.mode === 'write') {
+    nextActions = [
+      'Revise o diff e os artefatos no orquestrador.',
+      'Rode as validações do projeto no orquestrador antes de commit ou deploy.',
+    ];
+  }
   return {
     status,
-    summary: status === 'warning'
-      ? warningReason === 'timeout_partial'
-        ? hasConfirmedWrite
-          ? 'O agente não concluiu antes do timeout; há resultado parcial para revisão e uma alteração foi confirmada.'
-          : 'O agente não concluiu antes do timeout; há resultado parcial para revisão. Nenhuma mudança foi confirmada.'
-        : warningReason === 'forbidden_tools_rejected'
-        ? hasConfirmedWrite
-          ? 'As ferramentas proibidas solicitadas foram negadas; uma alteração foi confirmada. Revise os artefatos.'
-          : request.mode === 'write'
-            ? 'As ferramentas proibidas solicitadas foram negadas; nenhuma mudança foi confirmada.'
-            : 'O agente solicitou ferramentas proibidas, mas elas foram negadas pela política.'
-        : 'O agente encerrou sem executar ferramenta de edição; nenhuma mudança foi confirmada.'
-      : `Agente Verboo concluiu a tarefa em modo ${request.mode}.`,
+    summary,
     result: result || 'Execução concluída sem mensagem final.',
-    next_actions: status === 'warning'
-      ? [
-          'Não trate a tarefa como concluída.',
-          'Revise a instrução ou escolha manualmente outro modelo.',
-        ]
-      : request.mode === 'write'
-      ? [
-          'Revise o diff e os artefatos no orquestrador.',
-          'Rode as validações do projeto no orquestrador antes de commit ou deploy.',
-        ]
-      : ['Revise a análise e delegue escrita somente se a mudança estiver autorizada.'],
+    next_actions: nextActions,
     artifacts: parsed.artifacts,
     tools_used: parsed.toolsUsed,
     ...(warningReason === 'timeout_partial'
@@ -2154,7 +2164,11 @@ async function runRoutedAgent(request, executor, options) {
         remainingSeconds,
       );
       attempts.push({ model, status });
-      markModelFinished(model, null, options.env);
+      markModelFinished(
+        model,
+        warningReason === 'timeout_partial' ? { code: 'TIMEOUT' } : null,
+        options.env,
+      );
       return successfulAgentResult({
         request,
         executor,

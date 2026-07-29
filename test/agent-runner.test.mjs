@@ -5,6 +5,7 @@ import {
   chmod,
   mkdtemp,
   mkdir,
+  readFile,
   realpath,
   symlink,
   writeFile,
@@ -666,6 +667,8 @@ test('runVerbooAgent seleciona executor nativo e retorna contrato E2E', async ()
   await writeFile(
     fakeVerboo,
     `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+writeFileSync('status.txt', 'updated');
 process.stdout.write(JSON.stringify({
   type: 'system',
   subtype: 'init',
@@ -729,6 +732,7 @@ process.stdout.write(JSON.stringify({
   assert.equal(result.session_id, 'native_run');
   assert.deepEqual(result.tools_used, ['Edit']);
   assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'status.txt')]);
+  assert.equal(await readFile(path.join(base, 'status.txt'), 'utf8'), 'updated');
 });
 
 test('issue #14 / PR #17: Edit real e Bash negada preservam contrato para revisão', async () => {
@@ -4726,6 +4730,82 @@ test('timeout nativo com Read e texto seguro retorna apenas fallback factual', a
   assert.ok(!result.result.includes('vazamento incompleto'));
 });
 
+test('timeout parcial preserva cooldown do modelo para a próxima rota auto', async () => {
+  resetModelRuntimeState();
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-cooldown-'));
+  const prompt = 'Faça uma auditoria de segurança complexa da arquitetura.';
+  const availableModels = ['glm-5.2', 'deepseek-v4-flash'];
+  const env = {
+    ...process.env,
+    VERBOO_AGENT_ALLOWED_ROOTS: base,
+    VERBOO_MODEL_COOLDOWN_SECONDS: '3600',
+  };
+
+  const partial = await runVerbooAgent(
+    {
+      prompt,
+      cwd: base,
+      executor: 'native',
+      mode: 'read_only',
+      model: 'glm-5.2',
+      timeout_seconds: 10,
+    },
+    {
+      availableModels,
+      env,
+      spawnImpl: spawnNativeTimeoutFixture([
+        { type: 'assistant', session_id: 'timeout_cooldown', message: { content: [
+          { type: 'tool_use', id: 'read_1', name: 'Read', input: { file_path: 'README.md' } },
+        ] } },
+        { type: 'user', session_id: 'timeout_cooldown', message: { content: [
+          { type: 'tool_result', tool_use_id: 'read_1', content: 'ok' },
+        ] } },
+      ]),
+      timeoutMs: 20,
+      killGraceMs: 0,
+      platform: 'linux',
+    },
+  );
+  assert.equal(partial.status, 'warning');
+  assert.deepEqual(partial.warnings.map(({ code }) => code), ['TIMEOUT']);
+
+  let routedModel;
+  const spawnImpl = (_command, args) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    routedModel = args[args.indexOf('--model') + 1];
+    setImmediate(() => {
+      child.stdout.end(`${JSON.stringify({
+        type: 'result',
+        session_id: 'after_timeout',
+        result: 'Concluído.',
+      })}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+  const next = await runVerbooAgent(
+    {
+      prompt,
+      cwd: base,
+      executor: 'native',
+      mode: 'read_only',
+      model: 'auto',
+      timeout_seconds: 10,
+    },
+    { availableModels, env, spawnImpl },
+  );
+
+  assert.equal(routedModel, 'deepseek-v4-flash');
+  assert.equal(next.model, 'deepseek-v4-flash');
+  assert.ok(next.routing.ranking
+    .find(({ model }) => model === 'glm-5.2')
+    .penalties.some((penalty) => penalty.includes('cooldown')));
+});
+
 test('timeout nativo ignora session_id e artefato inexistente controlados pelo stream', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-untrusted-fields-'));
   const sessionSecret = 'session-secret-REDACT-ME';
@@ -4905,17 +4985,17 @@ test('timeout nativo sem conteúdo material continua rejeitando TIMEOUT', async 
   );
 });
 
-const TIMEOUT_SECRET_CASES = [
+const TIMEOUT_REDACTION_CASES = [
   ['sk-live', 'sk-live-REDACT-ME-123456'],
   ['sk-live multilinha', 'sk-live-\nREDACT-ME-123456'],
   ['Bearer multilinha', 'Authorization: Bearer\nZXlKaGJHY2lPaJIUzI1NiJ9'],
   ['TOKEN', 'TOKEN=nao-expor-123456'],
-  ['api_key', 'api_key: nao-expor-123456'],
+  ['api_key', 'marcador-api-key-sem-credencial'],
   ['password', 'password=nao-expor-123456'],
 ];
 
-for (const [label, secret] of TIMEOUT_SECRET_CASES) {
-  test(`timeout nativo com apenas credencial ${label} continua TIMEOUT`, async () => {
+for (const [label, secret] of TIMEOUT_REDACTION_CASES) {
+  test(`timeout nativo com apenas conteúdo ${label} continua TIMEOUT`, async () => {
     const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-secret-only-'));
 
     await assert.rejects(
@@ -4950,8 +5030,8 @@ for (const [label, secret] of TIMEOUT_SECRET_CASES) {
   });
 }
 
-for (const [label, secret] of TIMEOUT_SECRET_CASES) {
-  test(`timeout nativo com Read e credencial ${label} usa apenas fallback factual`, async () => {
+for (const [label, secret] of TIMEOUT_REDACTION_CASES) {
+  test(`timeout nativo com Read e conteúdo ${label} usa apenas fallback factual`, async () => {
     const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-secret-mixed-'));
     const freeText = `Diagnóstico do modelo. ${secret}`;
 

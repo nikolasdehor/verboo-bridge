@@ -1116,8 +1116,11 @@ test('JobQueue: rejeicao inesperada em listener nao causa unhandled rejection', 
   assert.equal(unhandled.length, 0, 'nenhuma unhandled rejection');
 });
 
-test('JobQueue: warning timeout_partial terminaliza com resultado público', async () => {
-  const q = new JobQueue({ concurrency: 1 });
+test('JobQueue: warning timeout_partial persiste e recupera resultado público', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-timeout-warning-'));
+  const { readFile, rm } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1, persistResults: true, platform: 'linux' });
+  await q.initStore(dir);
   q.setRunner(async () => ({
     ...fakeResult({ output: 'Diagnóstico parcial sanitizado.' }),
     status: 'warning',
@@ -1126,12 +1129,13 @@ test('JobQueue: warning timeout_partial terminaliza com resultado público', asy
     warnings: [{ code: 'TIMEOUT', message: 'Tempo esgotado após progresso material.' }],
   }));
 
-  const { job_id } = q.enqueue({
+  const { job_id } = await q.enqueuePersisted({
     model: 'deepseek-v4-flash',
     executor: 'native',
     runnerData: { prompt: 'revise' },
   });
   await new Promise((resolve) => q.once('completed', resolve));
+  await q.waitForPersistence(job_id);
 
   const terminal = q.getJobResult(job_id);
   assert.equal(terminal.status, 'warning');
@@ -1143,7 +1147,29 @@ test('JobQueue: warning timeout_partial terminaliza com resultado público', asy
   }]);
   assert.equal(terminal.model, 'deepseek-v4-flash');
   assert.equal(terminal.executor, 'native');
+
+  const stored = JSON.parse(
+    await readFile(path.join(dir, `${job_id}.json`), 'utf8'),
+  );
+  assert.deepEqual(stored.result.warnings, [{ code: 'TIMEOUT' }]);
+
+  const recovered = new JobQueue({
+    concurrency: 1,
+    persistResults: true,
+    platform: 'linux',
+  });
+  await recovered.initStore(dir);
+  const restored = recovered.getJobResult(job_id);
+  assert.equal(restored.status, 'warning');
+  assert.ok(restored.result, 'warning recuperado não pode perder o resultado');
+  assert.equal(restored.result.output, 'Diagnóstico parcial sanitizado.');
+  assert.deepEqual(restored.result.warnings, [{ code: 'TIMEOUT' }]);
+  assert.equal(restored.model, 'deepseek-v4-flash');
+  assert.equal(restored.executor, 'native');
+
   q.dispose();
+  recovered.dispose();
+  await rm(dir, { recursive: true, force: true });
 });
 
 test('JobQueue: persistencia opt-in sanitiza artifacts absolutos', async () => {
