@@ -183,6 +183,10 @@ são expandidos dentro de JSON ou TOML.
 | Cursor IDE e CLI | `~/.cursor/mcp.json` ou `.cursor/mcp.json` | **Available Tools** ou `cursor-agent mcp list-tools verboo-bridge` |
 | OpenCode | `opencode.json` | `opencode mcp list` |
 
+Esses clientes iniciam o servidor local por `stdio`. Apps web ou mobile que
+não conseguem executar um processo local exigem o transporte HTTP/stateless
+planejado no P2; essa superfície remota ainda não está implementada.
+
 ### Codex App, CLI e extensão IDE
 
 O App, a CLI e a extensão compartilham a mesma configuração. Adicione a
@@ -232,7 +236,10 @@ O Codex controla a aprovação da chamada MCP. Para automação não interativa 
 [mcp_servers.verboo-bridge.tools.verboo_route]
 approval_mode = "approve"
 
-[mcp_servers.verboo-bridge.tools.verboo_agent]
+[mcp_servers.verboo-bridge.tools.verboo_agent_start]
+approval_mode = "approve"
+
+[mcp_servers.verboo-bridge.tools.verboo_job]
 approval_mode = "approve"
 ```
 
@@ -342,15 +349,17 @@ Adicione o servidor local ao `opencode.json`:
         "VERBOO_CODE_BIN": "/caminho/absoluto/para/verboo"
       },
       "enabled": true,
-      "timeout": 60000
+      "timeout": 1800000
     }
   }
 }
 ```
 
-Valide com `opencode mcp list`. O OpenCode prefixa as ferramentas com o nome do
-servidor; no prompt, peça explicitamente para usar o MCP `verboo-bridge`. Veja a
-[documentação oficial do OpenCode](https://opencode.ai/docs/mcp-servers).
+O timeout do OpenCode é expresso em milissegundos; `1800000` acompanha o teto de
+30 minutos do job assíncrono. Valide com `opencode mcp list`. O OpenCode prefixa
+as ferramentas com o nome do servidor; no prompt, peça explicitamente para usar
+o MCP `verboo-bridge`. Veja a [documentação oficial do
+OpenCode](https://opencode.ai/docs/mcp-servers).
 
 O provedor direto abaixo só é necessário para usar `executor: "opencode"` como
 fallback, em vez do executor nativo:

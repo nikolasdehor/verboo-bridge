@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFile } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { accessSync, constants, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -380,13 +380,14 @@ function runVerifyCommand(command, cwd, env, timeoutMs) {
     const startedAt = Date.now();
     let child;
     try {
-      child = execFile(command.bin, command.execArgs, {
+      child = spawn(command.bin, command.execArgs, {
         cwd,
         shell: false,
         env,
         windowsHide: true,
         detached: process.platform !== 'win32',
-      }, () => {});
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
     } catch {
       resolve({
         ...emptyVerifyResult(),
@@ -529,8 +530,8 @@ async function runVerbooValidate(args) {
         break;
       }
     }
-    const anyFailure = results.some(
-      (result) => Boolean(result.error) || result.timed_out || result.exit_code !== 0,
+    const anyFailure = stoppedEarly || results.some(
+      (r) => Boolean(r.error) || r.timed_out || r.exit_code !== 0,
     );
     return {
       status: anyFailure ? 'failed' : 'ok',
@@ -606,72 +607,80 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const codec = { type: 'object', properties: { prompt: { type: 'string' }, system: { type: 'string' }, temperature: { type: 'number', default: 0.3 }, max_tokens: { type: 'number', default: 65536 } }, required: ['prompt'] };
   const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
-  const defaultDirectModel = allowedModels.includes('deepseek-v4-flash')
-    ? 'deepseek-v4-flash'
-    : allowedModels[0];
 
-  const tools = [
-    ...Object.entries(MODELS)
-      .filter(([id]) => allowedModels.includes(id))
-      .map(([id, info]) => ({
-      name: `verboo_${id.replace(/[.-]/g, '_')}`,
-      description: `${info.name} — ${info.note}. ${(info.ctx / 1024).toFixed(0)}K ctx, ${info.out} max output. Plano: ${info.tier}.`,
-      inputSchema: { ...codec, properties: { ...codec.properties, max_tokens: { type: 'number', description: `Max tokens (max ${info.out})`, default: Math.min(info.out, 8192) } } },
-      })),
-    {
-      name: 'verboo_code',
-      description: 'Executa tarefa de codificação com um modelo permitido pela política administrativa.',
-      inputSchema: { ...codec, properties: { ...codec.properties, model: { type: 'string', enum: allowedModels, default: defaultDirectModel } } },
-    },
-    {
-      name: 'verboo_review',
-      description: 'Revisa codigo buscando bugs, vulnerabilidades e problemas de performance',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          code: { type: 'string', description: 'Codigo a ser revisado' },
-          context: { type: 'string', description: 'Contexto adicional (ex: linguagem, framework)' },
-          model: { type: 'string', enum: allowedModels, default: defaultDirectModel },
-          temperature: { type: 'number', default: 0.2 },
-        },
-        required: ['code'],
+  const tools = [];
+
+  if (allowedModels.length > 0) {
+    const defaultDirectModel = allowedModels.includes('deepseek-v4-flash')
+      ? 'deepseek-v4-flash'
+      : allowedModels[0];
+
+    tools.push(
+      ...Object.entries(MODELS)
+        .filter(([id]) => allowedModels.includes(id))
+        .map(([id, info]) => ({
+        name: `verboo_${id.replace(/[.-]/g, '_')}`,
+        description: `${info.name} — ${info.note}. ${(info.ctx / 1024).toFixed(0)}K ctx, ${info.out} max output. Plano: ${info.tier}.`,
+        inputSchema: { ...codec, properties: { ...codec.properties, max_tokens: { type: 'number', description: `Max tokens (max ${info.out})`, default: Math.min(info.out, 8192) } } },
+        })),
+      {
+        name: 'verboo_code',
+        description: 'Executa tarefa de codificação com um modelo permitido pela política administrativa.',
+        inputSchema: { ...codec, properties: { ...codec.properties, model: { type: 'string', enum: allowedModels, default: defaultDirectModel } } },
       },
-    },
-    {
-      name: 'verboo_route',
-      description: 'Classifica uma tarefa e explica o ranking dos modelos Verboo sem executar nenhum agente.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          prompt: {
-            type: 'string',
-            description: 'Tarefa que será classificada',
+      {
+        name: 'verboo_review',
+        description: 'Revisa codigo buscando bugs, vulnerabilidades e problemas de performance',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            code: { type: 'string', description: 'Codigo a ser revisado' },
+            context: { type: 'string', description: 'Contexto adicional (ex: linguagem, framework)' },
+            model: { type: 'string', enum: allowedModels, default: defaultDirectModel },
+            temperature: { type: 'number', default: 0.2 },
           },
-          mode: {
-            type: 'string',
-            enum: ['read_only', 'write'],
-            default: 'read_only',
-          },
-          tiers: {
-            type: 'array',
-            items: { type: 'string', enum: ['pro', 'max', 'ultra'] },
-            default: ['pro', 'max', 'ultra'],
-          },
-          exclude_models: {
-            type: 'array',
-            items: { type: 'string', enum: allowedModels },
-            default: [],
-          },
-          executor: {
-            type: 'string',
-            enum: AGENT_EXECUTORS,
-            default: DEFAULT_AGENT_EXECUTOR,
-            description: 'Aplica à prévia a mesma disponibilidade de modelos do executor que executará a tarefa',
-          },
+          required: ['code'],
         },
-        required: ['prompt'],
       },
-    },
+      {
+        name: 'verboo_route',
+        description: 'Classifica uma tarefa e explica o ranking dos modelos Verboo sem executar nenhum agente.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            prompt: {
+              type: 'string',
+              description: 'Tarefa que será classificada',
+            },
+            mode: {
+              type: 'string',
+              enum: ['read_only', 'write'],
+              default: 'read_only',
+            },
+            tiers: {
+              type: 'array',
+              items: { type: 'string', enum: ['pro', 'max', 'ultra'] },
+              default: ['pro', 'max', 'ultra'],
+            },
+            exclude_models: {
+              type: 'array',
+              items: { type: 'string', enum: allowedModels },
+              default: [],
+            },
+            executor: {
+              type: 'string',
+              enum: AGENT_EXECUTORS,
+              default: DEFAULT_AGENT_EXECUTOR,
+              description: 'Aplica à prévia a mesma disponibilidade de modelos do executor que executará a tarefa',
+            },
+          },
+          required: ['prompt'],
+        },
+      },
+    );
+  }
+
+  tools.push(
     {
       name: 'verboo_agent',
       description: 'Executa um subagente Verboo repo-aware de forma síncrona e bloqueia até concluir; use apenas para tarefa curta. Para App/IDE ou tarefa não trivial, longa, paralela ou de duração incerta, use verboo_agent_start. Nunca chame a CLI diretamente. model=auto classifica a tarefa e tenta fallback recuperável. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1. O orquestrador executa testes e outros comandos.',
@@ -800,7 +809,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         required: ['cwd', 'commands'],
       },
     },
-  ];
+  );
 
   return { tools };
 });
@@ -994,6 +1003,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     } else if (name === 'verboo_code') {
       const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
+      if (allowedModels.length === 0) {
+        throw Object.assign(new Error('MODEL_POLICY_EMPTY: política de modelos vazia — nenhum modelo disponível.'), { code: 'MODEL_POLICY_EMPTY' });
+      }
       model = args.model ?? (
         allowedModels.includes('deepseek-v4-flash')
           ? 'deepseek-v4-flash'
@@ -1004,6 +1016,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       messages.push({ role: 'user', content: args.prompt });
     } else if (name === 'verboo_review') {
       const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
+      if (allowedModels.length === 0) {
+        throw Object.assign(new Error('MODEL_POLICY_EMPTY: política de modelos vazia — nenhum modelo disponível.'), { code: 'MODEL_POLICY_EMPTY' });
+      }
       model = args.model ?? (
         allowedModels.includes('deepseek-v4-flash')
           ? 'deepseek-v4-flash'
@@ -1097,6 +1112,9 @@ server.setRequestHandler(GetPromptRequestSchema, async (req) => {
   if (!prompt) throw new Error(`Prompt desconhecido: ${req.params.name}`);
 
   const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
+  if (allowedModels.length === 0) {
+    throw Object.assign(new Error('MODEL_POLICY_EMPTY: política de modelos vazia — nenhum modelo disponível.'), { code: 'MODEL_POLICY_EMPTY' });
+  }
   const modelo = req.params.arguments?.modelo || (
     allowedModels.includes('deepseek-v4-flash')
       ? 'deepseek-v4-flash'
@@ -1156,6 +1174,15 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
 server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
   if (req.params.uri === 'verboo://models') {
     const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
+    if (allowedModels.length === 0) {
+      return {
+        contents: [{
+          uri: 'verboo://models',
+          mimeType: 'application/json',
+          text: JSON.stringify({ error: 'MODEL_POLICY_EMPTY', message: 'Política de modelos vazia — nenhum modelo disponível.' }, null, 2),
+        }],
+      };
+    }
     return {
       contents: [{
         uri: 'verboo://models',

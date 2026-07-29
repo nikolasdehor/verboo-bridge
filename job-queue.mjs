@@ -30,7 +30,7 @@ const TERMINAL_STATUSES = new Set([
 ]);
 
 const PROGRESS_PHASES = new Set([
-  'queued', 'routing', 'generating', 'executing_tool', 'processing_result', 'idle',
+  'queued', 'routing', 'generating', 'executing_tool', 'processing_result', 'waiting_model', 'idle',
 ]);
 const HEARTBEAT_MS = 5000;
 const PROGRESS_SUMMARY_MAX = 200;
@@ -131,7 +131,11 @@ function safeTerminalResult(result) {
     summary: typeof result.summary === 'string' ? result.summary : '',
     output: typeof result.output === 'string' ? result.output : '',
     next_actions: safeStringList(result.next_actions),
-    artifacts: safeStringList(result.artifacts),
+    artifacts: safeStringList(result.artifacts).map(
+      // Paths absolutos vazam estrutura do repositório —
+      // reduz ao filename para manter privacidade.
+      (a) => path.isAbsolute(a) ? path.basename(a) : a
+    ),
     tools_used: safeStringList(result.tools_used),
     session_id: typeof result.session_id === 'string' ? result.session_id : null,
     memory,
@@ -522,7 +526,7 @@ export class JobQueue extends EventEmitter {
           // completed até o rename atômico confirmar o estado terminal.
           await this.#persistJob(completed);
         } catch {
-          if (this.#storeDir && this.#persistResults) {
+          if (this.#storeDir && this.#persistResults && job.status !== 'cancelled') {
             Object.assign(completed, {
               status: 'failed',
               result: null,
@@ -538,10 +542,33 @@ export class JobQueue extends EventEmitter {
         }
 
         // cancel() pode vencer a corrida enquanto o resultado era persistido.
-        if (job.status === 'cancelled') return;
+        if (job.status === 'cancelled') {
+          if (!this.#disposed) this.#drain();
+          return;
+        }
         Object.assign(job, completed);
         this.#clearProgress(jobId);
-        this.emit('completed', jobId);
+        try { this.emit('completed', jobId); } catch { /* listener error — job ainda completou */ }
+        if (!this.#disposed) this.#drain();
+      }).catch((err) => {
+        // Rejeição inesperada do handler/listener: limpa running, progresso, heartbeat,
+        // marca como failed, drena a fila — sem unhandled rejection.
+        this.#running.delete(jobId);
+        this.#stopHeartbeat(jobId);
+        this.#clearProgress(jobId);
+        this.#runnerData.delete(jobId);
+        const safeJob = this.#jobs.get(jobId);
+        if (safeJob && !TERMINAL_STATUSES.has(safeJob.status)) {
+          safeJob.status = 'failed';
+          safeJob.updated_at = nowISO();
+          safeJob.finished_at = nowISO();
+          safeJob.error = {
+            code: err?.code ?? 'EXECUTION_FAILED',
+            message: err?.message ?? 'Erro inesperado na execução do job.',
+          };
+          this.#persistJob(safeJob).catch(() => {});
+        }
+        try { this.emit('completed', jobId); } catch { /* suppress */ }
         if (!this.#disposed) this.#drain();
       });
     }
@@ -711,6 +738,7 @@ export class JobQueue extends EventEmitter {
       queue_position: opts.queuePosition ?? null,
       attempts: { current: 0, total: opts.totalAttempts ?? 1 },
       model: opts.model ?? null,
+      allowed_tools: null,
       tool_counts: createToolCounts(),
       progress_summary: 'Aguardando na fila.',
       _started_at: now,
@@ -726,6 +754,7 @@ export class JobQueue extends EventEmitter {
     if (update.model !== undefined) p.model = update.model;
     if (update.attempts !== undefined) Object.assign(p.attempts, update.attempts);
     if (update.tool_counts !== undefined) mergeToolCounts(p.tool_counts, update.tool_counts);
+    if (update.allowed_tools !== undefined) p.allowed_tools = update.allowed_tools;
     if (update.queue_position !== undefined) p.queue_position = update.queue_position;
     p.updated_at = new Date(now).toISOString();
     p.last_activity_at = p.updated_at;
@@ -744,7 +773,10 @@ export class JobQueue extends EventEmitter {
       const idleMs = now - new Date(p.last_activity_at).getTime();
       if (idleMs >= this.#heartbeatMs) {
         p.idle_for_ms = idleMs;
-        p.phase = 'idle';
+        // waiting_model não transiciona para idle — aguarda primeira tool_use
+        if (p.phase !== 'waiting_model') {
+          p.phase = 'idle';
+        }
         p.progress_summary = generateSummary(p);
       }
     }
@@ -788,6 +820,7 @@ export class JobQueue extends EventEmitter {
       idle_for_ms: p.idle_for_ms,
       queue_position: this.#queuePosition(jobId),
       attempts: p.attempts,
+      allowed_tools: p.allowed_tools,
       tool_counts: p.tool_counts,
       progress_summary: p.progress_summary,
       ...(p.model ? { model: p.model } : {}),

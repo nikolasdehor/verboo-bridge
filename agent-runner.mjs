@@ -488,15 +488,29 @@ function nativePermissionSettings(request) {
   });
 }
 
+export function allowedToolsForMode(mode, executor = 'native') {
+  const write = mode === 'write';
+  if (executor === 'opencode') {
+    return write ? ['Read', 'Glob', 'List', 'Edit'] : ['Read', 'Glob', 'List'];
+  }
+  return write ? ['Read', 'Glob', 'Grep', 'Edit', 'Write'] : ['Read', 'Glob', 'Grep'];
+}
+
 export function buildVerbooCodeInvocation(
   request,
   verbooCodeBin = 'verboo',
   entrypoint = '',
 ) {
-  const write = request.mode === 'write';
-  const tools = write
-    ? 'Read,Glob,Grep,Edit,Write'
-    : 'Read,Glob,Grep';
+  const allowedTools = allowedToolsForMode(request.mode, 'native');
+  const tools = allowedTools.join(',');
+  const disallowedTools = [
+    'Edit',
+    'Write',
+    'Bash',
+    'WebFetch',
+    'WebSearch',
+    'Task',
+  ].filter((tool) => !allowedTools.includes(tool)).join(',');
   const args = [];
   if (entrypoint) args.push(entrypoint);
   args.push(
@@ -510,6 +524,9 @@ export function buildVerbooCodeInvocation(
     'bypassPermissions',
     '--tools',
     tools,
+    '--disallowed-tools',
+    disallowedTools,
+    '--include-partial-messages',
     '--strict-mcp-config',
     '--disable-slash-commands',
     '--no-chrome',
@@ -543,14 +560,111 @@ export function buildChildEnv(sourceEnv, invocation) {
   return childEnv;
 }
 
-function stripReasoning(text) {
-  return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+function createThinkFilter() {
+  let inThink = false;
+  let thinkBuffer = '';
+
+  const filter = (text) => {
+    if (!text) return '';
+    let result = '';
+    let pos = 0;
+    const input = thinkBuffer + text;
+    thinkBuffer = '';
+
+    while (pos < input.length) {
+      if (inThink) {
+        const closeIdx = input.toLowerCase().indexOf('</think>', pos);
+        if (closeIdx !== -1) {
+          if (
+            closeIdx > 0
+            && input[closeIdx - 1] === '`'
+            && input[closeIdx + 8] === '`'
+          ) {
+            // Literal </think> em backticks — pula sem sair do think
+            pos = closeIdx + 8;
+          } else {
+            inThink = false;
+            pos = closeIdx + 8;
+          }
+        } else {
+          const remaining = input.slice(pos);
+          let partialMatchLength = 0;
+          for (let len = Math.min(remaining.length, 7); len > 0; len--) {
+            if ('</think>'.startsWith(remaining.slice(-len).toLowerCase())) {
+              partialMatchLength = len;
+              break;
+            }
+          }
+          if (partialMatchLength > 0) {
+            thinkBuffer = remaining.slice(-partialMatchLength);
+          }
+          break;
+        }
+      } else {
+        const openIdx = input.toLowerCase().indexOf('<think>', pos);
+        if (openIdx !== -1) {
+          if (
+            openIdx > 0
+            && input[openIdx - 1] === '`'
+            && input[openIdx + 7] === '`'
+          ) {
+            // Literal <think> em backticks — emite e continua
+            result += input.slice(pos, openIdx + 7);
+            pos = openIdx + 7;
+            continue;
+          }
+          result += input.slice(pos, openIdx);
+          inThink = true;
+          pos = openIdx + 7;
+        } else {
+          const remaining = input.slice(pos);
+          let partialMatchLength = 0;
+          for (let len = Math.min(remaining.length, 6); len > 0; len--) {
+            if ('<think>'.startsWith(remaining.slice(-len).toLowerCase())) {
+              partialMatchLength = len;
+              break;
+            }
+          }
+          if (partialMatchLength > 0) {
+            result += remaining.slice(0, remaining.length - partialMatchLength);
+            thinkBuffer = remaining.slice(-partialMatchLength);
+          } else {
+            result += remaining;
+          }
+          break;
+        }
+      }
+    }
+    return result.trim();
+  };
+
+  filter.flush = () => {
+    if (!inThink && thinkBuffer) {
+      const buf = thinkBuffer.trim();
+      thinkBuffer = '';
+      return buf;
+    }
+    thinkBuffer = '';
+    return '';
+  };
+
+  return filter;
+}
+
+function safeContextString(context) {
+  if (context === undefined || context === null) return '';
+  if (typeof context === 'string') return context.slice(0, 200);
+  try {
+    return JSON.stringify(context).slice(0, 200);
+  } catch {
+    return String(context).slice(0, 200);
+  }
 }
 
 function categorizeTool(name) {
   const n = (name ?? '').toLowerCase();
   if (n === 'read') return 'Read';
-  if (n === 'glob' || n === 'search') return 'Glob';
+  if (n === 'glob' || n === 'list' || n === 'search') return 'Glob';
   if (n === 'grep') return 'Grep';
   if (n === 'edit' || n === 'apply_diff' || n === 'apply_patch') return 'Edit';
   if (n === 'write' || n === 'create' || n === 'delete') return 'Write';
@@ -558,9 +672,20 @@ function categorizeTool(name) {
   return 'Other';
 }
 
+function policyToolName(name) {
+  const normalized = String(name ?? '').toLowerCase();
+  if (normalized === 'apply_diff' || normalized === 'apply_patch') return 'edit';
+  return normalized;
+}
+
 export function buildProgressOnLine(
   onProgress,
-  { minIntervalMs = 100, now = Date.now } = {},
+  {
+    minIntervalMs = 100,
+    now = Date.now,
+    mode = 'read_only',
+    executor = 'native',
+  } = {},
 ) {
   const categories = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', 'Other'];
   const counts = Object.fromEntries(
@@ -569,12 +694,17 @@ export function buildProgressOnLine(
       { total: 0, succeeded: 0, failed: 0 },
     ]),
   );
+  const allowedTools = allowedToolsForMode(mode, executor);
   const pendingTools = new Map();
   const completedTools = new Set();
+  const anonymousActiveKeys = new Map();
+  const anonymousActiveKeysByFullKey = new Map();
+  const anonymousCounts = new Map();
   let lastEmitAt = Number.NEGATIVE_INFINITY;
   let pending = false;
   let closed = false;
-  let anonymousId = 0;
+  let phase = 'waiting_model';
+  let hasSeenToolUse = false;
 
   const emit = () => {
     if (!pending || closed) return;
@@ -595,7 +725,8 @@ export function buildProgressOnLine(
       { total: 0, succeeded: 0, failed: 0 },
     );
     onProgress({
-      phase: 'executing_tool',
+      phase,
+      allowed_tools: allowedTools,
       tool_counts: {
         ...toolCounts,
         total,
@@ -603,9 +734,32 @@ export function buildProgressOnLine(
     });
   };
 
-  const startTool = (name, id) => {
-    const key = id ? String(id) : `anonymous:${anonymousId += 1}`;
+  const startTool = (name, id, sessionContext = {}) => {
+    let key;
+    if (id) {
+      key = String(id);
+    } else {
+      const sessionId = String(sessionContext.sessionId ?? 'global');
+      const ctxStr = safeContextString(sessionContext.context);
+      const baseKey = `anon:${sessionId}:${name}:${ctxStr}`;
+      if (anonymousActiveKeys.has(baseKey)) {
+        key = anonymousActiveKeys.get(baseKey);
+      } else {
+        const count = (anonymousCounts.get(baseKey) ?? 0) + 1;
+        anonymousCounts.set(baseKey, count);
+        key = `${baseKey}:${count}`;
+        anonymousActiveKeys.set(baseKey, key);
+        anonymousActiveKeysByFullKey.set(key, baseKey);
+      }
+    }
+
     if (pendingTools.has(key) || completedTools.has(key)) return key;
+    if (!hasSeenToolUse) {
+      hasSeenToolUse = true;
+      phase = 'executing_tool';
+    } else if (phase === 'processing_result') {
+      phase = 'executing_tool';
+    }
     const category = categorizeTool(name);
     pendingTools.set(key, category);
     counts[category].total += 1;
@@ -621,6 +775,12 @@ export function buildProgressOnLine(
     counts[category][failed ? 'failed' : 'succeeded'] += 1;
     pendingTools.delete(key);
     completedTools.add(key);
+    if (anonymousActiveKeysByFullKey.has(key)) {
+      const baseKey = anonymousActiveKeysByFullKey.get(key);
+      anonymousActiveKeys.delete(baseKey);
+      anonymousActiveKeysByFullKey.delete(key);
+    }
+    phase = 'processing_result';
     pending = true;
   };
 
@@ -628,23 +788,39 @@ export function buildProgressOnLine(
     if (closed) return;
     try {
       const event = JSON.parse(line);
+      const sessionID = event.sessionID ?? event.part?.sessionID ?? event.session_id ?? event.sessionId;
+
+      // Partial messages wrap the Anthropic event under `event`.
+      const streamEvent = event.type === 'stream_event' ? event.event : null;
+      if (
+        streamEvent?.type === 'content_block_start'
+        && streamEvent.content_block?.type === 'tool_use'
+      ) {
+        const cb = streamEvent.content_block;
+        startTool(cb.name, cb.id, { sessionId: event.session_id, context: cb.input });
+        if (pending && now() - lastEmitAt >= minIntervalMs) emit();
+        return;
+      }
+
       if (event.type === 'tool_use' && typeof event.part?.tool === 'string') {
         const id = event.part.id
           ?? event.part.callID
           ?? event.part.callId
           ?? event.part.toolCallID;
-        const key = startTool(event.part.tool, id);
+        const context = event.part.state?.input ?? event.part.input;
+        const key = startTool(event.part.tool, id, { sessionId: sessionID, context });
         const status = String(event.part.state?.status ?? '').toLowerCase();
         if (['completed', 'failed', 'error'].includes(status)) {
           finishTool(key, status !== 'completed' || Boolean(event.part.state?.error));
         }
       } else if (event.type === 'content' && event.content_type === 'tool_call' && typeof event.name === 'string') {
-        startTool(event.name, event.id ?? event.call_id ?? event.tool_use_id);
+        const id = event.id ?? event.call_id ?? event.tool_use_id;
+        startTool(event.name, id, { sessionId: sessionID, context: event.input ?? event.arguments });
       }
 
       for (const block of nativeEventBlocks(event)) {
         if (block.type === 'tool_use' && typeof block.name === 'string') {
-          startTool(block.name, block.id);
+          startTool(block.name, block.id, { sessionId: sessionID, context: block.input });
         } else if (block.type === 'tool_result') {
           finishTool(block.tool_use_id, block.is_error === true);
         }
@@ -673,6 +849,7 @@ export function parseOpenCodeEvents(raw, cwd) {
   const artifacts = new Set();
   const toolsUsed = new Set();
   const successfulTools = new Set();
+  const filter = createThinkFilter();
 
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
@@ -685,7 +862,7 @@ export function parseOpenCodeEvents(raw, cwd) {
 
     sessionId ||= event.sessionID ?? event.part?.sessionID ?? null;
     if (event.type === 'text') {
-      const candidate = stripReasoning(event.part?.text ?? '');
+      const candidate = filter(event.part?.text ?? '');
       if (candidate) resultParts.push(candidate);
     }
 
@@ -700,7 +877,17 @@ export function parseOpenCodeEvents(raw, cwd) {
         if (isInside(cwd, candidate)) artifacts.add(candidate);
       }
     }
+    if (
+      event.type === 'content'
+      && event.content_type === 'tool_call'
+      && typeof event.name === 'string'
+    ) {
+      toolsUsed.add(event.name);
+    }
   }
+
+  const remaining = filter.flush();
+  if (remaining) resultParts.push(remaining);
 
   return {
     sessionId,
@@ -723,6 +910,7 @@ export function parseVerbooCodeEvents(raw, cwd) {
   const toolsUsed = new Set();
   const successfulTools = new Set();
   const pendingTools = new Map();
+  const filter = createThinkFilter();
 
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
@@ -735,13 +923,13 @@ export function parseVerbooCodeEvents(raw, cwd) {
 
     sessionId ||= event.session_id ?? event.sessionId ?? null;
     if (event.type === 'result' && typeof event.result === 'string') {
-      const candidate = stripReasoning(event.result);
+      const candidate = filter(event.result);
       if (candidate) resultParts.push(candidate);
     }
 
     for (const block of nativeEventBlocks(event)) {
       if (block.type === 'text') {
-        const candidate = stripReasoning(block.text ?? '');
+        const candidate = filter(block.text ?? '');
         if (candidate) resultParts.push(candidate);
         continue;
       }
@@ -769,6 +957,9 @@ export function parseVerbooCodeEvents(raw, cwd) {
       }
     }
   }
+
+  const remaining = filter.flush();
+  if (remaining) resultParts.push(remaining);
 
   return {
     sessionId,
@@ -1070,9 +1261,16 @@ async function executeAgentAttempt(
   options,
   timeoutSeconds = request.timeoutSeconds,
 ) {
-  if (options.onProgress) options.onProgress({ phase: 'executing_tool' });
+  if (options.onProgress) {
+    options.onProgress({
+      phase: 'waiting_model',
+      allowed_tools: allowedToolsForMode(request.mode, executor),
+    });
+  }
   const invocation = buildAgentInvocation(request, executor, options.env);
-  const onLine = options.onProgress ? buildProgressOnLine(options.onProgress) : undefined;
+  const onLine = options.onProgress
+    ? buildProgressOnLine(options.onProgress, { mode: request.mode, executor })
+    : undefined;
   const raw = await execute(invocation, {
     cwd: request.cwd,
     timeoutSeconds,
@@ -1088,6 +1286,18 @@ async function executeAgentAttempt(
   const parsed = executor === 'native'
     ? parseVerbooCodeEvents(raw, request.cwd)
     : parseOpenCodeEvents(raw, request.cwd);
+  const allowedTools = new Set(
+    allowedToolsForMode(request.mode, executor).map(policyToolName),
+  );
+  const forbiddenUsed = parsed.toolsUsed.filter(
+    (tool) => !allowedTools.has(policyToolName(tool)),
+  );
+  if (forbiddenUsed.length > 0) {
+    throw agentError(
+      'FORBIDDEN_TOOL_USED',
+      `${invocation.label} executou ferramenta proibida pela política: ${forbiddenUsed.join(', ')}.`,
+    );
+  }
   const hasWriteExecution = parsed.successfulTools.some((tool) => (
     ['apply_patch', 'edit', 'write'].includes(tool.toLowerCase())
   ));

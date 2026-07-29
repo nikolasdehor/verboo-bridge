@@ -7,6 +7,7 @@ import test from 'node:test';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { MODEL_CATALOG } from '../model-router.mjs';
 
 test('MCP expõe verboo_agent e falha fechado fora da allowlist', async (t) => {
   const repo = path.resolve('.');
@@ -388,7 +389,7 @@ async function callValidate(client, cwd, commands, extra = {}) {
 // Imprime o próprio caminho, o node real, HOME e a presença da API key,
 // provando executáveis fixados, isolamento de env e precedência de PATH.
 const FAKE_NPM_SCRIPT = [
-  '#!/usr/bin/env node',
+  '#!/usr/bin/env should-not-run',
   "console.log(`FAKE_NPM_PATH:${process.argv[1]}`);",
   "console.log(`FAKE_NODE_PATH:${process.execPath}`);",
   "console.log(`FAKE_NPM_HOME:${process.env.HOME}`);",
@@ -396,6 +397,7 @@ const FAKE_NPM_SCRIPT = [
   "const args = process.argv.slice(2).join(' ');",
   "if (args === 'run fail') process.exit(3);",
   "if (args === 'run big') process.stdout.write('x'.repeat(70000));",
+  "if (args === 'run huge') process.stdout.write('x'.repeat(2_200_000));",
   "if (args === 'run slow') setTimeout(() => {}, 30000);",
   "if (args === 'run stubborn') { process.on('SIGTERM', () => {}); setTimeout(() => {}, 30000); }",
   "if (args === 'run leak') console.log('Bearer abcdef123456');",
@@ -417,6 +419,11 @@ async function makeValidateFixture() {
     '#!/bin/sh\necho "HIJACKED_NPM:$0"\nexit 0\n',
     { mode: 0o755 },
   );
+  await writeFile(
+    path.join(hijackDir, 'should-not-run'),
+    '#!/bin/sh\necho "HIJACKED_SHEBANG:$0"\nexit 0\n',
+    { mode: 0o755 },
+  );
   await writeFile(path.join(projectDir, 'ok.js'), 'module.exports = 1;\n');
   return { fixture, binDir, hijackDir, projectDir };
 }
@@ -425,7 +432,7 @@ function validateEnv(binDir, projectDir, extra = {}) {
   return makeValidateClientEnv({
     VERBOO_AGENT_ALLOWED_ROOTS: projectDir,
     VERBOO_AGENT_VERIFY_ENABLED: '1',
-    VERBOO_AGENT_VERIFY_NPM_SCRIPTS: 'ok,fail,big,slow,stubborn,leak',
+    VERBOO_AGENT_VERIFY_NPM_SCRIPTS: 'ok,fail,big,huge,slow,stubborn,leak',
     PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
     ...extra,
   });
@@ -487,9 +494,15 @@ test('MCP verboo_validate separa perfil estático de project-code com segundo ga
 
 test('MCP verboo_validate executa binário resolvido e rejeita política adversarial', async (t) => {
   const { binDir, hijackDir, projectDir } = await makeValidateFixture();
+  // O npm permitido vem primeiro, mas seu shebang aponta para um interpretador
+  // disponível apenas em hijackDir. Executá-lo com node absoluto deve ignorar
+  // tanto o npm adversarial quanto o shebang adversarial.
   const client = await connectValidateClient(
     t,
-    validateEnv(binDir, projectDir, { VERBOO_AGENT_VERIFY_PROJECT_CODE_ENABLED: '1' }),
+    validateEnv(binDir, projectDir, {
+      VERBOO_AGENT_VERIFY_PROJECT_CODE_ENABLED: '1',
+      PATH: `${binDir}${path.delimiter}${hijackDir}${path.delimiter}${process.env.PATH}`,
+    }),
   );
   const expectedNpm = realpathSync(path.join(binDir, 'npm'));
   const expectedNode = realpathSync(path.join(binDir, 'node'));
@@ -512,11 +525,10 @@ test('MCP verboo_validate executa binário resolvido e rejeita política adversa
     `npm deve executar com o node absoluto resolvido (${expectedNode})`,
   );
   assert.ok(!stdout.includes('HIJACKED_NPM'), 'PATH hijack não pode vencer a resolução');
+  assert.ok(!stdout.includes('HIJACKED_SHEBANG'), 'shebang do npm não pode escolher outro interpretador');
   assert.ok(stdout.includes('FAKE_NPM_KEY:empty'), 'env do filho não pode conter VERBOO_API_KEY');
   assert.ok(stdout.includes('verboo-verify-home-'), 'HOME do filho deve ser isolado');
   assert.ok(!stdout.includes(`FAKE_NPM_HOME:${os.homedir()}`), 'HOME real do host vazou');
-
-  assert.ok(hijackDir.includes('bin-hijack'), 'fixture de hijack presente para o cenário acima');
 
   symlinkSync('/etc/passwd', path.join(projectDir, 'link-escape.js'));
   const denials = [
@@ -614,4 +626,80 @@ test('MCP verboo_validate stop_on_failure, timeout total, truncamento e redactio
   assert.equal(leak.payload.status, 'ok');
   assert.ok(!leak.payload.results[0].stdout.includes('abcdef123456'));
   assert.match(leak.payload.results[0].stdout, /Bearer <redacted>/);
+});
+
+test('MCP falha fechado com MODEL_POLICY_EMPTY quando política exclui todos os modelos', async (t) => {
+  const repo = path.resolve('.');
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(repo, 'index.mjs')],
+    env: {
+      ...process.env,
+      VERBOO_API_KEY: 'test-key',
+      VERBOO_AGENT_ALLOWED_ROOTS: repo,
+      VERBOO_MODEL_ALLOWLIST: '',
+      VERBOO_MODEL_DENYLIST: Object.keys(MODEL_CATALOG).join(','),
+      VERBOO_MODEL_TIERS: 'pro,max,ultra',
+      VERBOO_MEMORY_ENABLED: '0',
+    },
+    stderr: 'pipe',
+  });
+  const client = new Client(
+    { name: 'verboo-bridge-test', version: '1.0.0' },
+    { capabilities: {} },
+  );
+  t.after(async () => client.close());
+  await client.connect(transport);
+
+  const listed = await client.listTools();
+  const toolNames = listed.tools.map((tool) => tool.name);
+  // Tools dependentes de modelo não são expostas
+  assert.ok(!toolNames.includes('verboo_code'), 'verboo_code não deve existir com política vazia');
+  assert.ok(!toolNames.includes('verboo_review'), 'verboo_review não deve existir com política vazia');
+  assert.ok(!toolNames.includes('verboo_route'), 'verboo_route não deve existir com política vazia');
+  // Tools não-modelo permanecem disponíveis
+  assert.ok(toolNames.includes('verboo_agent'));
+  assert.ok(toolNames.includes('verboo_agent_start'));
+  assert.ok(toolNames.includes('verboo_job'));
+  assert.ok(toolNames.includes('verboo_memory'));
+  assert.ok(toolNames.includes('verboo_validate'));
+
+  // Recurso verboo://models retorna erro MODEL_POLICY_EMPTY
+  const modelsResource = await client.readResource({ uri: 'verboo://models' });
+  const modelsPayload = JSON.parse(modelsResource.contents[0].text);
+  assert.equal(modelsPayload.error, 'MODEL_POLICY_EMPTY');
+
+  const direct = await client.callTool({
+    name: 'verboo_code',
+    arguments: { prompt: 'não executar' },
+  });
+  assert.equal(direct.isError, true);
+  assert.match(direct.content[0].text, /MODEL_POLICY_EMPTY/);
+
+  await assert.rejects(
+    client.getPrompt({
+      name: 'explicar',
+      arguments: { codigo: 'const x = 1;' },
+    }),
+    /MODEL_POLICY_EMPTY/,
+  );
+});
+
+test('MCP verboo_validate saída >1 MiB é truncada corretamente', async (t) => {
+  const { binDir, projectDir } = await makeValidateFixture();
+  const client = await connectValidateClient(
+    t,
+    validateEnv(binDir, projectDir, { VERBOO_AGENT_VERIFY_PROJECT_CODE_ENABLED: '1' }),
+  );
+
+  const huge = await callValidate(client, projectDir, [
+    { cmd: 'npm', args: ['run', 'huge'] },
+  ]);
+  assert.equal(huge.payload.status, 'ok');
+  assert.equal(huge.payload.results[0].exit_code, 0);
+  assert.equal(huge.payload.results[0].stdout_truncated, true);
+  assert.ok(
+    huge.payload.results[0].stdout.length <= 8192,
+    `saída deve ser truncada em 8 KiB, recebido ${huge.payload.results[0].stdout.length}`,
+  );
 });

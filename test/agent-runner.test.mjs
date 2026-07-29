@@ -7,6 +7,7 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import {
+  allowedToolsForMode,
   assertGlobalModelAllowed,
   buildOpenCodeInvocation,
   buildProgressOnLine,
@@ -182,7 +183,10 @@ test('invocação nativa usa Verboo Code headless com ferramentas delimitadas', 
   );
   assert.ok(invocation.args.includes('Read,Glob,Grep,Edit,Write'));
   assert.ok(!invocation.args.includes('--allowedTools'));
-  assert.ok(!invocation.args.includes('Bash'));
+  assert.equal(
+    invocation.args[invocation.args.indexOf('--disallowed-tools') + 1],
+    'Bash,WebFetch,WebSearch,Task',
+  );
   assert.equal(invocation.args.at(-2), '--');
   assert.equal(invocation.args.at(-1), request.prompt);
 
@@ -210,6 +214,10 @@ test('invocação nativa read_only usa bypass sem liberar escrita', () => {
   assert.equal(
     invocation.args[invocation.args.indexOf('--tools') + 1],
     'Read,Glob,Grep',
+  );
+  assert.equal(
+    invocation.args[invocation.args.indexOf('--disallowed-tools') + 1],
+    'Edit,Write,Bash,WebFetch,WebSearch,Task',
   );
   const settings = JSON.parse(invocation.args[invocation.args.indexOf('--settings') + 1]);
   assert.equal(settings.disableAllHooks, true);
@@ -521,6 +529,120 @@ process.stdout.write(JSON.stringify({
   assert.equal(result.session_id, 'native_run');
   assert.deepEqual(result.tools_used, ['Edit']);
   assert.deepEqual(result.artifacts, [path.join(await realpath(base), 'status.txt')]);
+});
+
+test('executor nativo falha fechado se reportar ferramenta proibida', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-native-forbidden-'));
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.end(`${[
+        {
+          type: 'assistant',
+          session_id: 'native_forbidden',
+          message: {
+            content: [{
+              type: 'tool_use',
+              id: 'bash_1',
+              name: 'Bash',
+              input: { command: 'pwd' },
+            }],
+          },
+        },
+        {
+          type: 'user',
+          session_id: 'native_forbidden',
+          message: {
+            content: [{
+              type: 'tool_result',
+              tool_use_id: 'bash_1',
+              content: base,
+            }],
+          },
+        },
+        {
+          type: 'result',
+          session_id: 'native_forbidden',
+          result: 'Não deveria concluir.',
+        },
+      ].map(JSON.stringify).join('\n')}\n`);
+      child.stderr.end();
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  await assert.rejects(
+    () => runVerbooAgent(
+      {
+        prompt: 'audite sem shell',
+        cwd: base,
+        executor: 'native',
+        mode: 'read_only',
+        model: 'deepseek-v4-flash',
+        timeout_seconds: 10,
+      },
+      {
+        availableModels: MODELS,
+        env: {
+          ...process.env,
+          VERBOO_AGENT_ALLOWED_ROOTS: base,
+        },
+        spawnImpl,
+      },
+    ),
+    (error) => error.code === 'FORBIDDEN_TOOL_USED' && /Bash/.test(error.message),
+  );
+});
+
+test('OpenCode falha fechado para tool_call fora da allowlist efetiva', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-opencode-forbidden-'));
+
+  for (const [mode, tool] of [['read_only', 'bash'], ['write', 'Write']]) {
+    const spawnImpl = () => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => true;
+      setImmediate(() => {
+        child.stdout.end(`${JSON.stringify({
+          type: 'content',
+          content_type: 'tool_call',
+          sessionID: 'opencode_forbidden',
+          name: tool,
+        })}\n`);
+        child.stderr.end();
+        child.emit('close', 0);
+      });
+      return child;
+    };
+
+    await assert.rejects(
+      () => runVerbooAgent(
+        {
+          prompt: 'não use ferramenta fora da política',
+          cwd: base,
+          executor: 'opencode',
+          mode,
+          model: 'deepseek-v4-flash',
+          timeout_seconds: 10,
+        },
+        {
+          availableModels: MODELS,
+          env: {
+            ...process.env,
+            VERBOO_AGENT_ALLOWED_ROOTS: base,
+            VERBOO_AGENT_WRITE_ENABLED: '1',
+          },
+          spawnImpl,
+        },
+      ),
+      (error) => error.code === 'FORBIDDEN_TOOL_USED' && error.message.includes(tool),
+    );
+  }
 });
 
 test('runVerbooAgent persiste nota e injeta memória na execução seguinte', async () => {
@@ -1893,7 +2015,7 @@ test('onProgress nao afeta execucao quando ausente', async () => {
   assert.equal(result.status, 'success');
 });
 
-test('onProgress recebe executing_tool e processing_result', async () => {
+test('onProgress recebe waiting_model, executing_tool e processing_result', async () => {
   resetModelRuntimeState();
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-onprogress-phases-'));
   const updates = [];
@@ -1903,11 +2025,23 @@ test('onProgress recebe executing_tool e processing_result', async () => {
     child.stderr = new PassThrough();
     child.kill = () => true;
     setImmediate(() => {
-      child.stdout.end(`${JSON.stringify({
-        type: 'text',
-        sessionID: 'ses_full',
-        part: { text: 'Análise completa.' },
-      })}\n`);
+      child.stdout.end(`${[
+        {
+          type: 'tool_use',
+          sessionID: 'ses_full',
+          part: { id: 't1', tool: 'read', state: { status: 'running' } },
+        },
+        {
+          type: 'tool_use',
+          sessionID: 'ses_full',
+          part: { id: 't1', tool: 'read', state: { status: 'completed' } },
+        },
+        {
+          type: 'text',
+          sessionID: 'ses_full',
+          part: { text: 'Análise completa.' },
+        },
+      ].map(JSON.stringify).join('\n')}\n`);
       child.stderr.end();
       child.emit('close', 0);
     });
@@ -1934,6 +2068,9 @@ test('onProgress recebe executing_tool e processing_result', async () => {
   const phases = updates.map((u) => u.phase);
   assert.ok(phases.includes('routing'));
   assert.ok(phases.includes('generating'));
+  assert.ok(phases.includes('waiting_model'));
+  assert.ok(phases.includes('executing_tool'));
+  assert.ok(phases.includes('processing_result'));
 });
 
 test('onProgress inclui attempt info em fallback', async () => {
@@ -2053,6 +2190,16 @@ test('parseOpenCodeEvents preserva multiplos blocos text em ordem', () => {
   assert.equal(parsed.result, 'Primeiro bloco.\nSegundo bloco.\nTerceiro.');
 });
 
+test('parseOpenCodeEvents remove bloco think dividido entre multiplos fragmentos', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'Início.\n<think>pensando na ' } }),
+    JSON.stringify({ type: 'text', sessionID: 's1', part: { text: 'solução complexa...</think>Resultado.' } }),
+  ].join('\n');
+  const parsed = parseOpenCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Início.\nResultado.');
+});
+
 test('parseVerbooCodeEvents preserva multiplos blocos text em ordem', () => {
   const cwd = '/repo';
   const raw = [
@@ -2066,6 +2213,54 @@ test('parseVerbooCodeEvents preserva multiplos blocos text em ordem', () => {
   ].join('\n');
   const parsed = parseVerbooCodeEvents(raw, cwd);
   assert.equal(parsed.result, 'Analisei.\nEncontrei um bug.\nConcluído.');
+});
+
+test('parseVerbooCodeEvents remove bloco think dividido entre multiplos fragmentos', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({ type: 'assistant', session_id: 's2', message: { content: [
+      { type: 'text', text: 'Analise:\n<think>raciocínio ' },
+    ] } }),
+    JSON.stringify({ type: 'assistant', session_id: 's2', message: { content: [
+      { type: 'text', text: 'profundo...</think>Sucesso.' },
+    ] } }),
+  ].join('\n');
+  const parsed = parseVerbooCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Analise:\nSucesso.');
+});
+
+test('buildProgressOnLine correlaciona tool_use sem id por ferramenta e contexto sem duplicar', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0 },
+  );
+
+  cb(JSON.stringify({
+    type: 'tool_use',
+    sessionID: 'ses_anon',
+    part: { tool: 'read', state: { status: 'running', input: { path: 'a.js' } } },
+  }));
+  cb(JSON.stringify({
+    type: 'tool_use',
+    sessionID: 'ses_anon',
+    part: { tool: 'read', state: { status: 'completed', input: { path: 'a.js' } } },
+  }));
+
+  cb(JSON.stringify({
+    type: 'tool_use',
+    sessionID: 'ses_anon',
+    part: { tool: 'read', state: { status: 'running', input: { path: 'a.js' } } },
+  }));
+  cb(JSON.stringify({
+    type: 'tool_use',
+    sessionID: 'ses_anon',
+    part: { tool: 'read', state: { status: 'completed', input: { path: 'a.js' } } },
+  }));
+
+  const last = updates.at(-1).tool_counts;
+  assert.deepEqual(last.total, { total: 2, succeeded: 2, failed: 0 });
+  assert.deepEqual(last.Read, { total: 2, succeeded: 2, failed: 0 });
 });
 
 // ── onLine incremental tool_counts ──────────────────────────────────────
@@ -2163,4 +2358,366 @@ test('buildProgressOnLine nao falha com JSON invalido', () => {
   onLine('not json');
   onLine('{"malformed"');
   assert.equal(called, false);
+});
+
+// ── Think filter: backtick literal, fragment split, EOF incomplete ──────
+
+test('parseOpenCodeEvents preserva <think> literal envolto em backticks', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'text', sessionID: 's1',
+      part: { text: 'Use `<think>` para blocos de raciocinio.' },
+    }),
+  ].join('\n');
+  const parsed = parseOpenCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Use `<think>` para blocos de raciocinio.');
+});
+
+test('parseOpenCodeEvents preserva </think> literal envolto em backticks', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'text', sessionID: 's1',
+      part: { text: 'Feche com `</think>` no final.' },
+    }),
+  ].join('\n');
+  const parsed = parseOpenCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Feche com `</think>` no final.');
+});
+
+test('parseOpenCodeEvents remove think real mas preserva referencia em backticks', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'text', sessionID: 's1',
+      part: { text: '<think>analisando</think>Use `<think>` para blocos.' },
+    }),
+  ].join('\n');
+  const parsed = parseOpenCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Use `<think>` para blocos.');
+});
+
+test('parseOpenCodeEvents nao fecha think com </think> em backticks', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'text', sessionID: 's1',
+      part: { text: '<think>use `</think>` literal</think>Resultado.' },
+    }),
+  ].join('\n');
+  const parsed = parseOpenCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Resultado.');
+});
+
+test('parseOpenCodeEvents fecha think após backtick solto', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'text', sessionID: 's1',
+      part: { text: '<think>rascunho termina com `</think>Resultado.' },
+    }),
+  ].join('\n');
+  const parsed = parseOpenCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Resultado.');
+});
+
+test('parseVerbooCodeEvents preserva <think> e </think> literais em backticks', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'assistant', session_id: 's2', message: {
+        content: [{ type: 'text', text: 'Padrao `<think>` e `</think>` sao literais.' }],
+      },
+    }),
+  ].join('\n');
+  const parsed = parseVerbooCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Padrao `<think>` e `</think>` sao literais.');
+});
+
+test('parseVerbooCodeEvents remove think real com </think> em backticks no meio', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'assistant', session_id: 's2', message: {
+        content: [{
+          type: 'text',
+          text: '<think>use `</think>` como ref</think>Pronto.',
+        }],
+      },
+    }),
+  ].join('\n');
+  const parsed = parseVerbooCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Pronto.');
+});
+
+test('parseOpenCodeEvents nao vaza bloco think incompleto no fim do fluxo', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'text', sessionID: 's1',
+      part: { text: 'Inicio.\n<think>raciocinio incompleto' },
+    }),
+  ].join('\n');
+  const parsed = parseOpenCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Inicio.');
+});
+
+test('parseVerbooCodeEvents nao vaza bloco think incompleto no fim do fluxo', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'assistant', session_id: 's2', message: {
+        content: [{ type: 'text', text: 'Inicio.\n<think>raciocinio incompleto' }],
+      },
+    }),
+  ].join('\n');
+  const parsed = parseVerbooCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Inicio.');
+});
+
+test('parseOpenCodeEvents trata <think> partido entre dois fragmentos', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'text', sessionID: 's1',
+      part: { text: 'Antes do<thi' },
+    }),
+    JSON.stringify({
+      type: 'text', sessionID: 's1',
+      part: { text: 'nk>raciocinio</think>Depois.' },
+    }),
+  ].join('\n');
+  const parsed = parseOpenCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Antes do\nDepois.');
+});
+
+test('parseOpenCodeEvents trata </think> partido entre dois fragmentos', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'text', sessionID: 's1',
+      part: { text: '<think>pensando</thi' },
+    }),
+    JSON.stringify({
+      type: 'text', sessionID: 's1',
+      part: { text: 'nk>Final.' },
+    }),
+  ].join('\n');
+  const parsed = parseOpenCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Final.');
+});
+
+test('parseVerbooCodeEvents trata think partido entre dois fragmentos', () => {
+  const cwd = '/repo';
+  const raw = [
+    JSON.stringify({
+      type: 'assistant', session_id: 's2', message: {
+        content: [{ type: 'text', text: '<think>racioc' }],
+      },
+    }),
+    JSON.stringify({
+      type: 'assistant', session_id: 's2', message: {
+        content: [{ type: 'text', text: 'inio profun' }],
+      },
+    }),
+    JSON.stringify({
+      type: 'assistant', session_id: 's2', message: {
+        content: [{ type: 'text', text: 'do</think>Fim.' }],
+      },
+    }),
+  ].join('\n');
+  const parsed = parseVerbooCodeEvents(raw, cwd);
+  assert.equal(parsed.result, 'Fim.');
+});
+
+// ── allowedToolsForMode ─────────────────────────────────────────────────
+
+test('allowedToolsForMode retorna Read/Glob/Grep para read_only', () => {
+  assert.deepEqual(allowedToolsForMode('read_only'), ['Read', 'Glob', 'Grep']);
+});
+
+test('allowedToolsForMode inclui Edit/Write para write', () => {
+  assert.deepEqual(allowedToolsForMode('write'), ['Read', 'Glob', 'Grep', 'Edit', 'Write']);
+});
+
+test('allowedToolsForMode reflete a política do executor OpenCode', () => {
+  assert.deepEqual(
+    allowedToolsForMode('read_only', 'opencode'),
+    ['Read', 'Glob', 'List'],
+  );
+  assert.deepEqual(
+    allowedToolsForMode('write', 'opencode'),
+    ['Read', 'Glob', 'List', 'Edit'],
+  );
+});
+
+// ── buildVerbooCodeInvocation com --include-partial-messages ────────────
+
+test('buildVerbooCodeInvocation inclui --include-partial-messages', () => {
+  const invocation = buildVerbooCodeInvocation({
+    prompt: 'teste',
+    cwd: '/repo',
+    mode: 'read_only',
+    model: 'deepseek-v4-flash',
+  });
+  assert.ok(invocation.args.includes('--include-partial-messages'));
+});
+
+// ── buildProgressOnLine: allowed_tools e stream_event ───────────────────
+
+test('buildProgressOnLine inclui allowed_tools no progresso', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0, mode: 'read_only' },
+  );
+  cb(JSON.stringify({ type: 'tool_use', part: { tool: 'read' } }));
+  const update = updates.find((u) => u.allowed_tools);
+  assert.ok(update);
+  assert.deepEqual(update.allowed_tools, ['Read', 'Glob', 'Grep']);
+});
+
+test('buildProgressOnLine allowed_tools reflete mode write', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0, mode: 'write' },
+  );
+  cb(JSON.stringify({ type: 'tool_use', part: { tool: 'edit' } }));
+  const update = updates.find((u) => u.allowed_tools);
+  assert.ok(update);
+  assert.deepEqual(update.allowed_tools, ['Read', 'Glob', 'Grep', 'Edit', 'Write']);
+});
+
+test('buildProgressOnLine conta List do OpenCode como inspeção Glob', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0, mode: 'read_only', executor: 'opencode' },
+  );
+  cb(JSON.stringify({
+    type: 'tool_use',
+    part: { id: 'list-1', tool: 'list', state: { status: 'completed' } },
+  }));
+  const update = updates.at(-1);
+  assert.deepEqual(update.allowed_tools, ['Read', 'Glob', 'List']);
+  assert.deepEqual(update.tool_counts.Glob, { total: 1, succeeded: 1, failed: 0 });
+});
+
+test('buildProgressOnLine transiciona executing_tool -> processing_result', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0, mode: 'read_only' },
+  );
+
+  cb(JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 't1', name: 'Read' }] },
+  }));
+
+  cb(JSON.stringify({
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: 't1' }] },
+  }));
+
+  const phases = updates.map((u) => u.phase);
+  assert.ok(phases.includes('executing_tool'), 'deve ter executing_tool');
+  assert.ok(phases.includes('processing_result'), 'deve ter processing_result');
+});
+
+test('buildProgressOnLine processa stream_event content_block_start tool_use', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0, mode: 'read_only' },
+  );
+
+  cb(JSON.stringify({
+    type: 'stream_event',
+    session_id: 'ses_stream',
+    event: {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'stream_t1', name: 'Read', input: { file_path: 'x.js' } },
+    },
+  }));
+
+  const update = updates.find((u) => u.tool_counts);
+  assert.ok(update, 'deve emitir progresso após stream_event');
+  assert.equal(update.phase, 'executing_tool', 'stream_event tool_use transiciona para executing_tool');
+  assert.equal(update.tool_counts.Read.total, 1);
+});
+
+test('buildProgressOnLine deduplica tool_use de stream_event quando assistant chega depois', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0, mode: 'read_only' },
+  );
+
+  // stream_event anuncia tool_use primeiro
+  cb(JSON.stringify({
+    type: 'stream_event',
+    session_id: 'ses_dedup',
+    event: {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'tool_use', id: 'dedup_1', name: 'Read', input: { file_path: 'x.js' } },
+    },
+  }));
+
+  // assistant message chega com o mesmo tool_use — não deve duplicar
+  cb(JSON.stringify({
+    type: 'assistant',
+    session_id: 'ses_dedup',
+    message: { content: [{ type: 'tool_use', id: 'dedup_1', name: 'Read', input: { file_path: 'x.js' } }] },
+  }));
+
+  // tool_result
+  cb(JSON.stringify({
+    type: 'user',
+    session_id: 'ses_dedup',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'dedup_1' }] },
+  }));
+
+  const last = updates.at(-1).tool_counts;
+  assert.equal(last.total.total, 1, 'tool_use não deve ser duplicado');
+  assert.equal(last.Read.total, 1);
+  assert.equal(last.Read.succeeded, 1);
+});
+
+test('buildProgressOnLine nao expoe thinking_delta nem texto de stream_event', () => {
+  const updates = [];
+  const cb = buildProgressOnLine(
+    (update) => { updates.push(update); },
+    { minIntervalMs: 0, mode: 'read_only' },
+  );
+
+  // stream_event com thinking_delta — ignorado
+  cb(JSON.stringify({
+    type: 'stream_event',
+    session_id: 'ses_think',
+    event: {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'thinking_delta', thinking: 'raciocinio secreto' },
+    },
+  }));
+
+  // stream_event com texto — ignorado
+  cb(JSON.stringify({
+    type: 'stream_event',
+    session_id: 'ses_text',
+    event: {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: 'texto incremental' },
+    },
+  }));
+
+  // Nenhum update deve ter sido emitido (sem tool_use)
+  const toolUpdates = updates.filter((u) => u.tool_counts);
+  assert.equal(toolUpdates.length, 0, 'thinking_delta e texto não devem gerar tool_counts');
 });

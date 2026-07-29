@@ -560,11 +560,9 @@ test('JobQueue: schema desconhecido e legado nunca recuperam resultado', async (
   await rm(dir, { recursive: true, force: true });
 });
 
-test('JobQueue: falha ao gravar resultado nunca publica sucesso falso', {
-  skip: process.platform === 'win32',
-}, async () => {
+test('JobQueue: falha ao gravar resultado nunca publica sucesso falso', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-durable-failure-'));
-  const { rm } = await import('node:fs/promises');
+  const { rm, writeFile } = await import('node:fs/promises');
   const q = new JobQueue({ concurrency: 1, persistResults: true });
   let release;
   q.setRunner(async () => {
@@ -574,7 +572,13 @@ test('JobQueue: falha ao gravar resultado nunca publica sucesso falso', {
   await q.initStore(dir);
   const { job_id } = await q.enqueuePersisted({ runnerData: { prompt: 'x' } });
   await new Promise((resolve) => q.once('started', resolve));
-  await chmod(dir, 0o500);
+  await q.waitForPersistence(job_id);
+
+  // Substitui o diretório por um arquivo — futuras escritas falham deterministicamente
+  // (funciona inclusive como root, ao contrário de chmod 0o500).
+  await rm(dir, { recursive: true, force: true });
+  await writeFile(dir, '');
+
   release();
   await new Promise((resolve) => q.once('completed', resolve));
 
@@ -584,8 +588,7 @@ test('JobQueue: falha ao gravar resultado nunca publica sucesso falso', {
   assert.equal(result.error.code, 'RESULT_STORE_WRITE_FAILED');
 
   q.dispose();
-  await chmod(dir, 0o700);
-  await rm(dir, { recursive: true, force: true });
+  await rm(dir, { recursive: true, force: true }).catch(() => {});
 });
 
 test('JobQueue: enqueuePersisted grava estado queued antes de responder', async () => {
@@ -901,6 +904,35 @@ test('JobQueue: runnerData original nao contem __onProgress apos enqueue', () =>
   assert.equal(original.__onProgress, undefined, 'runnerData original nao deve conter __onProgress');
 });
 
+test('JobQueue: heartbeat nao troca waiting_model para idle', async () => {
+  const q = new JobQueue({ concurrency: 1, heartbeatMs: 10 });
+  let release;
+  let onProgressRef;
+  q.setRunner(async (_job, _signal, _data, onProgress) => {
+    onProgressRef = onProgress;
+    // Emite waiting_model — heartbeat não deve trocar para idle
+    onProgress({ phase: 'waiting_model' });
+    return new Promise((r) => { release = r; });
+  });
+  const { job_id } = q.enqueue({ runnerData: { prompt: 'waiting-model-keep' } });
+  await new Promise((resolve) => q.on('started', resolve));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  const progress = q.getJob(job_id);
+  assert.equal(progress.phase, 'waiting_model', 'heartbeat não deve trocar waiting_model para idle');
+  assert.ok(progress.idle_for_ms >= 10, 'deve ter idle_for_ms mesmo em waiting_model');
+
+  // Atividade real restaura comportamento normal
+  onProgressRef({ phase: 'executing_tool' });
+  const afterActivity = q.getJob(job_id);
+  assert.equal(afterActivity.phase, 'executing_tool');
+  assert.equal(afterActivity.idle_for_ms, null);
+
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  q.dispose();
+});
+
 test('JobQueue: heartbeat relata silencio como idle e atividade restaura fase', async () => {
   const q = new JobQueue({ concurrency: 1, heartbeatMs: 10 });
   let release;
@@ -925,16 +957,20 @@ test('JobQueue: heartbeat relata silencio como idle e atividade restaura fase', 
   await new Promise((resolve) => setTimeout(resolve, 20));
 });
 
-test('JobQueue: cancelamento com falha de persistência não expõe status de cancelado confirmado', {
-  skip: process.platform === 'win32',
-}, async () => {
+test('JobQueue: cancelamento com falha de persistência não expõe status de cancelado confirmado', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-cancel-write-fail-'));
-  const { rm } = await import('node:fs/promises');
+  const { rm, writeFile } = await import('node:fs/promises');
   const q = new JobQueue({ concurrency: 1 });
   q.setRunner(async () => new Promise(() => {}));
   await q.initStore(dir);
+  const started = new Promise((resolve) => q.once('started', resolve));
   const { job_id } = q.enqueue({ runnerData: { prompt: 'cancel-fail' } });
-  await chmod(dir, 0o500);
+  await started;
+  await q.waitForPersistence(job_id);
+
+  // Troca dir por arquivo — #persistJob falha deterministicamente.
+  await rm(dir, { recursive: true, force: true });
+  await writeFile(dir, '');
 
   const res = await q.cancel(job_id);
   assert.equal(res.status, undefined, 'não deve confirmar status cancelled');
@@ -942,6 +978,101 @@ test('JobQueue: cancelamento com falha de persistência não expõe status de ca
   assert.match(res.message, /não pôde ser persistido/);
 
   q.dispose();
-  await chmod(dir, 0o700);
+  await rm(dir, { recursive: true, force: true }).catch(() => {});
+});
+
+test('JobQueue: cancelamento de running job drena fila para proximo', async () => {
+  const q = new JobQueue({ concurrency: 1 });
+  const started = [];
+  q.setRunner(async (job, signal) => {
+    started.push(job.job_id);
+    await new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        reject(Object.assign(new Error('CANCELLED'), { code: 'CANCELLED' }));
+      }, { once: true });
+    });
+    return { status: 'succeeded', finished_at: new Date().toISOString(), summary: 'ok' };
+  });
+
+  const { job_id: aId } = q.enqueue({});
+  const { job_id: bId } = q.enqueue({});
+
+  await new Promise((resolve) => q.once('started', resolve));
+  assert.deepEqual(started, [aId]);
+
+  const bStarted = new Promise((resolve) => {
+    const onStarted = (id) => {
+      if (id !== bId) return;
+      q.off('started', onStarted);
+      resolve();
+    };
+    q.on('started', onStarted);
+  });
+  await q.cancel(aId);
+  await Promise.race([
+    bStarted,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error('B não iniciou após o cancelamento de A')),
+      200,
+    )),
+  ]);
+
+  assert.equal(q.getJob(aId).status, 'cancelled');
+  assert.equal(q.getJob(bId).status, 'running');
+  q.dispose();
+});
+
+test('JobQueue: rejeicao inesperada em listener nao causa unhandled rejection', async (t) => {
+  const q = new JobQueue({ concurrency: 1 });
+  q.setRunner(async () => ({ status: 'succeeded', finished_at: new Date().toISOString(), summary: 'ok' }));
+
+  const unhandled = [];
+  const onUnhandled = (err) => { unhandled.push(err); };
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => {
+    process.removeListener('unhandledRejection', onUnhandled);
+    q.dispose();
+  });
+
+  // Listener que lança — deve ser capturado pelo .catch, não virar unhandled
+  q.on('completed', () => { throw new Error('listener-error'); });
+
+  const { job_id } = q.enqueue({});
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const result = q.getJobResult(job_id);
+  assert.ok(result, 'job deve existir apesar do listener ruim');
+
+  assert.equal(unhandled.length, 0, 'nenhuma unhandled rejection');
+});
+
+test('JobQueue: persistencia opt-in sanitiza artifacts absolutos', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'verboo-artifact-privacy-'));
+  const { readFile, rm } = await import('node:fs/promises');
+  const q = new JobQueue({ concurrency: 1, persistResults: true });
+  q.setRunner(async () => ({
+    ...fakeResult({ output: 'resultado' }),
+    artifacts: [
+      '/Users/nikolas/Projects/segredo/output.pdf',
+      '/etc/passwd',
+      'relatorio.md',
+      './docs/nota.txt',
+    ],
+  }));
+  await q.initStore(dir);
+  const { job_id } = q.enqueue({});
+  await new Promise((resolve) => q.once('completed', resolve));
+  await q.waitForPersistence(job_id);
+
+  const stored = JSON.parse(
+    await readFile(path.join(dir, `${job_id}.json`), 'utf8'),
+  );
+  const artifacts = stored.result.artifacts;
+  assert.equal(artifacts[0], 'output.pdf', 'path absoluto reduzido a filename');
+  assert.equal(artifacts[1], 'passwd', 'path absoluto reduzido a filename');
+  assert.equal(artifacts[2], 'relatorio.md', 'path relativo mantido');
+  assert.equal(artifacts[3], './docs/nota.txt', 'path relativo mantido');
+
+  q.dispose();
   await rm(dir, { recursive: true, force: true });
 });
