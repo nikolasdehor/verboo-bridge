@@ -1,7 +1,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
   <img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen" alt="Node >=18">
-  <img src="https://img.shields.io/badge/MCP-1.0.0-purple" alt="MCP">
+  <a href="https://www.npmjs.com/package/verboo-bridge"><img src="https://img.shields.io/npm/v/verboo-bridge?label=npm" alt="Versão no npm"></a>
+  <img src="https://img.shields.io/badge/MCP-stdio-purple" alt="MCP via stdio">
   <img src="https://img.shields.io/badge/status-ativo-success" alt="Status">
 </p>
 
