@@ -298,12 +298,13 @@ test('subprocesso desativa config de projeto e recebe apenas ambiente necessári
 });
 
 test('taskkill usa árvore, força encerramento e não abre shell', () => {
+  const systemRoot = path.join(path.parse(process.cwd()).root, 'windows');
   const invocation = buildTaskkillInvocation(321, {
-    env: { SystemRoot: '/windows' },
+    env: { SystemRoot: systemRoot },
     realpathImpl: (value) => value,
   });
   assert.deepEqual(invocation, {
-    command: path.join('/windows', 'System32', 'taskkill.exe'),
+    command: path.join(systemRoot, 'System32', 'taskkill.exe'),
     args: ['/pid', '321', '/t', '/f'],
     options: {
       shell: false,
@@ -313,9 +314,11 @@ test('taskkill usa árvore, força encerramento e não abre shell', () => {
   });
   assert.throws(
     () => buildTaskkillInvocation(321, {
-      env: { SystemRoot: '/windows' },
+      env: { SystemRoot: systemRoot },
       realpathImpl: (value) => (
-        value.endsWith('taskkill.exe') ? '/tmp/taskkill.exe' : value
+        value.endsWith('taskkill.exe')
+          ? path.join(path.parse(systemRoot).root, 'tmp', 'taskkill.exe')
+          : value
       ),
     }),
     (error) => error.code === 'TASKKILL_INVALID',
