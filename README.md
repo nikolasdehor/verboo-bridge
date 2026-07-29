@@ -183,6 +183,10 @@ são expandidos dentro de JSON ou TOML.
 | Cursor IDE e CLI | `~/.cursor/mcp.json` ou `.cursor/mcp.json` | **Available Tools** ou `cursor-agent mcp list-tools verboo-bridge` |
 | OpenCode | `opencode.json` | `opencode mcp list` |
 
+Esses clientes iniciam o servidor local por `stdio`. Apps web ou mobile que
+não conseguem executar um processo local exigem o transporte HTTP/stateless
+planejado no P2; essa superfície remota ainda não está implementada.
+
 ### Codex App, CLI e extensão IDE
 
 O App, a CLI e a extensão compartilham a mesma configuração. Adicione a
@@ -232,12 +236,25 @@ O Codex controla a aprovação da chamada MCP. Para automação não interativa 
 [mcp_servers.verboo-bridge.tools.verboo_route]
 approval_mode = "approve"
 
-[mcp_servers.verboo-bridge.tools.verboo_agent]
+[mcp_servers.verboo-bridge.tools.verboo_agent_start]
+approval_mode = "approve"
+
+[mcp_servers.verboo-bridge.tools.verboo_job]
 approval_mode = "approve"
 ```
 
 Isso evita `user cancelled MCP tool call` quando não há interface para responder
 ao prompt. Não use aprovação global irrestrita como atalho.
+
+Para também aprovar `verboo_validate`, primeiro habilite deliberadamente
+`VERBOO_AGENT_VERIFY_ENABLED=1` no ambiente do bridge. Só então adicione:
+
+```toml
+[mcp_servers.verboo-bridge.tools.verboo_validate]
+approval_mode = "approve"
+```
+
+Sem esse gate, `verboo_validate` falha fechado.
 
 ### Claude Desktop
 
@@ -342,15 +359,17 @@ Adicione o servidor local ao `opencode.json`:
         "VERBOO_CODE_BIN": "/caminho/absoluto/para/verboo"
       },
       "enabled": true,
-      "timeout": 60000
+      "timeout": 1800000
     }
   }
 }
 ```
 
-Valide com `opencode mcp list`. O OpenCode prefixa as ferramentas com o nome do
-servidor; no prompt, peça explicitamente para usar o MCP `verboo-bridge`. Veja a
-[documentação oficial do OpenCode](https://opencode.ai/docs/mcp-servers).
+O timeout do OpenCode é expresso em milissegundos; `1800000` acompanha o teto de
+30 minutos do job assíncrono. Valide com `opencode mcp list`. O OpenCode prefixa
+as ferramentas com o nome do servidor; no prompt, peça explicitamente para usar
+o MCP `verboo-bridge`. Veja a [documentação oficial do
+OpenCode](https://opencode.ai/docs/mcp-servers).
 
 O provedor direto abaixo só é necessário para usar `executor: "opencode"` como
 fallback, em vez do executor nativo:
@@ -658,18 +677,22 @@ O servidor também expõe **recursos** e **prompts**:
 | `VERBOO_AGENT_ALLOWED_ROOTS` | — | Raízes repo-aware separadas pelo delimitador de paths do SO; sem valor, `verboo_agent` falha fechado |
 | `VERBOO_AGENT_WRITE_ENABLED` | — | Defina `1` para habilitar `write`; por padrão, somente `read_only` é aceito |
 | `VERBOO_AGENT_MAX_CONCURRENCY` | `4` | Execuções simultâneas globais, incluindo jobs assíncronos; inteiro entre 1 e 8, valores inválidos usam 4 |
-| `VERBOO_JOB_STORE_DIR` | — | Diretório opcional 0700/0600 para persistência somente de metadados seguros; resultados ficam apenas em memória. Não grava prompts, raciocínio, segredos ou env e recupera jobs interrompidos ao reiniciar |
+| `VERBOO_JOB_STORE_DIR` | — | Diretório privado 0700/0600 para persistência atômica de metadados seguros e recuperação de jobs interrompidos |
+| `VERBOO_JOB_PERSIST_RESULTS` | — | Defina `1` junto com `VERBOO_JOB_STORE_DIR` para persistir e recuperar o resultado público terminal. Pode conter código proprietário; use somente diretório privado. Nunca grava prompt, runner data, cwd, env, raciocínio, memory note ou mensagens de erro |
 | `VERBOO_JOB_TTL_MS` | `1800000` (30 min) | TTL em ms para jobs finalizados sem resultado |
 | `VERBOO_JOB_RESULT_TTL_MS` | `600000` (10 min) | TTL em ms para resultados de jobs |
 | `VERBOO_JOB_MAX_RESULTS` | `100` | Máximo de resultados mantidos em memória (até 500) |
 | `VERBOO_JOB_MAX_QUEUED` | `50` | Máximo de jobs aguardando na fila |
 | `VERBOO_AGENT_MAX_MODEL_ATTEMPTS` | `2` | Tentativas de modelos no modo `auto` + `read_only`; inteiro entre 1 e 3 |
 | `VERBOO_AGENT_EXECUTOR` | `native` | Padrão administrativo; cada chamada pode substituir por `native` ou `opencode` |
+| `VERBOO_AGENT_VERIFY_ENABLED` | — | Defina `1` para habilitar `verboo_validate`; por padrão falha fechado |
+| `VERBOO_AGENT_VERIFY_PROJECT_CODE_ENABLED` | — | Segundo opt-in obrigatório para `npm test`/`npm run`; não é sandbox: executa código confiável com o usuário do bridge e pode escrever, ler arquivos/configs acessíveis e usar rede |
+| `VERBOO_AGENT_VERIFY_NPM_SCRIPTS` | — | Scripts separados por vírgula permitidos para `npm run`; `npm test` continua sujeito ao segundo opt-in |
 | `VERBOO_MEMORY_ENABLED` | — | Defina `1` para ativar memória técnica persistente dos subagentes |
 | `VERBOO_MEMORY_DIR` | `~/.local/share/verboo-bridge/memory` | Diretório dos diários JSONL isolados por projeto |
 | `VERBOO_SHARED_MEMORY_FILES` | — | Arquivos de memória curada, somente leitura, separados pelo delimitador de paths do SO |
-| `VERBOO_MODEL_ALLOWLIST` | todos | Modelos permitidos no roteamento automático, preview e seleção manual, separados por vírgula |
-| `VERBOO_MODEL_DENYLIST` | — | Modelos bloqueados, separados por vírgula |
+| `VERBOO_MODEL_ALLOWLIST` | todos | Modelos permitidos em todas as frentes (tools diretas, schemas, recursos, prompts, preview e agentes), separados por vírgula |
+| `VERBOO_MODEL_DENYLIST` | — | Modelos bloqueados em todas as frentes; são ocultados dos schemas/recursos e rejeitados antes de rede ou fila |
 | `VERBOO_MODEL_TIERS` | `pro,max,ultra` | Grupos internos permitidos no roteamento, preview e seleção manual; não substitui a allowlist da assinatura |
 | `VERBOO_MODEL_COOLDOWN_SECONDS` | `60` | Cooldown de um modelo após falha recuperável |
 | `VERBOO_CODE_BIN` | `verboo` | Executável da CLI oficial; pode ser Node quando `VERBOO_CODE_ENTRYPOINT` estiver definido |

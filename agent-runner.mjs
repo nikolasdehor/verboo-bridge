@@ -22,6 +22,25 @@ const DEFAULT_AGENT_CONCURRENCY = 4;
 const MAX_AGENT_CONCURRENCY = 8;
 const KILL_GRACE_MS = 2_000;
 const AGENT_NAME = 'verboo-bridge-agent';
+const NATIVE_ALWAYS_DISALLOWED_TOOLS = [
+  'Bash',
+  'WebFetch',
+  'WebSearch',
+  'Task',
+  'TaskOutput',
+  'TaskStop',
+  'MultiEdit',
+  'NotebookEdit',
+  'TodoWrite',
+  'Skill',
+  'ToolSearch',
+  'AskUserQuestion',
+  'EnterPlanMode',
+  'ExitPlanMode',
+  'ListMcpResourcesTool',
+  'ReadMcpResourceTool',
+  'LSP',
+];
 let activeAgentRuns = 0;
 let slotWaiters = [];
 
@@ -299,6 +318,40 @@ export function configuredModelPolicy(availableModels, env) {
   };
 }
 
+export function assertGlobalModelAllowed(model, env) {
+  const allowlist = envList(env.VERBOO_MODEL_ALLOWLIST);
+  const denylist = new Set(envList(env.VERBOO_MODEL_DENYLIST));
+  validateConfiguredModels('VERBOO_MODEL_ALLOWLIST', allowlist);
+  validateConfiguredModels('VERBOO_MODEL_DENYLIST', [...denylist]);
+  const tiers = allowedTiers(env);
+  const tier = MODEL_CATALOG[model]?.tier;
+  if (allowlist.length && !allowlist.includes(model)) {
+    throw agentError(
+      'MODEL_NOT_ALLOWED',
+      `Modelo fora de VERBOO_MODEL_ALLOWLIST: ${model}.`,
+    );
+  }
+  if (denylist.has(model)) {
+    throw agentError(
+      'MODEL_NOT_ALLOWED',
+      `Modelo bloqueado por VERBOO_MODEL_DENYLIST: ${model}.`,
+    );
+  }
+  if (!tier || !tiers.includes(tier)) {
+    throw agentError(
+      'MODEL_NOT_ALLOWED',
+      `Tier do modelo bloqueado por VERBOO_MODEL_TIERS: ${model} (${tier ?? 'unknown'}).`,
+    );
+  }
+}
+
+export function globallyAllowedModels(availableModels, env) {
+  const policy = configuredModelPolicy(availableModels, env);
+  return policy.availableModels.filter(
+    (model) => policy.allowTiers.includes(MODEL_CATALOG[model]?.tier),
+  );
+}
+
 function markModelStarted(model) {
   const state = modelRuntimeState[model];
   state.inFlight += 1;
@@ -325,28 +378,7 @@ function recoverableModelFailure(error) {
 
 function modelRouteFor(request, availableModels, env) {
   if (request.model !== 'auto') {
-    const allowlist = envList(env.VERBOO_MODEL_ALLOWLIST);
-    const denylist = new Set(envList(env.VERBOO_MODEL_DENYLIST));
-    const tiers = allowedTiers(env);
-    const tier = MODEL_CATALOG[request.model]?.tier;
-    if (allowlist.length && !allowlist.includes(request.model)) {
-      throw agentError(
-        'MODEL_NOT_ALLOWED',
-        `Modelo fora de VERBOO_MODEL_ALLOWLIST: ${request.model}.`,
-      );
-    }
-    if (denylist.has(request.model)) {
-      throw agentError(
-        'MODEL_NOT_ALLOWED',
-        `Modelo bloqueado por VERBOO_MODEL_DENYLIST: ${request.model}.`,
-      );
-    }
-    if (!tier || !tiers.includes(tier)) {
-      throw agentError(
-        'MODEL_NOT_ALLOWED',
-        `Tier do modelo bloqueado por VERBOO_MODEL_TIERS: ${request.model} (${tier ?? 'unknown'}).`,
-      );
-    }
+    assertGlobalModelAllowed(request.model, env);
     return {
       strategy: 'manual',
       model: request.model,
@@ -440,6 +472,13 @@ function nativePathPattern(cwd, suffix = '**') {
   return `${escaped.replace(/\/+$/, '')}/${suffix}`;
 }
 
+function nativeDisallowedToolsForMode(mode) {
+  return [
+    ...(mode === 'read_only' ? ['Edit', 'Write'] : []),
+    ...NATIVE_ALWAYS_DISALLOWED_TOOLS,
+  ];
+}
+
 function nativePermissionSettings(request) {
   const write = request.mode === 'write';
   const projectFiles = nativePathPattern(request.cwd);
@@ -459,11 +498,7 @@ function nativePermissionSettings(request) {
     ...secretFiles.map((pattern) => `Read(${pattern})`),
     ...secretFiles.map((pattern) => `Edit(${pattern})`),
     ...secretFiles.map((pattern) => `Write(${pattern})`),
-    ...(!write ? ['Edit', 'Write'] : []),
-    'Bash',
-    'WebFetch',
-    'WebSearch',
-    'Task',
+    ...nativeDisallowedToolsForMode(request.mode),
   ];
   return JSON.stringify({
     disableAllHooks: true,
@@ -475,15 +510,22 @@ function nativePermissionSettings(request) {
   });
 }
 
+export function allowedToolsForMode(mode, executor = 'native') {
+  const write = mode === 'write';
+  if (executor === 'opencode') {
+    return write ? ['Read', 'Glob', 'List', 'Edit'] : ['Read', 'Glob', 'List'];
+  }
+  return write ? ['Read', 'Glob', 'Grep', 'Edit', 'Write'] : ['Read', 'Glob', 'Grep'];
+}
+
 export function buildVerbooCodeInvocation(
   request,
   verbooCodeBin = 'verboo',
   entrypoint = '',
 ) {
-  const write = request.mode === 'write';
-  const tools = write
-    ? 'Read,Glob,Grep,Edit,Write'
-    : 'Read,Glob,Grep';
+  const allowedTools = allowedToolsForMode(request.mode, 'native');
+  const tools = allowedTools.join(',');
+  const disallowedTools = nativeDisallowedToolsForMode(request.mode).join(',');
   const args = [];
   if (entrypoint) args.push(entrypoint);
   args.push(
@@ -497,6 +539,9 @@ export function buildVerbooCodeInvocation(
     'bypassPermissions',
     '--tools',
     tools,
+    '--disallowed-tools',
+    disallowedTools,
+    '--include-partial-messages',
     '--strict-mcp-config',
     '--disable-slash-commands',
     '--no-chrome',
@@ -530,16 +575,402 @@ export function buildChildEnv(sourceEnv, invocation) {
   return childEnv;
 }
 
-function stripReasoning(text) {
-  return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+const THINK_OPEN = '<think>';
+const THINK_CLOSE = '</think>';
+
+function isBacktickedTag(input, index, tag) {
+  return index > 0
+    && input[index - 1] === '`'
+    && input[index + tag.length] === '`';
+}
+
+function trailingTagPrefix(text, tag) {
+  for (let length = Math.min(text.length, tag.length - 1); length > 0; length--) {
+    if (tag.startsWith(text.slice(-length).toLowerCase())) {
+      return text.slice(-length);
+    }
+  }
+  return '';
+}
+
+function consumeInsideThink(input, position) {
+  const closeIndex = input.toLowerCase().indexOf(THINK_CLOSE, position);
+  if (closeIndex === -1) {
+    return {
+      position: input.length,
+      inThink: true,
+      buffer: trailingTagPrefix(input.slice(position), THINK_CLOSE),
+      visible: '',
+    };
+  }
+  return {
+    position: closeIndex + THINK_CLOSE.length,
+    inThink: isBacktickedTag(input, closeIndex, THINK_CLOSE),
+    buffer: '',
+    visible: '',
+  };
+}
+
+function consumeVisibleText(input, position) {
+  const openIndex = input.toLowerCase().indexOf(THINK_OPEN, position);
+  if (openIndex === -1) {
+    const remaining = input.slice(position);
+    const buffer = trailingTagPrefix(remaining, THINK_OPEN);
+    return {
+      position: input.length,
+      inThink: false,
+      buffer,
+      visible: remaining.slice(0, remaining.length - buffer.length),
+    };
+  }
+  if (isBacktickedTag(input, openIndex, THINK_OPEN)) {
+    return {
+      position: openIndex + THINK_OPEN.length,
+      inThink: false,
+      buffer: '',
+      visible: input.slice(position, openIndex + THINK_OPEN.length),
+    };
+  }
+  return {
+    position: openIndex + THINK_OPEN.length,
+    inThink: true,
+    buffer: '',
+    visible: input.slice(position, openIndex),
+  };
+}
+
+function consumeThinkStream(input, startsInThink) {
+  let position = 0;
+  let inThink = startsInThink;
+  let buffer = '';
+  let visible = '';
+  while (position < input.length) {
+    const consumed = inThink
+      ? consumeInsideThink(input, position)
+      : consumeVisibleText(input, position);
+    position = consumed.position;
+    inThink = consumed.inThink;
+    buffer = consumed.buffer;
+    visible += consumed.visible;
+  }
+  return { inThink, buffer, visible };
+}
+
+function createThinkFilter() {
+  let inThink = false;
+  let thinkBuffer = '';
+
+  const filter = (text) => {
+    if (!text) return '';
+    const consumed = consumeThinkStream(thinkBuffer + text, inThink);
+    inThink = consumed.inThink;
+    thinkBuffer = consumed.buffer;
+    return consumed.visible;
+  };
+
+  filter.flush = () => {
+    const visible = inThink ? '' : thinkBuffer;
+    thinkBuffer = '';
+    return visible;
+  };
+
+  return filter;
+}
+
+function categorizeTool(name) {
+  const n = (name ?? '').toLowerCase();
+  if (n === 'read') return 'Read';
+  if (n === 'glob' || n === 'list' || n === 'search') return 'Glob';
+  if (n === 'grep') return 'Grep';
+  if (n === 'edit' || n === 'apply_diff' || n === 'apply_patch') return 'Edit';
+  if (n === 'write' || n === 'create' || n === 'delete') return 'Write';
+  if (n === 'bash' || n === 'shell' || n === 'execute_command') return 'Bash';
+  return 'Other';
+}
+
+function policyToolName(name) {
+  const normalized = String(name ?? '').toLowerCase();
+  if (normalized === 'apply_diff' || normalized === 'apply_patch') return 'edit';
+  return normalized;
+}
+
+export function buildProgressOnLine(
+  onProgress,
+  {
+    minIntervalMs = 100,
+    now = Date.now,
+    mode = 'read_only',
+    executor = 'native',
+  } = {},
+) {
+  const categories = ['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash', 'Other'];
+  const counts = Object.fromEntries(
+    categories.map((category) => [
+      category,
+      { total: 0, succeeded: 0, failed: 0 },
+    ]),
+  );
+  const allowedTools = allowedToolsForMode(mode, executor);
+  const pendingTools = new Map();
+  const completedTools = new Set();
+  const anonymousActiveKeys = new Map();
+  const anonymousActiveKeysByFullKey = new Map();
+  const anonymousCounts = new Map();
+  const toolAliases = new Map();
+  const pendingContentToolsBySession = new Map();
+  let lastEmitAt = Number.NEGATIVE_INFINITY;
+  let pending = false;
+  let closed = false;
+  let phase = 'waiting_model';
+  let hasSeenToolUse = false;
+
+  const emit = () => {
+    if (!pending || closed) return;
+    pending = false;
+    lastEmitAt = now();
+    const toolCounts = Object.fromEntries(
+      Object.entries(counts).map(([category, value]) => [
+        category,
+        { ...value },
+      ]),
+    );
+    const total = Object.values(counts).reduce(
+      (sum, value) => ({
+        total: sum.total + value.total,
+        succeeded: sum.succeeded + value.succeeded,
+        failed: sum.failed + value.failed,
+      }),
+      { total: 0, succeeded: 0, failed: 0 },
+    );
+    onProgress({
+      phase,
+      allowed_tools: allowedTools,
+      tool_counts: {
+        ...toolCounts,
+        total,
+      },
+    });
+  };
+
+  const startTool = (name, id, sessionContext = {}) => {
+    let key;
+    if (id) {
+      key = String(id);
+    } else {
+      const sessionId = String(sessionContext.sessionId ?? 'global');
+      const baseKey = `anon:${sessionId}:${name}`;
+      if (!sessionContext.forceNewAnonymous && anonymousActiveKeys.has(baseKey)) {
+        key = anonymousActiveKeys.get(baseKey);
+      } else {
+        const count = (anonymousCounts.get(baseKey) ?? 0) + 1;
+        anonymousCounts.set(baseKey, count);
+        key = `${baseKey}:${count}`;
+        if (!sessionContext.forceNewAnonymous) {
+          anonymousActiveKeys.set(baseKey, key);
+          anonymousActiveKeysByFullKey.set(key, baseKey);
+        }
+      }
+    }
+
+    if (pendingTools.has(key) || completedTools.has(key)) return key;
+    if (!hasSeenToolUse) {
+      hasSeenToolUse = true;
+      phase = 'executing_tool';
+    } else if (phase === 'processing_result') {
+      phase = 'executing_tool';
+    }
+    const category = categorizeTool(name);
+    pendingTools.set(key, category);
+    counts[category].total += 1;
+    pending = true;
+    return key;
+  };
+
+  const finishTool = (id, failed) => {
+    if (!id) return;
+    const key = String(id);
+    const category = pendingTools.get(key);
+    if (!category || completedTools.has(key)) return;
+    counts[category][failed ? 'failed' : 'succeeded'] += 1;
+    pendingTools.delete(key);
+    completedTools.add(key);
+    if (anonymousActiveKeysByFullKey.has(key)) {
+      const baseKey = anonymousActiveKeysByFullKey.get(key);
+      anonymousActiveKeys.delete(baseKey);
+      anonymousActiveKeysByFullKey.delete(key);
+    }
+    for (const [alias, mappedKey] of toolAliases) {
+      if (mappedKey === key) toolAliases.delete(alias);
+    }
+    phase = 'processing_result';
+    pending = true;
+  };
+
+  const takePendingContentTool = (sessionId) => {
+    const sessionKey = String(sessionId ?? 'global');
+    const queue = pendingContentToolsBySession.get(sessionKey) ?? [];
+    while (queue.length > 0) {
+      const key = queue.shift();
+      if (pendingTools.has(key)) return key;
+    }
+    pendingContentToolsBySession.delete(sessionKey);
+    return null;
+  };
+
+  const emitIfReady = () => {
+    if (pending && now() - lastEmitAt >= minIntervalMs) emit();
+  };
+
+  const handleStreamToolStart = (event) => {
+    const streamEvent = event.type === 'stream_event' ? event.event : null;
+    if (
+      streamEvent?.type !== 'content_block_start'
+      || streamEvent.content_block?.type !== 'tool_use'
+    ) {
+      return false;
+    }
+    const block = streamEvent.content_block;
+    startTool(block.name, block.id, {
+      sessionId: event.session_id,
+      context: block.input,
+    });
+    return true;
+  };
+
+  const registerContentToolCall = (event, sessionId) => {
+    const id = event.id ?? event.call_id ?? event.tool_use_id;
+    const key = startTool(event.name, id, {
+      sessionId,
+      forceNewAnonymous: !id,
+    });
+    if (id) toolAliases.set(String(id), key);
+    const sessionKey = String(sessionId ?? 'global');
+    const queue = pendingContentToolsBySession.get(sessionKey) ?? [];
+    if (!queue.includes(key)) queue.push(key);
+    pendingContentToolsBySession.set(sessionKey, queue);
+  };
+
+  const handleOpenCodeToolUse = (event, sessionId) => {
+    if (event.type === 'tool_use' && typeof event.part?.tool === 'string') {
+      const id = event.part.id
+        ?? event.part.callID
+        ?? event.part.callId
+        ?? event.part.toolCallID;
+      const context = event.part.state?.input ?? event.part.input;
+      const key = startTool(event.part.tool, id, { sessionId, context });
+      const status = String(event.part.state?.status ?? '').toLowerCase();
+      if (['completed', 'failed', 'error'].includes(status)) {
+        finishTool(key, status !== 'completed' || Boolean(event.part.state?.error));
+      }
+      return;
+    }
+    if (
+      event.type === 'content'
+      && event.content_type === 'tool_call'
+      && typeof event.name === 'string'
+    ) {
+      registerContentToolCall(event, sessionId);
+    }
+  };
+
+  const handleNativeBlocks = (event, sessionId) => {
+    for (const block of nativeEventBlocks(event)) {
+      if (block.type === 'tool_use' && typeof block.name === 'string') {
+        startTool(block.name, block.id, { sessionId, context: block.input });
+      } else if (block.type === 'tool_result') {
+        finishTool(block.tool_use_id, block.is_error === true);
+      }
+    }
+  };
+
+  const handleToolResult = (event, sessionId) => {
+    if (event.type !== 'tool_result') return;
+    const id = event.tool_use_id ?? event.call_id ?? event.part?.tool_use_id;
+    const directKey = id && pendingTools.has(String(id)) ? String(id) : null;
+    const aliasedKey = id ? toolAliases.get(String(id)) : null;
+    finishTool(
+      directKey
+        ?? aliasedKey
+        ?? takePendingContentTool(sessionId),
+      event.is_error === true || event.part?.is_error === true,
+    );
+  };
+
+  const onLine = (line) => {
+    if (closed) return;
+    try {
+      const event = JSON.parse(line);
+      pending = true;
+      const sessionId = event.sessionID
+        ?? event.part?.sessionID
+        ?? event.session_id
+        ?? event.sessionId;
+      if (handleStreamToolStart(event)) {
+        emitIfReady();
+        return;
+      }
+      handleOpenCodeToolUse(event, sessionId);
+      handleNativeBlocks(event, sessionId);
+      handleToolResult(event, sessionId);
+      emitIfReady();
+    } catch {}
+  };
+  onLine.flush = emit;
+  onLine.close = () => {
+    emit();
+    closed = true;
+  };
+  return onLine;
+}
+
+
+function openCodeEventSessionId(event) {
+  return event.sessionID
+    ?? event.part?.sessionID
+    ?? event.session_id
+    ?? event.sessionId
+    ?? null;
+}
+
+function registerOpenCodeContentTool(pendingBySession, event) {
+  if (
+    event.type !== 'content'
+    || event.content_type !== 'tool_call'
+    || typeof event.name !== 'string'
+  ) {
+    return null;
+  }
+  const sessionKey = String(openCodeEventSessionId(event) ?? 'global');
+  const queue = pendingBySession.get(sessionKey) ?? [];
+  const id = event.id ?? event.call_id ?? event.tool_use_id;
+  queue.push({ id: id == null ? null : String(id), tool: event.name });
+  pendingBySession.set(sessionKey, queue);
+  return event.name;
+}
+
+function takeSuccessfulOpenCodeContentTool(pendingBySession, event) {
+  if (event.type !== 'tool_result') return null;
+  const sessionKey = String(openCodeEventSessionId(event) ?? 'global');
+  const queue = pendingBySession.get(sessionKey) ?? [];
+  if (queue.length === 0) return null;
+  const id = event.tool_use_id ?? event.call_id ?? event.part?.tool_use_id;
+  const matchedIndex = id == null
+    ? -1
+    : queue.findIndex((pending) => pending.id === String(id));
+  const [completed] = queue.splice(Math.max(0, matchedIndex), 1);
+  if (queue.length === 0) pendingBySession.delete(sessionKey);
+  if (event.is_error === true || event.part?.is_error === true) return null;
+  return completed.tool;
 }
 
 export function parseOpenCodeEvents(raw, cwd) {
   let sessionId = null;
-  let result = '';
+  const resultParts = [];
   const artifacts = new Set();
   const toolsUsed = new Set();
   const successfulTools = new Set();
+  const pendingContentToolsBySession = new Map();
+  const filter = createThinkFilter();
 
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
@@ -550,10 +981,10 @@ export function parseOpenCodeEvents(raw, cwd) {
       continue;
     }
 
-    sessionId ||= event.sessionID ?? event.part?.sessionID ?? null;
+    sessionId ||= openCodeEventSessionId(event);
     if (event.type === 'text') {
-      const candidate = stripReasoning(event.part?.text ?? '');
-      if (candidate) result = candidate;
+      const candidate = filter(event.part?.text ?? '');
+      if (candidate) resultParts.push(candidate);
     }
 
     if (event.type === 'tool_use') {
@@ -567,11 +998,24 @@ export function parseOpenCodeEvents(raw, cwd) {
         if (isInside(cwd, candidate)) artifacts.add(candidate);
       }
     }
+    const contentTool = registerOpenCodeContentTool(
+      pendingContentToolsBySession,
+      event,
+    );
+    if (contentTool) toolsUsed.add(contentTool);
+    const completedContentTool = takeSuccessfulOpenCodeContentTool(
+      pendingContentToolsBySession,
+      event,
+    );
+    if (completedContentTool) successfulTools.add(completedContentTool);
   }
+
+  const remaining = filter.flush();
+  if (remaining) resultParts.push(remaining);
 
   return {
     sessionId,
-    result,
+    result: resultParts.join('').trim(),
     artifacts: sortedStrings(artifacts),
     toolsUsed: sortedStrings(toolsUsed),
     successfulTools: sortedStrings(successfulTools),
@@ -585,11 +1029,12 @@ function nativeEventBlocks(event) {
 
 export function parseVerbooCodeEvents(raw, cwd) {
   let sessionId = null;
-  let result = '';
+  const resultParts = [];
   const artifacts = new Set();
   const toolsUsed = new Set();
   const successfulTools = new Set();
   const pendingTools = new Map();
+  const filter = createThinkFilter();
 
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
@@ -602,14 +1047,14 @@ export function parseVerbooCodeEvents(raw, cwd) {
 
     sessionId ||= event.session_id ?? event.sessionId ?? null;
     if (event.type === 'result' && typeof event.result === 'string') {
-      const candidate = stripReasoning(event.result);
-      if (candidate) result = candidate;
+      const candidate = filter(event.result);
+      if (candidate) resultParts.push(candidate);
     }
 
     for (const block of nativeEventBlocks(event)) {
       if (block.type === 'text') {
-        const candidate = stripReasoning(block.text ?? '');
-        if (candidate) result = candidate;
+        const candidate = filter(block.text ?? '');
+        if (candidate) resultParts.push(candidate);
         continue;
       }
       if (block.type === 'tool_use') {
@@ -637,9 +1082,12 @@ export function parseVerbooCodeEvents(raw, cwd) {
     }
   }
 
+  const remaining = filter.flush();
+  if (remaining) resultParts.push(remaining);
+
   return {
     sessionId,
-    result,
+    result: resultParts.join('').trim(),
     artifacts: sortedStrings(artifacts),
     toolsUsed: sortedStrings(toolsUsed),
     successfulTools: sortedStrings(successfulTools),
@@ -745,7 +1193,9 @@ function execute(invocation, options) {
     spawnImpl = spawn,
     killImpl = process.kill,
     killGraceMs = KILL_GRACE_MS,
+    timeoutMs = timeoutSeconds * 1000,
     signal,
+    onLine,
   } = options;
 
   return new Promise((resolve, reject) => {
@@ -761,10 +1211,9 @@ function execute(invocation, options) {
     let stderrBytes = 0;
     let settled = false;
     let terminationError = null;
-    let childClosed = false;
-    let forceKillSent = false;
     let forceKillTimer;
     let timer;
+    let lineBuffer = '';
 
     const child = spawnImpl(invocation.command, invocation.args, {
       cwd,
@@ -783,11 +1232,12 @@ function execute(invocation, options) {
       signal.addEventListener('abort', onSignalAbort, { once: true });
     }
 
-    const finish = (callback, value) => {
+    const finish = (callback, value, clearForceKill = true) => {
       if (settled) return;
       settled = true;
+      onLine?.close?.();
       clearTimeout(timer);
-      clearTimeout(forceKillTimer);
+      if (clearForceKill) clearTimeout(forceKillTimer);
       if (signal) {
         signal.removeEventListener('abort', onSignalAbort);
       }
@@ -809,12 +1259,11 @@ function execute(invocation, options) {
     const terminate = (error) => {
       if (settled || terminationError) return;
       terminationError = error;
-      signalTree('SIGTERM');
       forceKillTimer = setTimeout(() => {
-        forceKillSent = true;
         signalTree('SIGKILL');
-        if (childClosed) finish(reject, terminationError);
+        finish(reject, terminationError);
       }, killGraceMs);
+      signalTree('SIGTERM');
     };
 
     timer = setTimeout(() => {
@@ -822,7 +1271,7 @@ function execute(invocation, options) {
         'TIMEOUT',
         `${invocation.label} excedeu o timeout de ${timeoutSeconds}s e foi interrompido.`,
       ));
-    }, timeoutSeconds * 1000);
+    }, timeoutMs);
 
     child.stdout?.on('data', (chunk) => {
       if (terminationError) return;
@@ -836,7 +1285,14 @@ function execute(invocation, options) {
         );
         return;
       }
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      if (onLine) {
+        lineBuffer += text;
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop() ?? '';
+        for (const line of lines) onLine(line);
+      }
     });
 
     child.stderr?.on('data', (chunk) => {
@@ -860,9 +1316,9 @@ function execute(invocation, options) {
     });
 
     child.on('close', (code) => {
-      childClosed = true;
       if (terminationError) {
-        if (forceKillSent) finish(reject, terminationError);
+        const processGroupMayRemain = process.platform !== 'win32' && child.pid;
+        finish(reject, terminationError, !processGroupMayRemain);
         return;
       }
       if (code !== 0) {
@@ -903,6 +1359,7 @@ function execute(invocation, options) {
         );
         return;
       }
+      if (lineBuffer.trim() && onLine) onLine(lineBuffer);
       finish(resolve, stdout);
     });
   });
@@ -928,7 +1385,16 @@ async function executeAgentAttempt(
   options,
   timeoutSeconds = request.timeoutSeconds,
 ) {
+  if (options.onProgress) {
+    options.onProgress({
+      phase: 'waiting_model',
+      allowed_tools: allowedToolsForMode(request.mode, executor),
+    });
+  }
   const invocation = buildAgentInvocation(request, executor, options.env);
+  const onLine = options.onProgress
+    ? buildProgressOnLine(options.onProgress, { mode: request.mode, executor })
+    : undefined;
   const raw = await execute(invocation, {
     cwd: request.cwd,
     timeoutSeconds,
@@ -936,11 +1402,26 @@ async function executeAgentAttempt(
     spawnImpl: options.spawnImpl,
     killImpl: options.killImpl,
     killGraceMs: options.killGraceMs,
+    timeoutMs: options.timeoutMs,
     signal: options.signal,
+    onLine,
   });
+  if (options.onProgress) options.onProgress({ phase: 'processing_result' });
   const parsed = executor === 'native'
     ? parseVerbooCodeEvents(raw, request.cwd)
     : parseOpenCodeEvents(raw, request.cwd);
+  const allowedTools = new Set(
+    allowedToolsForMode(request.mode, executor).map(policyToolName),
+  );
+  const forbiddenUsed = parsed.toolsUsed.filter(
+    (tool) => !allowedTools.has(policyToolName(tool)),
+  );
+  if (forbiddenUsed.length > 0) {
+    throw agentError(
+      'FORBIDDEN_TOOL_USED',
+      `${invocation.label} executou ferramenta proibida pela política: ${forbiddenUsed.join(', ')}.`,
+    );
+  }
   const hasWriteExecution = parsed.successfulTools.some((tool) => (
     ['apply_patch', 'edit', 'write'].includes(tool.toLowerCase())
   ));
@@ -1072,6 +1553,13 @@ async function runRoutedAgent(request, executor, options) {
     }
     const model = route.ranking[0].model;
     const attemptRequest = { ...request, model };
+    if (options.onProgress) {
+      options.onProgress({
+        phase: 'generating',
+        model,
+        attempts: { current: attempts.length + 1, total: maxAttempts },
+      });
+    }
     markModelStarted(model);
     try {
       const { parsed, status } = await executeAgentAttempt(
@@ -1110,6 +1598,12 @@ async function runRoutedAgent(request, executor, options) {
         throw error;
       }
       route = rerouteAfterFailure(request, options, attempts);
+      if (options.onProgress) {
+        options.onProgress({
+          phase: 'routing',
+          attempts: { current: attempts.length + 1, total: maxAttempts },
+        });
+      }
     }
   }
 
@@ -1137,6 +1631,12 @@ export function executorAvailableModels(executor, availableModels, env) {
 export async function runVerbooAgent(args, options) {
   let releaseAgentSlot = options.slotRelease;
   try {
+    const progressCallback = typeof args?.__onProgress === 'function'
+      ? args.__onProgress : null;
+    if (progressCallback) {
+      options = { ...options, onProgress: progressCallback };
+      progressCallback({ phase: 'routing' });
+    }
     const request = normalizeAgentRequest(args, options.availableModels);
     if (request.mode === 'write' && options.env.VERBOO_AGENT_WRITE_ENABLED !== '1') {
       throw agentError(
@@ -1156,11 +1656,15 @@ export async function runVerbooAgent(args, options) {
     request.prompt = promptWithMemory(originalPrompt, memoryContext);
     const executor = resolveAgentExecutor(args.executor, options.env);
     validateExecutorCredentials(executor, options.env);
-    const availableModels = executorAvailableModels(
+    const executorModels = executorAvailableModels(
       executor,
       options.availableModels,
       options.env,
     );
+    if (request.model !== 'auto') {
+      assertGlobalModelAllowed(request.model, options.env);
+    }
+    const availableModels = globallyAllowedModels(executorModels, options.env);
     if (availableModels.length === 0) {
       const error = agentError(
         'MODEL_ROUTE_EMPTY',
@@ -1169,7 +1673,7 @@ export async function runVerbooAgent(args, options) {
       error.executor = executor;
       throw error;
     }
-    if (request.model !== 'auto' && !availableModels.includes(request.model)) {
+    if (request.model !== 'auto' && !executorModels.includes(request.model)) {
       const error = agentError(
         'MODEL_NOT_ALLOWED',
         `Modelo ${request.model} indisponível para o executor ${executor}.`,

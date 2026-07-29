@@ -1,13 +1,19 @@
 #!/usr/bin/env node
 
+import { spawn, execFile } from 'node:child_process';
+import { accessSync, constants, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { createRequire } from 'module';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   AGENT_EXECUTORS,
+  assertGlobalModelAllowed,
   configuredModelPolicy,
   executorAvailableModels,
   formatAgentFailure,
+  globallyAllowedModels,
   MAX_TIMEOUT_SECONDS,
   MIN_TIMEOUT_SECONDS,
   normalizeAgentRequest,
@@ -91,6 +97,7 @@ async function callVerboo(model, messages, opts = {}) {
     const available = Object.keys(MODELS).join(', ');
     throw new Error(`Modelo desconhecido: "${model}". Disponiveis: ${available}`);
   }
+  assertGlobalModelAllowed(model, process.env);
 
   const body = {
     model,
@@ -132,6 +139,495 @@ async function callVerboo(model, messages, opts = {}) {
   return { content, model: data.model || model, usage: data.usage || {} };
 }
 
+// ── Safe Validation (verboo_validate) ────────────────────────────────────
+// Validação de repositório SEM iniciar agente/job, em dois perfis: estático
+// (node --check, git read-only) sob VERBOO_AGENT_VERIFY_ENABLED=1 e
+// project-code (npm test/npm run allowlistado) que exige ADICIONALMENTE
+// VERBOO_AGENT_VERIFY_PROJECT_CODE_ENABLED=1 por executar código do projeto
+// (escrita, caches, rede). Execução só pelo binário absoluto resolvido na
+// validação, argv estrito com shell:false, cwd realpath, HOME isolado e
+// timeouts por comando e total. Não é read-only; não há isolamento de rede.
+
+const VERIFY_ENABLED = process.env.VERBOO_AGENT_VERIFY_ENABLED === '1';
+const VERIFY_PROJECT_CODE_ENABLED = process.env.VERBOO_AGENT_VERIFY_PROJECT_CODE_ENABLED === '1';
+const VERIFY_MAX_COMMANDS = 10;
+const VERIFY_MAX_ARGS = 20;
+const VERIFY_MAX_ARG_LEN = 200;
+const VERIFY_OUTPUT_LIMIT = 8 * 1024;
+const VERIFY_MAX_TIMEOUT_SECONDS = 600;
+const VERIFY_DEFAULT_TIMEOUT_SECONDS = 120;
+const VERIFY_TOTAL_MAX_SECONDS = 600;
+const VERIFY_KILL_GRACE_MS = 1500;
+const VERIFY_HARD_SETTLE_MS = 2000;
+
+function verifyAllowlist(envVar) {
+  return new Set(
+    String(process.env[envVar] ?? '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean),
+  );
+}
+
+function verifyChildEnv(homeDir, cmd) {
+  const env = {
+    PATH: process.env.PATH,
+    HOME: homeDir,
+    TMPDIR: homeDir,
+    CI: 'true',
+    NO_COLOR: '1',
+  };
+  if (process.platform === 'win32') {
+    env.SystemRoot = process.env.SystemRoot;
+    env.USERPROFILE = homeDir;
+  }
+  if (cmd === 'git') {
+    // `status` pode chamar o fsmonitor configurado pelo próprio repositório.
+    // Config de escopo command vence a local; locks opcionais evitam refresh do index.
+    Object.assign(env, {
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'core.fsmonitor',
+      GIT_CONFIG_VALUE_0: 'false',
+      GIT_CONFIG_KEY_1: 'core.hooksPath',
+      GIT_CONFIG_VALUE_1: path.join(homeDir, 'git-hooks-disabled'),
+      GIT_OPTIONAL_LOCKS: '0',
+    });
+  }
+  return env;
+}
+
+function redactVerifyOutput(text) {
+  let out = text;
+  if (API_KEY) out = out.split(API_KEY).join('<redacted>');
+  return out.replace(/Bearer\s+\S+/gi, 'Bearer <redacted>');
+}
+
+// Resolve o binário no MESMO PATH entregue ao processo filho e devolve o
+// caminho absoluto realpath que será executado - o PATH do filho nunca pode
+// selecionar outro executável depois da validação.
+function resolveVerifyBinary(cmd, pathEnv) {
+  if (!/^[A-Za-z0-9._-]+$/.test(cmd)) {
+    throw new Error('nome de binário inválido');
+  }
+  const exts = process.platform === 'win32' ? ['.exe', '.cmd', ''] : [''];
+  for (const dir of String(pathEnv ?? '').split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      try {
+        const resolved = realpathSync(path.join(dir, cmd + ext));
+        accessSync(resolved, constants.X_OK);
+        return resolved;
+      } catch { /* próximo candidato */ }
+    }
+  }
+  throw new Error(`binário de validação não encontrado: ${cmd}`);
+}
+
+function resolveVerifyExecutable(cmd, pathEnv) {
+  const bin = resolveVerifyBinary(cmd, pathEnv);
+  if (cmd !== 'npm') {
+    return { bin, prefixArgs: [], supportFiles: [] };
+  }
+
+  // npm é um script. Execute-o sempre com o mesmo node absoluto resolvido
+  // agora, sem deixar "#!/usr/bin/env node" consultar o PATH no spawn.
+  let npmCli = bin;
+  try {
+    if (process.platform === 'win32' && bin.toLowerCase().endsWith('.cmd')) {
+      npmCli = realpathSync(
+        path.join(path.dirname(bin), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+      );
+    }
+  } catch {
+    throw new Error('npm.cmd sem npm-cli.js verificável');
+  }
+  return {
+    bin: resolveVerifyBinary('node', pathEnv),
+    prefixArgs: [npmCli],
+    supportFiles: [npmCli],
+  };
+}
+
+function validateVerifyArgs(args) {
+  if (args.length > VERIFY_MAX_ARGS) {
+    throw new Error(`muitos argumentos (max ${VERIFY_MAX_ARGS})`);
+  }
+  for (const arg of args) {
+    if (arg.length > VERIFY_MAX_ARG_LEN) {
+      throw new Error(`argumento excede ${VERIFY_MAX_ARG_LEN} caracteres`);
+    }
+    if (/[;&|<>$`]/.test(arg)) {
+      throw new Error('argumento com metacaractere proibido');
+    }
+  }
+}
+
+function validateNpmVerifyArgs(args) {
+  if (args.length === 1 && args[0] === 'test') return;
+  if (
+    args.length === 2
+    && args[0] === 'run'
+    && /^[A-Za-z0-9:_-]+$/.test(args[1])
+  ) {
+    if (verifyAllowlist('VERBOO_AGENT_VERIFY_NPM_SCRIPTS').has(args[1])) return;
+    throw new Error('script npm fora da allowlist administrativa');
+  }
+  throw new Error('comando npm fora da política de validação');
+}
+
+function resolveNodeCheckFile(args, cwd) {
+  if (args.length !== 2 || args[0] !== '--check') {
+    throw new Error('comando node fora da política de validação');
+  }
+  let file;
+  try {
+    file = realpathSync(path.resolve(cwd, args[1]));
+  } catch {
+    throw new Error('arquivo de verificação inexistente');
+  }
+  if (file === cwd || !file.startsWith(cwd + path.sep)) {
+    throw new Error('arquivo de verificação fora do diretório autorizado');
+  }
+  return file;
+}
+
+function validateGitVerifyArgs(args) {
+  // Allowlist positiva exata: qualquer flag/pathspec/config não modelada
+  // (-c, --git-dir, --work-tree, pager, pathspec magic) é rejeitada.
+  const allowed = [
+    ['diff', '--check'],
+    ['diff', '--cached', '--check'],
+    ['status', '--porcelain=v1'],
+    ['log', '--oneline'],
+  ];
+  const exactMatch = allowed.some(
+    (spec) => spec.length === args.length
+      && spec.every((value, index) => value === args[index]),
+  );
+  const boundedLog = args.length === 4
+    && args[0] === 'log'
+    && args[1] === '--oneline'
+    && args[2] === '-n'
+    && /^\d{1,3}$/.test(args[3])
+    && Number(args[3]) <= 100;
+  if (!exactMatch && !boundedLog) {
+    throw new Error('comando git fora da política de validação');
+  }
+}
+
+function normalizeVerifyCommand(command, cwd, pathEnv) {
+  const cmd = String(command?.cmd ?? '');
+  const args = Array.isArray(command?.args) ? command.args.map(String) : [];
+  validateVerifyArgs(args);
+  let file = null;
+  switch (cmd) {
+    case 'npm':
+      validateNpmVerifyArgs(args);
+      break;
+    case 'node':
+      file = resolveNodeCheckFile(args, cwd);
+      break;
+    case 'git':
+      validateGitVerifyArgs(args);
+      break;
+    default:
+      throw new Error(`comando fora da política de validação: ${cmd}`);
+  }
+  const executable = resolveVerifyExecutable(cmd, pathEnv);
+  const normalizedArgs = file ? ['--check', file] : args;
+  return {
+    cmd,
+    args: normalizedArgs,
+    execArgs: [...executable.prefixArgs, ...normalizedArgs],
+    bin: executable.bin,
+    file,
+    supportFiles: executable.supportFiles,
+  };
+}
+
+// Revalida imediatamente antes do spawn: o binário/arquivo resolvido não pode
+// ter sido trocado (ex.: symlink re-apontado) entre a validação e a execução.
+function recheckVerifyTarget(command) {
+  try {
+    if (realpathSync(command.bin) !== command.bin) {
+      return 'binário de validação alterado após a política';
+    }
+    accessSync(command.bin, constants.X_OK);
+    if (command.file && realpathSync(command.file) !== command.file) {
+      return 'arquivo de verificação alterado após a política';
+    }
+    for (const supportFile of command.supportFiles) {
+      if (realpathSync(supportFile) !== supportFile) {
+        return 'suporte do executável alterado após a política';
+      }
+    }
+    return null;
+  } catch {
+    return 'alvo de validação indisponível na revalidação';
+  }
+}
+
+function killWindowsVerifyTree(child, signal) {
+  if (process.platform !== 'win32' || !child.pid) return false;
+  try {
+    const systemRoot = realpathSync(
+      process.env.SystemRoot || String.raw`C:\Windows`,
+    );
+    const taskkill = realpathSync(path.join(systemRoot, 'System32', 'taskkill.exe'));
+    if (!taskkill.toLowerCase().startsWith(systemRoot.toLowerCase() + path.sep)) {
+      throw new Error('taskkill fora de SystemRoot');
+    }
+    execFile(
+      taskkill,
+      ['/PID', String(child.pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])],
+      { shell: false, windowsHide: true },
+      () => {},
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killUnixVerifyGroup(child, signal) {
+  if (process.platform === 'win32' || !child.pid) return false;
+  try {
+    process.kill(-child.pid, signal); // grupo de processo (detached)
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killVerifyChild(child, signal) {
+  if (killWindowsVerifyTree(child, signal)) return;
+  if (killUnixVerifyGroup(child, signal)) return;
+  try { child.kill(signal); } catch { /* processo já encerrado */ }
+}
+
+function emptyVerifyResult() {
+  return {
+    exit_code: null,
+    signal: null,
+    timed_out: false,
+    hard_settled: false,
+    duration_ms: 0,
+    stdout: '',
+    stderr: '',
+    stdout_truncated: false,
+    stderr_truncated: false,
+  };
+}
+
+function runVerifyCommand(command, cwd, env, timeoutMs) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    let child;
+    try {
+      child = spawn(command.bin, command.execArgs, {
+        cwd,
+        shell: false,
+        env,
+        windowsHide: true,
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {
+      resolve({
+        ...emptyVerifyResult(),
+        duration_ms: Date.now() - startedAt,
+        error: 'falha ao iniciar o processo de validação',
+      });
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let finished = false;
+    let timedOut = false;
+
+    const collect = (current, chunk) => {
+      const text = chunk.toString('utf8');
+      if (current.length + text.length > VERIFY_OUTPUT_LIMIT) {
+        return { text: current + text.slice(0, Math.max(0, VERIFY_OUTPUT_LIMIT - current.length)), truncated: true };
+      }
+      return { text: current + text, truncated: false };
+    };
+    child.stdout.on('data', (chunk) => {
+      const next = collect(stdout, chunk);
+      stdout = next.text;
+      stdoutTruncated = stdoutTruncated || next.truncated;
+    });
+    child.stderr.on('data', (chunk) => {
+      const next = collect(stderr, chunk);
+      stderr = next.text;
+      stderrTruncated = stderrTruncated || next.truncated;
+    });
+
+    function finish(extra) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(termTimer);
+      clearTimeout(killTimer);
+      clearTimeout(settleTimer);
+      resolve({
+        ...emptyVerifyResult(),
+        timed_out: timedOut,
+        duration_ms: Date.now() - startedAt,
+        stdout: redactVerifyOutput(stdout),
+        stderr: redactVerifyOutput(stderr),
+        stdout_truncated: stdoutTruncated,
+        stderr_truncated: stderrTruncated,
+        ...extra,
+      });
+    }
+
+    // SIGTERM → SIGKILL → hard-settle: resolve mesmo que `close` nunca chegue.
+    const termTimer = setTimeout(() => {
+      timedOut = true;
+      killVerifyChild(child, 'SIGTERM');
+    }, timeoutMs);
+    const killTimer = setTimeout(() => {
+      if (timedOut) killVerifyChild(child, 'SIGKILL');
+    }, timeoutMs + VERIFY_KILL_GRACE_MS);
+    const settleTimer = setTimeout(() => {
+      if (timedOut) finish({ signal: 'SIGKILL', hard_settled: true });
+    }, timeoutMs + VERIFY_KILL_GRACE_MS + VERIFY_HARD_SETTLE_MS);
+
+    child.on('error', () => finish({ error: 'processo de validação falhou ao iniciar' }));
+    child.on('close', (code, signal) => finish({ exit_code: code, signal }));
+  });
+}
+
+function verifyCommandFailed(result) {
+  return Boolean(result.error) || result.timed_out || result.exit_code !== 0;
+}
+
+async function executeVerifyBatch({
+  normalized,
+  cwd,
+  isolatedHome,
+  perCommandMs,
+  stopOnFailure,
+}) {
+  const deadline = Date.now()
+    + Math.min(perCommandMs * normalized.length, VERIFY_TOTAL_MAX_SECONDS * 1000);
+  const results = [];
+  let stoppedEarly = false;
+  let stopReason = null;
+  for (const command of normalized) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      stoppedEarly = true;
+      stopReason = 'total_timeout';
+      break;
+    }
+    const recheckError = recheckVerifyTarget(command);
+    const result = recheckError
+      ? { ...emptyVerifyResult(), error: recheckError }
+      : await runVerifyCommand(
+        command,
+        cwd,
+        verifyChildEnv(isolatedHome, command.cmd),
+        Math.min(perCommandMs, remainingMs),
+      );
+    results.push({ cmd: command.cmd, args: command.args, ...result });
+    if (verifyCommandFailed(result) && stopOnFailure && results.length < normalized.length) {
+      stoppedEarly = true;
+      stopReason = 'failure';
+      break;
+    }
+  }
+  return {
+    stoppedEarly,
+    stopReason,
+    results,
+    anyFailure: stoppedEarly || results.some(verifyCommandFailed),
+  };
+}
+
+async function runVerbooValidate(args) {
+  if (!VERIFY_ENABLED) {
+    return {
+      status: 'error',
+      error: 'verboo_validate desabilitado; exige opt-in administrativo VERBOO_AGENT_VERIFY_ENABLED=1.',
+    };
+  }
+  let cwd;
+  try {
+    cwd = realpathSync(await resolveAllowedCwd(
+      String(args.cwd ?? ''),
+      process.env.VERBOO_AGENT_ALLOWED_ROOTS,
+    ));
+  } catch {
+    return { status: 'error', error: 'cwd fora das raízes autorizadas ou inexistente.' };
+  }
+  const commands = Array.isArray(args.commands) ? args.commands : [];
+  if (commands.length < 1 || commands.length > VERIFY_MAX_COMMANDS) {
+    return {
+      status: 'error',
+      error: `commands deve ter entre 1 e ${VERIFY_MAX_COMMANDS} itens.`,
+    };
+  }
+  if (
+    commands.some((command) => String(command?.cmd ?? '') === 'npm')
+    && !VERIFY_PROJECT_CODE_ENABLED
+  ) {
+    return {
+      status: 'error',
+      error: 'perfil project-code (npm) exige opt-in adicional VERBOO_AGENT_VERIFY_PROJECT_CODE_ENABLED=1.',
+      executed: [],
+    };
+  }
+  const timeoutSeconds = Number.isInteger(args.timeout_seconds)
+    ? Math.min(Math.max(args.timeout_seconds, 1), VERIFY_MAX_TIMEOUT_SECONDS)
+    : VERIFY_DEFAULT_TIMEOUT_SECONDS;
+  const stopOnFailure = args.stop_on_failure !== false;
+
+  const isolatedHome = mkdtempSync(path.join(tmpdir(), 'verboo-verify-home-'));
+  try {
+    // Valida TODA a sequência antes de executar qualquer comando: violação de
+    // política falha fechado, sem efeito parcial no repositório.
+    let normalized;
+    try {
+      normalized = commands.map((command) => normalizeVerifyCommand(
+        command,
+        cwd,
+        verifyChildEnv(isolatedHome).PATH,
+      ));
+    } catch (err) {
+      return { status: 'error', error: err.message, executed: [] };
+    }
+    const perCommandMs = timeoutSeconds * 1000;
+    const {
+      stoppedEarly,
+      stopReason,
+      results,
+      anyFailure,
+    } = await executeVerifyBatch({
+      normalized,
+      cwd,
+      isolatedHome,
+      perCommandMs,
+      stopOnFailure,
+    });
+    return {
+      status: anyFailure ? 'failed' : 'ok',
+      cwd,
+      timeout_seconds: timeoutSeconds,
+      stopped_early: stoppedEarly,
+      stop_reason: stopReason,
+      results,
+    };
+  } finally {
+    try {
+      rmSync(isolatedHome, { recursive: true, force: true });
+    } catch { /* limpeza do HOME isolado é best-effort */ }
+  }
+}
+
 // ── MCP Server ──────────────────────────────────────────────────────────
 
 // ── Async Job Queue ────────────────────────────────────────────────────
@@ -158,7 +654,13 @@ jobQueue.setRunner(async (job, signal, runnerData) => {
 
 // Initialise store from env (initStore agora é await antes de start)
 let storeReady = true;
-if (process.env.VERBOO_JOB_STORE_DIR) {
+if (
+  process.env.VERBOO_JOB_PERSIST_RESULTS === '1'
+  && !process.env.VERBOO_JOB_STORE_DIR
+) {
+  log('error', 'VERBOO_JOB_PERSIST_RESULTS=1 exige VERBOO_JOB_STORE_DIR.');
+  storeReady = false;
+} else if (process.env.VERBOO_JOB_STORE_DIR) {
   try {
     await jobQueue.initStore(process.env.VERBOO_JOB_STORE_DIR);
     log('info', `Job store inicializado: ${process.env.VERBOO_JOB_STORE_DIR}`);
@@ -184,67 +686,81 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const codec = { type: 'object', properties: { prompt: { type: 'string' }, system: { type: 'string' }, temperature: { type: 'number', default: 0.3 }, max_tokens: { type: 'number', default: 65536 } }, required: ['prompt'] };
+  const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
 
-  const tools = [
-    ...Object.entries(MODELS).map(([id, info]) => ({
-      name: `verboo_${id.replace(/[.-]/g, '_')}`,
-      description: `${info.name} — ${info.note}. ${(info.ctx / 1024).toFixed(0)}K ctx, ${info.out} max output. Plano: ${info.tier}.`,
-      inputSchema: { ...codec, properties: { ...codec.properties, max_tokens: { type: 'number', description: `Max tokens (max ${info.out})`, default: Math.min(info.out, 8192) } } },
-    })),
-    {
-      name: 'verboo_code',
-      description: 'Executa tarefa de codificacao com DeepSeek V4 Flash (1M ctx, melhor CxB)',
-      inputSchema: { ...codec, properties: { ...codec.properties, model: { type: 'string', default: 'deepseek-v4-flash' } } },
-    },
-    {
-      name: 'verboo_review',
-      description: 'Revisa codigo buscando bugs, vulnerabilidades e problemas de performance',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          code: { type: 'string', description: 'Codigo a ser revisado' },
-          context: { type: 'string', description: 'Contexto adicional (ex: linguagem, framework)' },
-          model: { type: 'string', default: 'deepseek-v4-flash' },
-          temperature: { type: 'number', default: 0.2 },
-        },
-        required: ['code'],
+  const tools = [];
+
+  if (allowedModels.length > 0) {
+    const defaultDirectModel = allowedModels.includes('deepseek-v4-flash')
+      ? 'deepseek-v4-flash'
+      : allowedModels[0];
+
+    tools.push(
+      ...Object.entries(MODELS)
+        .filter(([id]) => allowedModels.includes(id))
+        .map(([id, info]) => ({
+        name: `verboo_${id.replace(/[.-]/g, '_')}`,
+        description: `${info.name} — ${info.note}. ${(info.ctx / 1024).toFixed(0)}K ctx, ${info.out} max output. Plano: ${info.tier}.`,
+        inputSchema: { ...codec, properties: { ...codec.properties, max_tokens: { type: 'number', description: `Max tokens (max ${info.out})`, default: Math.min(info.out, 8192) } } },
+        })),
+      {
+        name: 'verboo_code',
+        description: 'Executa tarefa de codificação com um modelo permitido pela política administrativa.',
+        inputSchema: { ...codec, properties: { ...codec.properties, model: { type: 'string', enum: allowedModels, default: defaultDirectModel } } },
       },
-    },
-    {
-      name: 'verboo_route',
-      description: 'Classifica uma tarefa e explica o ranking dos modelos Verboo sem executar nenhum agente.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          prompt: {
-            type: 'string',
-            description: 'Tarefa que será classificada',
+      {
+        name: 'verboo_review',
+        description: 'Revisa codigo buscando bugs, vulnerabilidades e problemas de performance',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            code: { type: 'string', description: 'Codigo a ser revisado' },
+            context: { type: 'string', description: 'Contexto adicional (ex: linguagem, framework)' },
+            model: { type: 'string', enum: allowedModels, default: defaultDirectModel },
+            temperature: { type: 'number', default: 0.2 },
           },
-          mode: {
-            type: 'string',
-            enum: ['read_only', 'write'],
-            default: 'read_only',
-          },
-          tiers: {
-            type: 'array',
-            items: { type: 'string', enum: ['pro', 'max', 'ultra'] },
-            default: ['pro', 'max', 'ultra'],
-          },
-          exclude_models: {
-            type: 'array',
-            items: { type: 'string', enum: Object.keys(MODELS) },
-            default: [],
-          },
-          executor: {
-            type: 'string',
-            enum: AGENT_EXECUTORS,
-            default: DEFAULT_AGENT_EXECUTOR,
-            description: 'Aplica à prévia a mesma disponibilidade de modelos do executor que executará a tarefa',
-          },
+          required: ['code'],
         },
-        required: ['prompt'],
       },
-    },
+      {
+        name: 'verboo_route',
+        description: 'Classifica uma tarefa e explica o ranking dos modelos Verboo sem executar nenhum agente.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            prompt: {
+              type: 'string',
+              description: 'Tarefa que será classificada',
+            },
+            mode: {
+              type: 'string',
+              enum: ['read_only', 'write'],
+              default: 'read_only',
+            },
+            tiers: {
+              type: 'array',
+              items: { type: 'string', enum: ['pro', 'max', 'ultra'] },
+              default: ['pro', 'max', 'ultra'],
+            },
+            exclude_models: {
+              type: 'array',
+              items: { type: 'string', enum: allowedModels },
+              default: [],
+            },
+            executor: {
+              type: 'string',
+              enum: AGENT_EXECUTORS,
+              default: DEFAULT_AGENT_EXECUTOR,
+              description: 'Aplica à prévia a mesma disponibilidade de modelos do executor que executará a tarefa',
+            },
+          },
+          required: ['prompt'],
+        },
+      },
+    );
+  }
+
+  tools.push(
     {
       name: 'verboo_agent',
       description: 'Executa um subagente Verboo repo-aware de forma síncrona e bloqueia até concluir; use apenas para tarefa curta. Para App/IDE ou tarefa não trivial, longa, paralela ou de duração incerta, use verboo_agent_start. Nunca chame a CLI diretamente. model=auto classifica a tarefa e tenta fallback recuperável. read_only apenas inspeciona; write exige VERBOO_AGENT_WRITE_ENABLED=1. O orquestrador executa testes e outros comandos.',
@@ -267,7 +783,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           model: {
             type: 'string',
-            enum: ['auto', ...Object.keys(MODELS)],
+            enum: ['auto', ...allowedModels],
             default: 'auto',
           },
           timeout_seconds: {
@@ -290,7 +806,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           cwd: { type: 'string', description: 'Diretorio do projeto, dentro de VERBOO_AGENT_ALLOWED_ROOTS' },
           executor: { type: 'string', enum: AGENT_EXECUTORS, default: DEFAULT_AGENT_EXECUTOR },
           mode: { type: 'string', enum: ['read_only', 'write'], default: 'read_only' },
-          model: { type: 'string', enum: ['auto', ...Object.keys(MODELS)], default: 'auto' },
+          model: { type: 'string', enum: ['auto', ...allowedModels], default: 'auto' },
           timeout_seconds: { type: 'integer', minimum: MIN_TIMEOUT_SECONDS, maximum: MAX_TIMEOUT_SECONDS, default: 600 },
         },
         required: ['prompt', 'cwd'],
@@ -332,7 +848,48 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         required: ['action', 'cwd'],
       },
     },
-  ];
+    {
+      name: 'verboo_validate',
+      description:
+        'Executa validação do repositório como sequência de argv estrito com shell:false, binário absoluto resolvido/validado na política, cwd realpath e HOME isolado, sem iniciar agente ou job. Dois perfis: ESTÁTICO (node --check <arquivo no cwd>; git diff --check, diff --cached --check, status --porcelain=v1, log --oneline limitado) sob VERBOO_AGENT_VERIFY_ENABLED=1 (default falha fechado); PROJECT-CODE (npm test; npm run <script> só com VERBOO_AGENT_VERIFY_NPM_SCRIPTS) — ação importante que executa código confiável do repositório com o mesmo usuário do bridge e pode escrever arquivos, ler qualquer caminho acessível ao usuário, ler configurações e acessar rede, exigindo ADICIONALMENTE VERBOO_AGENT_VERIFY_PROJECT_CODE_ENABLED=1 e aprovação explícita do host. Não é read-only nem sandbox. Sem isolamento de filesystem ou rede. Nunca oferece comandos de commit, push, publish ou deploy.',
+      annotations: {
+        title: 'Validação segura do repositório',
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+      inputSchema: {
+        type: 'object',
+        properties: {
+          cwd: { type: 'string', description: 'Diretório do projeto, dentro de VERBOO_AGENT_ALLOWED_ROOTS' },
+          commands: {
+            type: 'array',
+            description: 'Sequência de comandos argv (sem shell). Ex.: {"cmd":"npm","args":["test"]}',
+            items: {
+              type: 'object',
+              properties: {
+                cmd: { type: 'string', enum: ['npm', 'node', 'git'] },
+                args: { type: 'array', items: { type: 'string' }, default: [] },
+              },
+              required: ['cmd'],
+            },
+            minItems: 1,
+            maxItems: 10,
+          },
+          stop_on_failure: { type: 'boolean', default: true },
+          timeout_seconds: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 600,
+            default: 120,
+            description: 'Timeout por comando, em segundos (há também teto total)',
+          },
+        },
+        required: ['cwd', 'commands'],
+      },
+    },
+  );
 
   return { tools };
 });
@@ -404,6 +961,29 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         process.env.VERBOO_AGENT_ALLOWED_ROOTS,
       );
       const executor = resolveAgentExecutor(args.executor, process.env);
+      const executorModels = executorAvailableModels(
+        executor,
+        Object.keys(MODELS),
+        process.env,
+      );
+      if (request.model !== 'auto') {
+        assertGlobalModelAllowed(request.model, process.env);
+        if (!executorModels.includes(request.model)) {
+          const error = new Error(
+            `Modelo ${request.model} indisponível para o executor ${executor}.`,
+          );
+          error.code = 'MODEL_NOT_ALLOWED';
+          error.executor = executor;
+          throw error;
+        }
+      } else if (globallyAllowedModels(executorModels, process.env).length === 0) {
+        const error = new Error(
+          `Nenhum modelo disponível para o executor ${executor}.`,
+        );
+        error.code = 'MODEL_ROUTE_EMPTY';
+        error.executor = executor;
+        throw error;
+      }
       const agentArgs = {
         prompt: request.prompt,
         cwd,
@@ -449,7 +1029,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         case 'cancel':
           if (!jobId) return { content: [{ type: 'text', text: JSON.stringify({ error: 'job_id obrigatorio' }) }], isError: true };
           {
-            const payload = jobQueue.cancel(jobId);
+            const payload = await jobQueue.cancel(jobId);
             return {
               content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
               isError: Boolean(payload.error),
@@ -495,13 +1075,35 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           }, null, 2),
         }],
       };
+    } else if (name === 'verboo_validate') {
+      const payload = await runVerbooValidate(args);
+      return {
+        content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+        isError: payload.status !== 'ok',
+      };
     } else if (name === 'verboo_code') {
-      model = args.model ?? 'deepseek-v4-flash';
+      const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
+      if (allowedModels.length === 0) {
+        throw Object.assign(new Error('MODEL_POLICY_EMPTY: política de modelos vazia — nenhum modelo disponível.'), { code: 'MODEL_POLICY_EMPTY' });
+      }
+      model = args.model ?? (
+        allowedModels.includes('deepseek-v4-flash')
+          ? 'deepseek-v4-flash'
+          : allowedModels[0]
+      );
       messages = [];
       if (args.system) messages.push({ role: 'system', content: args.system });
       messages.push({ role: 'user', content: args.prompt });
     } else if (name === 'verboo_review') {
-      model = args.model ?? 'deepseek-v4-flash';
+      const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
+      if (allowedModels.length === 0) {
+        throw Object.assign(new Error('MODEL_POLICY_EMPTY: política de modelos vazia — nenhum modelo disponível.'), { code: 'MODEL_POLICY_EMPTY' });
+      }
+      model = args.model ?? (
+        allowedModels.includes('deepseek-v4-flash')
+          ? 'deepseek-v4-flash'
+          : allowedModels[0]
+      );
         let contextPrefix = '';
         if (args.context) contextPrefix = `Contexto: ${args.context}\n\n`;
         messages = [
@@ -555,7 +1157,7 @@ const PROMPTS = {
     arguments: [
       { name: 'codigo', description: 'Codigo fonte a ser revisado', required: true },
       { name: 'contexto', description: 'Contexto do projeto', required: false },
-      { name: 'modelo', description: 'Modelo Verboo (default: deepseek-v4-flash)', required: false },
+      { name: 'modelo', description: 'Modelo Verboo permitido pela política administrativa', required: false },
     ],
   },
   'refatorar': {
@@ -589,7 +1191,16 @@ server.setRequestHandler(GetPromptRequestSchema, async (req) => {
   const prompt = PROMPTS[req.params.name];
   if (!prompt) throw new Error(`Prompt desconhecido: ${req.params.name}`);
 
-  const modelo = req.params.arguments?.modelo || 'deepseek-v4-flash';
+  const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
+  if (allowedModels.length === 0) {
+    throw Object.assign(new Error('MODEL_POLICY_EMPTY: política de modelos vazia — nenhum modelo disponível.'), { code: 'MODEL_POLICY_EMPTY' });
+  }
+  const modelo = req.params.arguments?.modelo || (
+    allowedModels.includes('deepseek-v4-flash')
+      ? 'deepseek-v4-flash'
+      : allowedModels[0]
+  );
+  assertGlobalModelAllowed(modelo, process.env);
 
   if (req.params.name === 'revisar-codigo') {
     const ctx = req.params.arguments?.contexto || '';
@@ -628,7 +1239,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
     {
       uri: 'verboo://models',
       name: 'Modelos disponiveis',
-      description: 'Lista de todos os modelos Verboo com especificacoes',
+      description: 'Lista de modelos Verboo permitidos pela política administrativa',
       mimeType: 'application/json',
     },
     {
@@ -642,24 +1253,37 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => ({
 
 server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
   if (req.params.uri === 'verboo://models') {
+    const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
+    if (allowedModels.length === 0) {
+      return {
+        contents: [{
+          uri: 'verboo://models',
+          mimeType: 'application/json',
+          text: JSON.stringify({ error: 'MODEL_POLICY_EMPTY', message: 'Política de modelos vazia — nenhum modelo disponível.' }, null, 2),
+        }],
+      };
+    }
     return {
       contents: [{
         uri: 'verboo://models',
         mimeType: 'application/json',
-        text: JSON.stringify(Object.entries(MODELS).map(([id, m]) => ({
+        text: JSON.stringify(Object.entries(MODELS)
+          .filter(([id]) => allowedModels.includes(id))
+          .map(([id, m]) => ({
           id,
           name: m.name,
           context_window: m.ctx,
           max_output: m.out,
           tier: m.tier,
           note: m.note,
-        })), null, 2),
+          })), null, 2),
       }],
     };
   }
 
   if (req.params.uri === 'verboo://status') {
     const queueStatus = jobQueue.status;
+    const allowedModels = globallyAllowedModels(Object.keys(MODELS), process.env);
     return {
       contents: [{
         uri: 'verboo://status',
@@ -667,7 +1291,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
         text: JSON.stringify({
           version: VERSION,
           base_url: BASE_URL,
-          models_count: Object.keys(MODELS).length,
+          models_count: allowedModels.length,
           log_level: LOG_LEVEL,
           api_key_configured: Boolean(API_KEY),
           agent_allowed_roots_configured: Boolean(process.env.VERBOO_AGENT_ALLOWED_ROOTS),

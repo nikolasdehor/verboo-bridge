@@ -27,9 +27,40 @@ jobs:
       - name: Validate
         run: npm test
 
+  validate-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      # A suíte completa continua no job validate (Linux). O Windows valida a nova
+      # superfície do PR #9 porque os testes legados utilizam premissas POSIX.
+      - name: Validate
+        run: |
+          $agentOutput = node --test --test-name-pattern="^(denylist global filtra seleção automática e rejeita seleção manual|onProgress (recebe routing e generating em execucao bem-sucedida|nao afeta execucao quando ausente|recebe waiting_model, executing_tool e processing_result|inclui attempt info em fallback|processa linha JSON dividida entre chunks)|parse(OpenCode|VerbooCode)Events preserva multiplos blocos text em ordem|buildProgressOnLine (detecta tool_use e chama onProgress com tool_counts|correlaciona resultado nativo e OpenCode por id|limita emissões, faz flush e ignora evento tardio|nao falha com JSON invalido))$" test/agent-runner.test.mjs
+          $agentOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (($agentOutput -join "`n") -notmatch '\bpass\s+[1-9]\d*\b') { throw 'agent-runner selected zero tests' }
+          $queueOutput = node --test --test-name-pattern="^JobQueue: (persistencia armazena apenas metadados seguros|resultado duravel exige opt-in na escrita e recuperacao|resultado duravel recupera warning failed e cancelled|schema desconhecido e legado nunca recuperam resultado|falha ao gravar resultado nunca publica sucesso falso|enqueuePersisted grava estado queued antes de responder|recuperação normaliza timestamps inválidos|initStore rejeita path traversal em filename|prune autonomo remove job e arquivo persistido|getJob inclui campos de progresso para job ativo|progresso tem tool_counts enquanto ativo e limpa no terminal|queue_position 0 running positivo queued null terminal|listJobs nao expoe campos de progresso|progresso limpo ao cancelar|progresso limpo ao fazer dispose|progress_summary gerado a partir da fase e contadores|getJob expoe updated_at no progresso|runnerData original nao contem __onProgress apos enqueue|heartbeat nao troca waiting_model para idle|heartbeat relata silencio como idle e atividade restaura fase|cancelamento com falha de persistência não expõe status de cancelado confirmado|cancelamento de running job drena fila para proximo|rejeicao inesperada em listener nao causa unhandled rejection|persistencia opt-in sanitiza artifacts absolutos)$" test/job-queue.test.mjs
+          $queueOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (($queueOutput -join "`n") -notmatch '\bpass\s+[1-9]\d*\b') { throw 'job-queue selected zero tests' }
+          $mcpOutput = node --test --test-name-pattern="^MCP (aplica denylist em tools, schemas, recursos e chamadas antigas|verboo_agent_start enfileira e verboo_job cancela execução em andamento|verboo_validate (falha fechado sem opt-in e anota ação não read-only|separa perfil estático de project-code com segundo gate|executa binário resolvido e rejeita política adversarial|stop_on_failure, timeout total, truncamento e redaction))$" test/mcp.test.mjs
+          $mcpOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (($mcpOutput -join "`n") -notmatch '\bpass\s+[1-9]\d*\b') { throw 'mcp selected zero tests' }
+
   release:
     if: github.event_name == 'push'
-    needs: validate
+    needs: [validate, validate-windows]
     permissions:
       contents: write
     runs-on: ubuntu-latest
