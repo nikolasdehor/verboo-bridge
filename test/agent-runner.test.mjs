@@ -2203,6 +2203,48 @@ test('model auto nunca tenta fallback depois de execução write falhar', async 
   assert.equal(spawnCalls, 1);
 });
 
+test('model auto inclui variantes premium somente com VERBOO_AUTO_INCLUDE_PREMIUM_MODELS=1', async () => {
+  const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-premium-auto-'));
+  const request = {
+    prompt: 'Implemente uma refatoração grande com testes.',
+    cwd: base,
+    executor: 'opencode',
+    mode: 'read_only',
+    model: 'auto',
+    timeout_seconds: 10,
+  };
+  const options = {
+    availableModels: ['deepseek-v4-pro'],
+    env: {
+      VERBOO_AGENT_ALLOWED_ROOTS: base,
+      VERBOO_API_KEY: 'test-key',
+    },
+    spawnImpl: spawnJsonlFixture([
+      { type: 'text', sessionID: 'premium_auto', part: { text: 'Concluído.' } },
+    ]),
+  };
+
+  await assert.rejects(
+    () => runVerbooAgent(request, options),
+    (error) => error.code === 'MODEL_ROUTE_EMPTY',
+  );
+  await assert.rejects(
+    () => runVerbooAgent(request, {
+      ...options,
+      env: { ...options.env, VERBOO_AUTO_INCLUDE_PREMIUM_MODELS: '0' },
+    }),
+    (error) => error.code === 'MODEL_ROUTE_EMPTY',
+  );
+
+  const result = await runVerbooAgent(request, {
+    ...options,
+    env: { ...options.env, VERBOO_AUTO_INCLUDE_PREMIUM_MODELS: '1' },
+  });
+  assert.equal(result.model, 'deepseek-v4-pro');
+  assert.equal(result.routing.selected_model, 'deepseek-v4-pro');
+  assert.equal(result.routing.auto_include_premium_models, true);
+});
+
 test('modelo manual respeita allowlist e tiers administrativos', async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'verboo-model-policy-'));
   const request = {

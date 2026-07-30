@@ -408,6 +408,10 @@ function recoverableModelFailure(error) {
   return ['EXIT_ERROR', 'TIMEOUT', 'MODEL_AT_CAPACITY'].includes(error.code);
 }
 
+export function autoIncludePremiumModels(env) {
+  return String(env.VERBOO_AUTO_INCLUDE_PREMIUM_MODELS ?? '').trim() === '1';
+}
+
 function modelRouteFor(request, availableModels, env) {
   if (request.model !== 'auto') {
     assertGlobalModelAllowed(request.model, env);
@@ -428,14 +432,16 @@ function modelRouteFor(request, availableModels, env) {
   }
 
   const policy = configuredModelPolicy(availableModels, env);
+  const includePremiumModels = autoIncludePremiumModels(env);
   const route = selectModelForTask({
     prompt: request.routePrompt ?? request.prompt,
     mode: request.mode,
     availableModels: policy.availableModels,
     allowTiers: policy.allowTiers,
+    includePremiumModels,
     runtimeState: modelRuntimeState,
   });
-  return { strategy: 'auto', ...route };
+  return { strategy: 'auto', autoIncludePremiumModels: includePremiumModels, ...route };
 }
 
 function inlineConfig(mode) {
@@ -1984,6 +1990,7 @@ function routingResult(route, initialRoute, model, attempts) {
   const fallbackCount = attempts.length - 1;
   return {
     strategy: route.strategy,
+    auto_include_premium_models: initialRoute.autoIncludePremiumModels ?? false,
     selected_model: model,
     reason: fallbackCount > 0
       ? `Fallback após ${fallbackCount} falha(s): ${route.reason}`

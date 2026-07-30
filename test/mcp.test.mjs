@@ -225,6 +225,48 @@ test('MCP aplica denylist em tools, schemas, recursos e chamadas antigas', async
   assert.equal(JSON.parse(deniedGlm52Call.content[0].text).job_id, undefined);
 });
 
+test('MCP inclui modelos premium no roteamento somente com opt-in e informa a configuração', async (t) => {
+  const repo = path.resolve('.');
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(repo, 'index.mjs')],
+    env: {
+      ...process.env,
+      VERBOO_API_KEY: 'test-key',
+      VERBOO_AGENT_ALLOWED_ROOTS: repo,
+      VERBOO_MODEL_ALLOWLIST: 'deepseek-v4-pro',
+      VERBOO_NATIVE_MODEL_ALLOWLIST: 'deepseek-v4-pro',
+      VERBOO_MODEL_TIERS: 'max',
+      VERBOO_AUTO_INCLUDE_PREMIUM_MODELS: '1',
+      VERBOO_MEMORY_ENABLED: '0',
+    },
+    stderr: 'pipe',
+  });
+  const client = new Client(
+    { name: 'verboo-bridge-test', version: '1.0.0' },
+    { capabilities: {} },
+  );
+  t.after(async () => client.close());
+  await client.connect(transport);
+
+  const routed = await client.callTool({
+    name: 'verboo_route',
+    arguments: {
+      prompt: 'Implemente uma refatoração grande com testes.',
+      mode: 'write',
+      executor: 'native',
+    },
+  });
+  assert.notEqual(routed.isError, true);
+  const routePayload = JSON.parse(routed.content[0].text);
+  assert.equal(routePayload.selected_model, 'deepseek-v4-pro');
+  assert.equal(routePayload.auto_include_premium_models, true);
+
+  const statusRead = await client.readResource({ uri: 'verboo://status' });
+  const statusPayload = JSON.parse(statusRead.contents[0].text);
+  assert.equal(statusPayload.auto_include_premium_models, true);
+});
+
 test('MCP verboo_agent_start enfileira e verboo_job cancela execução em andamento', async (t) => {
   const repo = path.resolve('.');
   const fixture = await mkdtemp(path.join(os.tmpdir(), 'verboo-mcp-agent-'));
@@ -516,6 +558,7 @@ test('MCP verboo://status resource contem capacity/queued/running/total', async 
   assert.equal(typeof statusPayload.job_queue.queued, 'number');
   assert.equal(typeof statusPayload.job_queue.running, 'number');
   assert.equal(typeof statusPayload.job_queue.total, 'number');
+  assert.equal(statusPayload.auto_include_premium_models, false);
 });
 
 
