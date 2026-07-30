@@ -9,6 +9,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   AGENT_EXECUTORS,
+  autoIncludePremiumModels,
   assertGlobalModelAllowed,
   configuredModelPolicy,
   executorAvailableModels,
@@ -936,6 +937,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       );
       const policy = configuredModelPolicy(executorModels, process.env);
       const requestedTiers = args.tiers ?? policy.allowTiers;
+      const includePremiumModels = autoIncludePremiumModels(process.env);
       const route = selectModelForTask({
         prompt,
         mode: args.mode ?? 'read_only',
@@ -944,12 +946,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           (tier) => policy.allowTiers.includes(tier),
         ),
         excludeModels: args.exclude_models ?? [],
+        includePremiumModels,
       });
       return {
         content: [{
           type: 'text',
           text: JSON.stringify({
             executor,
+            auto_include_premium_models: includePremiumModels,
             selected_model: route.model,
             reason: route.reason,
             task_profile: route.profile,
@@ -1314,6 +1318,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
           agent_executor: DEFAULT_AGENT_EXECUTOR,
           agent_default_executor: DEFAULT_AGENT_EXECUTOR,
           agent_executors: AGENT_EXECUTORS,
+          auto_include_premium_models: autoIncludePremiumModels(process.env),
           memory: memoryStatus(process.env),
           job_queue: {
             concurrency: jobQueue.capacity,

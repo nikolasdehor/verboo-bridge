@@ -89,6 +89,26 @@ test('expõe modelos Max para seleção manual sem colocá-los no roteamento aut
   assert.ok(!ranking.some((item) => item.model === 'mimo-v2.5-pro'));
 });
 
+test('inclui variantes premium no ranking somente com opt-in explícito', () => {
+  const input = {
+    prompt: 'Implemente uma refatoração grande com testes.',
+    mode: 'write',
+    availableModels: ALL_MODELS,
+    allowTiers: ['pro', 'max', 'ultra'],
+  };
+
+  const defaultRanking = rankModelsForTask(input);
+  assert.ok(!defaultRanking.some((item) => item.model === 'deepseek-v4-pro'));
+  assert.ok(!defaultRanking.some((item) => item.model === 'mimo-v2.5-pro'));
+
+  const premiumRanking = rankModelsForTask({
+    ...input,
+    includePremiumModels: true,
+  });
+  assert.ok(premiumRanking.some((item) => item.model === 'deepseek-v4-pro'));
+  assert.ok(premiumRanking.some((item) => item.model === 'mimo-v2.5-pro'));
+});
+
 test('penaliza concorrência e uso recente sem fazer round-robin cego', () => {
   const now = 1_000_000;
   const ranking = rankModelsForTask({
