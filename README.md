@@ -69,18 +69,22 @@ graph TB
 | Modelo | Contexto anunciado | Planos | Seleção automática | Ideal para |
 |--------|--------------------|--------|:-------------------:|-----------|
 | **DeepSeek V4 Flash** | 1M | Pro, Max e Ultra | Sim | Codificação geral |
-| **DeepSeek V4 Pro** | 1M | Max | Não | Codificação mais exigente |
+| **DeepSeek V4 Pro** | 1M | Max | Com opt-in | Codificação mais exigente |
 | **Mimo V2.5** | 1M | Pro, Max e Ultra | Sim | Análise com contexto longo |
-| **Mimo V2.5 Pro** | 1M | Max | Não | Análise mais exigente |
+| **Mimo V2.5 Pro** | 1M | Max | Com opt-in | Análise mais exigente |
 | **GLM 4.7 Flash** | 201k | Junior, Pro, Max e Ultra | Sim | Tarefas rápidas |
 | **Qwen 3.6 27B** | 262k | Junior, Pro, Max e Ultra | Sim | Tarefas leves |
 | **GLM 5.2** | 197k | Ultra | Sim | Raciocínio complexo |
 | **Kimi K2.7** | 259k | Ultra | Sim | Tarefas gerais e visão |
 | **Minimax M3** | até 1M | Max e Ultra | Sim | Codificação rápida e visão |
 
-O roteador não escolhe automaticamente as variantes exclusivas do Max porque a
-disponibilidade depende da assinatura. Elas podem ser selecionadas
+Por padrão, o roteador não escolhe automaticamente as variantes exclusivas do
+Max porque a disponibilidade depende da assinatura. Elas podem ser selecionadas
 explicitamente por `model` e limitadas com `VERBOO_NATIVE_MODEL_ALLOWLIST`.
+Para incluí-las no ranking automático, defina
+`VERBOO_AUTO_INCLUDE_PREMIUM_MODELS=1`; a allowlist, denylist, tier e a política
+do executor continuam sendo aplicados. Com a variável ausente, `0` ou qualquer
+outro valor, o comportamento padrão é mantido.
 O endpoint `/models` também é filtrado pelo plano associado à chave.
 
 ---
@@ -122,6 +126,8 @@ export VERBOO_AGENT_ALLOWED_ROOTS="/caminho/para/seus/projetos"
 # Padrão opcional; cada chamada pode escolher native ou opencode
 export VERBOO_AGENT_EXECUTOR="native"
 export VERBOO_CODE_BIN="/caminho/para/verboo"
+# Opcional: inclui variantes premium/Max no roteamento automático
+export VERBOO_AUTO_INCLUDE_PREMIUM_MODELS="1"
 # Opcional e sensível: habilita edição (sem shell)
 export VERBOO_AGENT_WRITE_ENABLED="1"
 # Memória técnica persistente e isolada por projeto
@@ -212,6 +218,8 @@ default_tools_approval_mode = "prompt"
 VERBOO_AGENT_ALLOWED_ROOTS = "/caminho/absoluto/para/seus/projetos"
 VERBOO_AGENT_EXECUTOR = "native"
 VERBOO_CODE_BIN = "/caminho/absoluto/para/verboo"
+# Opcional: inclui DeepSeek V4 Pro e Mimo V2.5 Pro no ranking automático
+VERBOO_AUTO_INCLUDE_PREMIUM_MODELS = "1"
 ```
 
 No Codex App, também é possível abrir **Settings → MCP servers → Add server**,
@@ -521,6 +529,7 @@ No `verboo_agent`, `model: "auto"` é o padrão. O roteador combina:
   longo ou resposta rápida;
 - afinidades declaradas de cada modelo;
 - tier permitido e allowlist/denylist administrativas;
+- variantes premium/Max somente quando `VERBOO_AUTO_INCLUDE_PREMIUM_MODELS=1`;
 - execuções em andamento, uso recente, falhas e cooldown.
 
 Isso distribui chamadas concorrentes sem round-robin cego: o melhor modelo
@@ -542,7 +551,8 @@ Exemplo:
 }
 ```
 
-O resultado informa `routing.strategy`, `selected_model`, `reason`, `ranking`
+O resultado informa `routing.strategy`, `auto_include_premium_models`,
+`selected_model`, `reason`, `ranking`
 e todas as `attempts`, para o orquestrador revisar a decisão.
 
 Escolha do harness:
@@ -744,6 +754,7 @@ O servidor também expõe **recursos** e **prompts**:
 | `VERBOO_MODEL_ALLOWLIST` | todos | Modelos permitidos em todas as frentes (tools diretas, schemas, recursos, prompts, preview e agentes), separados por vírgula |
 | `VERBOO_MODEL_DENYLIST` | — | Modelos bloqueados em todas as frentes; são ocultados dos schemas/recursos e rejeitados antes de rede ou fila |
 | `VERBOO_MODEL_TIERS` | `pro,max,ultra` | Grupos internos permitidos no roteamento, preview e seleção manual; não substitui a allowlist da assinatura |
+| `VERBOO_AUTO_INCLUDE_PREMIUM_MODELS` | — | Defina exatamente `1` para incluir variantes premium marcadas como manuais no ranking automático. Ausente, `0` ou outro valor preserva o comportamento padrão. Allowlist, denylist, tiers e política do executor continuam valendo. |
 | `VERBOO_MODEL_COOLDOWN_SECONDS` | `60` | Cooldown de um modelo após falha recuperável |
 | `VERBOO_CODE_BIN` | `verboo` | Executável da CLI oficial; pode ser Node quando `VERBOO_CODE_ENTRYPOINT` estiver definido |
 | `VERBOO_CODE_ENTRYPOINT` | — | Caminho opcional para `@verboo/code/dist/cli.mjs` |

@@ -56,6 +56,9 @@ security sandbox.
 The auto router classifies coding, security, review, UX/web, analysis, long
 context, and quick tasks. It also considers in-flight work, recent use, failures,
 and cooldown so concurrent calls are distributed without blind round-robin.
+Premium variants marked as manual stay out of automatic routing by default. An
+administrator can set `VERBOO_AUTO_INCLUDE_PREMIUM_MODELS=1` to include them;
+the configured allowlists, denylist, tiers, and executor policy still apply.
 Recoverable model errors can fall back to a freshly ranked model only in
 `read_only`; `write` and explicit model choices never rotate silently.
 

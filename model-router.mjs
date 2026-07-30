@@ -322,6 +322,7 @@ export function rankModelsForTask({
   availableModels = Object.keys(MODEL_CATALOG),
   allowTiers = ['pro', 'ultra'],
   excludeModels = [],
+  includePremiumModels = false,
   runtimeState = {},
   now = Date.now(),
 }) {
@@ -335,7 +336,7 @@ export function rankModelsForTask({
       available.has(model)
       && !excluded.has(model)
       && tiers.has(MODEL_CATALOG[model].tier)
-      && MODEL_CATALOG[model].auto !== false
+      && (includePremiumModels || MODEL_CATALOG[model].auto !== false)
     ))
     .map((model) => {
       const metadata = MODEL_CATALOG[model];
