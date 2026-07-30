@@ -12,12 +12,23 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const server = path.join(here, '..', 'index.mjs');
 const LEGACY_TOOL = 'verboo_glm_5_2';
 
+// Ambiente minimo e explicito. Herdar o shell inteiro levaria VERBOO_API_KEY
+// junto, e ai a chamada da tool legada faria uma requisicao real e paga em vez
+// de parar no erro de credencial que esta checagem espera observar.
+const BASE_ENV = {
+  PATH: process.env.PATH,
+  HOME: process.env.HOME,
+  TMPDIR: process.env.TMPDIR,
+  NO_COLOR: '1',
+  VERBOO_API_KEY: '',
+};
+
 const connect = async (env) => {
   const client = new Client({ name: 'compat-check', version: '1.0.0' });
   await client.connect(new StdioClientTransport({
     command: process.execPath,
     args: [server],
-    env: { ...process.env, ...env },
+    env: { ...BASE_ENV, ...env },
   }));
   return client;
 };
@@ -41,10 +52,17 @@ const leanNames = (await lean.listTools()).tools.map((tool) => tool.name);
 check('vitrine nao lista tools por modelo', !leanNames.includes(LEGACY_TOOL), leanNames.join(','));
 check('verboo_code segue publicada', leanNames.includes('verboo_code'));
 
-// 2. nome antigo continua resolvendo no handler
+// 2. nome antigo continua resolvendo no handler.
+// A resposta do servidor nao vai para o log nem sanitizada: so a classificacao
+// dela, que e o unico dado de que o diagnostico precisa.
 const call = await lean.callTool({ name: LEGACY_TOOL, arguments: { prompt: 'oi' } });
 const text = call.content?.[0]?.text ?? '';
-check('nome antigo nao vira "Tool desconhecida"', !/Tool desconhecida/i.test(text), text.slice(0, 120));
+const resolved = !/Tool desconhecida/i.test(text);
+check(
+  'nome antigo nao vira "Tool desconhecida"',
+  resolved,
+  resolved ? 'chegou ao handler e parou na credencial' : 'handler nao reconheceu o nome',
+);
 await lean.close();
 
 // 3. flag de compatibilidade republica as tools

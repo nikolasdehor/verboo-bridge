@@ -498,17 +498,23 @@ Quando o servidor MCP estiver registrado, o orquestrador terá acesso a estas fe
 | `verboo_agent_start` | Padrão para App/IDE e trabalho não trivial; retorna `job_id` imediatamente |
 | `verboo_job` | Consulta jobs sem bloquear: `status`, `result`, `list`, `cancel` |
 | `verboo_memory` | Consulta ou registra uma nota técnica durável no diário isolado do projeto |
-| `verboo_code` | Codificação com DeepSeek V4 Flash |
+| `verboo_code` | Codificação com um modelo escolhido em `model` |
 | `verboo_review` | Code review |
-| `verboo_deepseek_v4_flash` | Modelo específico |
-| `verboo_deepseek_v4_pro` | Modelo específico do plano Max |
-| `verboo_glm_5_2` | Modelo específico |
-| `verboo_mimo_v2_5` | Modelo específico |
-| `verboo_mimo_v2_5_pro` | Modelo específico do plano Max |
-| `verboo_kimi_k2_7` | Modelo específico |
-| `verboo_minimax_m3` | Modelo específico |
-| `verboo_glm_4_7_flash` | Modelo específico |
-| `verboo_qwen3_6_27b` | Modelo específico |
+| `verboo_validate` | Validação de entrega |
+
+As ferramentas por modelo (`verboo_deepseek_v4_flash`, `verboo_glm_5_2` e as
+demais) não são mais publicadas na listagem. Elas tinham schema idêntico entre si
+e custavam cerca de 900 tokens de contexto por sessão, sendo na prática o
+parâmetro `model` de `verboo_code` repetido na vitrine. Escolha o modelo em
+`verboo_code`:
+
+```json
+{ "name": "verboo_code", "arguments": { "prompt": "...", "model": "glm-5.2" } }
+```
+
+Chamadas pelo nome antigo continuam funcionando: o handler resolve
+`verboo_<modelo>` normalmente. Para voltar a publicá-las na listagem, defina
+`VERBOO_LIST_MODEL_TOOLS=1`.
 
 Exemplo de delegação nativa:
 
@@ -755,6 +761,7 @@ O servidor também expõe **recursos** e **prompts**:
 | `VERBOO_MODEL_DENYLIST` | — | Modelos bloqueados em todas as frentes; são ocultados dos schemas/recursos e rejeitados antes de rede ou fila |
 | `VERBOO_MODEL_TIERS` | `pro,max,ultra` | Grupos internos permitidos no roteamento, preview e seleção manual; não substitui a allowlist da assinatura |
 | `VERBOO_AUTO_INCLUDE_PREMIUM_MODELS` | — | Defina exatamente `1` para incluir variantes premium marcadas como manuais no ranking automático. Ausente, `0` ou outro valor preserva o comportamento padrão. Allowlist, denylist, tiers e política do executor continuam valendo. |
+| `VERBOO_LIST_MODEL_TOOLS` | — | Defina `1` para voltar a publicar uma tool por modelo na listagem. Ausente, as chamadas por nome antigo seguem funcionando, mas as tools não aparecem na descoberta. |
 | `VERBOO_MODEL_COOLDOWN_SECONDS` | `60` | Cooldown de um modelo após falha recuperável |
 | `VERBOO_CODE_BIN` | `verboo` | Executável da CLI oficial; pode ser Node quando `VERBOO_CODE_ENTRYPOINT` estiver definido |
 | `VERBOO_CODE_ENTRYPOINT` | — | Caminho opcional para `@verboo/code/dist/cli.mjs` |
