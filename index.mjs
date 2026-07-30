@@ -701,17 +701,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       ? 'deepseek-v4-flash'
       : allowedModels[0];
 
+    // Uma tool por modelo custava ~900 tokens de contexto em cada sessao de
+    // qualquer host, com schema identico entre elas: era o parametro `model` de
+    // verboo_code repetido N vezes na vitrine. Removidas da listagem; o handler
+    // continua resolvendo `verboo_<modelo>` por lookup em MODELS, entao quem ja
+    // chama pelo nome antigo nao quebra. Defina VERBOO_LIST_MODEL_TOOLS=1 para
+    // voltar a publica-las.
+    if (process.env.VERBOO_LIST_MODEL_TOOLS === '1') {
+      tools.push(
+        ...Object.entries(MODELS)
+          .filter(([id]) => allowedModels.includes(id))
+          .map(([id, info]) => ({
+            name: `verboo_${id.replace(/[.-]/g, '_')}`,
+            description: `${info.name} - ${info.note}. ${(info.ctx / 1024).toFixed(0)}K ctx, ${info.out} max output. Plano: ${info.tier}.`,
+            inputSchema: { ...codec, properties: { ...codec.properties, max_tokens: { type: 'number', description: `Max tokens (max ${info.out})`, default: Math.min(info.out, 8192) } } },
+          })),
+      );
+    }
+
     tools.push(
-      ...Object.entries(MODELS)
-        .filter(([id]) => allowedModels.includes(id))
-        .map(([id, info]) => ({
-        name: `verboo_${id.replace(/[.-]/g, '_')}`,
-        description: `${info.name} — ${info.note}. ${(info.ctx / 1024).toFixed(0)}K ctx, ${info.out} max output. Plano: ${info.tier}.`,
-        inputSchema: { ...codec, properties: { ...codec.properties, max_tokens: { type: 'number', description: `Max tokens (max ${info.out})`, default: Math.min(info.out, 8192) } } },
-        })),
       {
         name: 'verboo_code',
-        description: 'Executa tarefa de codificação com um modelo permitido pela política administrativa.',
+        description: `Executa tarefa com um modelo Verboo. Escolha em "model" (${allowedModels.length} disponiveis).`,
         inputSchema: { ...codec, properties: { ...codec.properties, model: { type: 'string', enum: allowedModels, default: defaultDirectModel } } },
       },
       {
