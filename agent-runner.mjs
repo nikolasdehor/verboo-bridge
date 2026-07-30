@@ -409,14 +409,16 @@ function recoverableModelFailure(error) {
 }
 
 export function autoIncludePremiumModels(env) {
-  return String(env.VERBOO_AUTO_INCLUDE_PREMIUM_MODELS ?? '').trim() === '1';
+  return env.VERBOO_AUTO_INCLUDE_PREMIUM_MODELS === '1';
 }
 
 function modelRouteFor(request, availableModels, env) {
+  const includePremiumModels = autoIncludePremiumModels(env);
   if (request.model !== 'auto') {
     assertGlobalModelAllowed(request.model, env);
     return {
       strategy: 'manual',
+      autoIncludePremiumModels: includePremiumModels,
       model: request.model,
       profile: null,
       reason: 'Modelo definido explicitamente pelo orquestrador.',
@@ -432,7 +434,6 @@ function modelRouteFor(request, availableModels, env) {
   }
 
   const policy = configuredModelPolicy(availableModels, env);
-  const includePremiumModels = autoIncludePremiumModels(env);
   const route = selectModelForTask({
     prompt: request.routePrompt ?? request.prompt,
     mode: request.mode,

@@ -2007,6 +2007,7 @@ test('modelo manual lotado faz fallback em leitura sem repetir o modelo', async 
         VERBOO_AGENT_ALLOWED_ROOTS: base,
         VERBOO_API_KEY: 'test-key',
         VERBOO_AGENT_MAX_MODEL_ATTEMPTS: '2',
+        VERBOO_AUTO_INCLUDE_PREMIUM_MODELS: '1',
       },
       spawnImpl,
     },
@@ -2017,6 +2018,7 @@ test('modelo manual lotado faz fallback em leitura sem repetir o modelo', async 
   assert.equal(result.status, 'success');
   assert.equal(result.routing.attempts[0].code, 'MODEL_AT_CAPACITY');
   assert.equal(result.routing.attempts[1].status, 'success');
+  assert.equal(result.routing.auto_include_premium_models, true);
 });
 
 test('falha de capacidade explica o fallback quando não há segundo modelo', async () => {
@@ -2228,13 +2230,18 @@ test('model auto inclui variantes premium somente com VERBOO_AUTO_INCLUDE_PREMIU
     () => runVerbooAgent(request, options),
     (error) => error.code === 'MODEL_ROUTE_EMPTY',
   );
-  await assert.rejects(
-    () => runVerbooAgent(request, {
-      ...options,
-      env: { ...options.env, VERBOO_AUTO_INCLUDE_PREMIUM_MODELS: '0' },
-    }),
-    (error) => error.code === 'MODEL_ROUTE_EMPTY',
-  );
+  for (const nonOptInValue of ['0', ' 1 ', '1\n']) {
+    await assert.rejects(
+      () => runVerbooAgent(request, {
+        ...options,
+        env: {
+          ...options.env,
+          VERBOO_AUTO_INCLUDE_PREMIUM_MODELS: nonOptInValue,
+        },
+      }),
+      (error) => error.code === 'MODEL_ROUTE_EMPTY',
+    );
+  }
 
   const result = await runVerbooAgent(request, {
     ...options,
