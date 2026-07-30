@@ -15,10 +15,11 @@ const LEGACY_TOOL = 'verboo_glm_5_2';
 // Ambiente minimo e explicito. Herdar o shell inteiro levaria VERBOO_API_KEY
 // junto, e ai a chamada da tool legada faria uma requisicao real e paga em vez
 // de parar no erro de credencial que esta checagem espera observar.
+// Sem TMPDIR de proposito: esta checagem nao escreve em disco, e repassar o
+// diretorio temporario so ampliaria a superficie do processo filho.
 const BASE_ENV = {
   PATH: process.env.PATH,
   HOME: process.env.HOME,
-  TMPDIR: process.env.TMPDIR,
   NO_COLOR: '1',
   VERBOO_API_KEY: '',
 };
