@@ -343,6 +343,85 @@ Feche completamente o Claude Desktop e abra novamente. No chat, clique em
 que `verboo-bridge` está conectado. A configuração segue o
 [guia oficial de servidores MCP locais](https://modelcontextprotocol.io/docs/develop/connect-local-servers).
 
+#### Claude Desktop no Windows com WSL
+
+O Claude Desktop no Windows roda o comando configurado fora da distro WSL. Um
+padrão comum é apontar `command` para `wsl.exe` e usar `args` com
+`bash -c '...'`, por exemplo:
+
+```json
+{
+  "command": "wsl.exe",
+  "args": ["bash", "-c", "/home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/bin/npx --yes verboo-bridge@latest"]
+}
+```
+
+Isso costuma falhar com **"Server disconnected"** sem log útil quando o Node
+é instalado via nvm. Causa raiz (verificada localmente com `env -i`, que
+simula o PATH mínimo de um shell não-login): `bash -c` abre um shell
+**não-login e não-interativo**, que não lê `~/.bashrc` nem o init do nvm por
+padrão. O `npx` do nvm é um script Node com shebang `#!/usr/bin/env node`;
+sem o diretório do nvm no `PATH`, o `env` não acha o `node` e o processo
+morre na hora, com `env: node: No such file or directory` (exit 127) antes
+mesmo de abrir a conexão MCP. O comportamento de `bash -c` não carregar
+`~/.bashrc` é padrão do Bash em qualquer SO; se o `~/.profile`/`~/.bash_profile`
+da distro específica encadeia para `~/.bashrc` (varia por distro e não foi
+verificado numa instalação Windows real), isso pode ou não compensar.
+
+**Correção recomendada (à prova de PATH, não depende de shell profile):**
+instale o pacote globalmente uma vez, dentro de uma sessão WSL onde `npm`
+já funciona, e aponte o Claude Desktop direto para o binário do Node e para
+o `index.mjs` instalado, sem passar pelo `npx`:
+
+```bash
+# uma vez, dentro do WSL
+npm install --global verboo-bridge
+npm root -g   # confirma o caminho de lib/node_modules
+```
+
+```json
+{
+  "mcpServers": {
+    "verboo-bridge": {
+      "command": "wsl.exe",
+      "args": [
+        "bash",
+        "-c",
+        "/home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/bin/node /home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/lib/node_modules/verboo-bridge/index.mjs"
+      ],
+      "env": {
+        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/absoluto/para/seus/projetos",
+        "VERBOO_AGENT_EXECUTOR": "native",
+        "VERBOO_CODE_BIN": "/caminho/absoluto/para/verboo"
+      }
+    }
+  }
+}
+```
+
+Chamando o `node` direto (sem passar por nenhum script com shebang), a
+resolução via `PATH`/nvm deixa de ser necessária, então nenhuma suposição
+sobre o shell profile da distro entra em jogo.
+
+**Correção rápida (não garantida, depende do perfil da distro):** trocar
+`bash -c` por `bash -lc` (shell de login) na config original com `npx`. Em
+instalações WSL padrão (Ubuntu com `~/.bashrc` contendo o init do nvm e um
+`~/.profile` que encadeia para ele), isso costuma bastar. Se ainda aparecer
+"Server disconnected", use a correção recomendada acima.
+
+Se preferir manter o binário `verboo-mcp` do pacote em vez de chamar
+`index.mjs` diretamente, defina a variável `VERBOO_NODE_BIN` com o caminho
+absoluto do `node` (veja [Variáveis de ambiente](#variáveis-de-ambiente)):
+o script já resolve esse binário antes de qualquer PATH de shell e, desde a
+versão que corrigiu este bug, avisa com clareza no stderr quando o `node`
+configurado não é encontrado.
+
+Por fim, `npx --yes verboo-bridge@latest` sempre resolve a versão mais
+recente do registro e pode baixar o pacote a cada início do cliente MCP,
+o que soma latência e depende de rede a cada abertura do Claude Desktop.
+Preferir instalação global (`npm install --global verboo-bridge`) evita essa
+resolução de rede repetida e é o caminho mais robusto para uso contínuo.
+
 ### Claude Code CLI
 
 Para disponibilizar o bridge em todos os projetos no macOS ou Linux:
@@ -786,6 +865,7 @@ O servidor também expõe **recursos** e **prompts**:
 | `write` inicia, mas `Edit`/`Write` são negados por `dontAsk` | Atualize para `verboo-bridge@1.4.3` ou superior e reinicie o cliente. O executor nativo usa `bypassPermissions`; o modo escolhido pelo orquestrador ainda delimita as ferramentas, e shell, web, hooks, agentes aninhados e segredos continuam negados. |
 | A chamada termina perto de 60 segundos | Defina `tool_timeout_sec = 1800` ou use `verboo_agent_start` com `verboo_job`. |
 | Aviso sobre `VERBOO_API_KEY` no modo nativo | A chave não é necessária para `verboo_agent` com OAuth; ela serve apenas às ferramentas de API. |
+| Claude Desktop no Windows/WSL mostra `Server disconnected` sem log | `bash -c` (shell não-login) não carrega o nvm, então `node` some do PATH e o `npx` do nvm morre na hora. Veja [Claude Desktop no Windows com WSL](#claude-desktop-no-windows-com-wsl). |
 
 ---
 

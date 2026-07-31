@@ -18,4 +18,21 @@ if [ -z "${VERBOO_API_KEY:-}" ] && [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; the
 fi
 
 NODE_BIN="${VERBOO_NODE_BIN:-node}"
+
+# ponytail: checagem única antes do exec, sem ela, PATH sem nvm carregado
+# (ex.: `bash -c` não-login no WSL) falha silenciosamente e o cliente MCP só
+# reporta "Server disconnected", sem pista nenhuma.
+if ! command -v "$NODE_BIN" >/dev/null 2>&1; then
+  echo "verboo-mcp: não encontrei o binário \"$NODE_BIN\" no PATH." >&2
+  echo "verboo-mcp: PATH atual: $PATH" >&2
+  echo "verboo-mcp: isso é comum quando o cliente MCP roda este script via" >&2
+  echo "verboo-mcp: shell não-login/não-interativo (ex.: wsl.exe + \`bash -c\`)," >&2
+  echo "verboo-mcp: que não carrega o nvm. Corrija de uma das formas:" >&2
+  echo "verboo-mcp:   1) defina VERBOO_NODE_BIN com o caminho absoluto do node" >&2
+  echo "verboo-mcp:      (ex.: \$(command -v node) numa sessão onde o nvm funciona)" >&2
+  echo "verboo-mcp:   2) troque \`bash -c\` por \`bash -lc\` na config do cliente" >&2
+  echo "verboo-mcp: veja a seção \"Claude Desktop no Windows com WSL\" do README" >&2
+  exit 127
+fi
+
 exec "$NODE_BIN" "$BRIDGE_DIR/index.mjs"
