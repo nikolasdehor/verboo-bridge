@@ -370,8 +370,8 @@ verificado numa instalação Windows real), isso pode ou não compensar.
 
 **Correção recomendada (à prova de PATH, não depende de shell profile):**
 instale o pacote globalmente uma vez, dentro de uma sessão WSL onde `npm`
-já funciona, e aponte o Claude Desktop direto para o binário do Node e para
-o `index.mjs` instalado, sem passar pelo `npx`:
+já funciona, e aponte o Claude Desktop para o wrapper `verboo-mcp` do
+pacote, informando o caminho do Node em `VERBOO_NODE_BIN`:
 
 ```bash
 # uma vez, dentro do WSL
@@ -387,9 +387,10 @@ npm root -g   # confirma o caminho de lib/node_modules
       "args": [
         "bash",
         "-c",
-        "/home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/bin/node /home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/lib/node_modules/verboo-bridge/index.mjs"
+        "/home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/lib/node_modules/verboo-bridge/bin/verboo-mcp"
       ],
       "env": {
+        "VERBOO_NODE_BIN": "/home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/bin/node",
         "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/absoluto/para/seus/projetos",
         "VERBOO_AGENT_EXECUTOR": "native",
         "VERBOO_CODE_BIN": "/caminho/absoluto/para/verboo"
@@ -399,9 +400,15 @@ npm root -g   # confirma o caminho de lib/node_modules
 }
 ```
 
-Chamando o `node` direto (sem passar por nenhum script com shebang), a
-resolução via `PATH`/nvm deixa de ser necessária, então nenhuma suposição
-sobre o shell profile da distro entra em jogo.
+O wrapper resolve o interpretador por `VERBOO_NODE_BIN` antes de qualquer
+`PATH` de shell, então nenhuma suposição sobre o profile da distro entra em
+jogo, e quando o binário informado não existe ele explica a causa no stderr
+em vez de morrer sem mensagem.
+
+Use o wrapper, e não o `index.mjs` direto: é ele que carrega o
+`VERBOO_ENV_FILE` e exporta a `VERBOO_API_KEY` antes de subir o servidor.
+Apontando para o `index.mjs`, quem guarda as credenciais nesse arquivo fica
+sem autenticação.
 
 **Correção rápida (não garantida, depende do perfil da distro):** trocar
 `bash -c` por `bash -lc` (shell de login) na config original com `npx`. Em
@@ -409,12 +416,10 @@ instalações WSL padrão (Ubuntu com `~/.bashrc` contendo o init do nvm e um
 `~/.profile` que encadeia para ele), isso costuma bastar. Se ainda aparecer
 "Server disconnected", use a correção recomendada acima.
 
-Se preferir manter o binário `verboo-mcp` do pacote em vez de chamar
-`index.mjs` diretamente, defina a variável `VERBOO_NODE_BIN` com o caminho
-absoluto do `node` (veja [Variáveis de ambiente](#variáveis-de-ambiente)):
-o script já resolve esse binário antes de qualquer PATH de shell e, desde a
-versão que corrigiu este bug, avisa com clareza no stderr quando o `node`
-configurado não é encontrado.
+Se você não usa `VERBOO_ENV_FILE` e prefere invocar o `index.mjs` sem
+intermediário, troque o argumento pelo caminho do `node` seguido do
+`index.mjs` instalado. Nesse caso as credenciais precisam vir todas pelo
+bloco `env` da própria configuração.
 
 Por fim, `npx --yes verboo-bridge@latest` sempre resolve a versão mais
 recente do registro e pode baixar o pacote a cada início do cliente MCP,
