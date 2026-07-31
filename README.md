@@ -387,18 +387,18 @@ npm root -g   # confirma o caminho de lib/node_modules
       "args": [
         "bash",
         "-c",
-        "/home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/lib/node_modules/verboo-bridge/bin/verboo-mcp"
-      ],
-      "env": {
-        "VERBOO_NODE_BIN": "/home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/bin/node",
-        "VERBOO_AGENT_ALLOWED_ROOTS": "/caminho/absoluto/para/seus/projetos",
-        "VERBOO_AGENT_EXECUTOR": "native",
-        "VERBOO_CODE_BIN": "/caminho/absoluto/para/verboo"
-      }
+        "VERBOO_NODE_BIN=/home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/bin/node VERBOO_AGENT_ALLOWED_ROOTS=/caminho/absoluto/para/seus/projetos VERBOO_AGENT_EXECUTOR=native VERBOO_CODE_BIN=/caminho/absoluto/para/verboo exec /home/SEU_USUARIO/.nvm/versions/node/vX.Y.Z/lib/node_modules/verboo-bridge/bin/verboo-mcp"
+      ]
     }
   }
 }
 ```
+
+As variáveis vão **dentro do comando**, e não no bloco `env` do
+`claude_desktop_config.json`. Aquele bloco define variáveis no ambiente do
+Windows, e o `wsl.exe` não as repassa para dentro do WSL sem configurar
+`WSLENV`. Declarando antes do `exec`, elas chegam ao processo Linux que
+realmente executa o servidor.
 
 O wrapper resolve o interpretador por `VERBOO_NODE_BIN` antes de qualquer
 `PATH` de shell, então nenhuma suposição sobre o profile da distro entra em
@@ -410,16 +410,15 @@ Use o wrapper, e não o `index.mjs` direto: é ele que carrega o
 Apontando para o `index.mjs`, quem guarda as credenciais nesse arquivo fica
 sem autenticação.
 
-**Correção rápida (não garantida, depende do perfil da distro):** trocar
-`bash -c` por `bash -lc` (shell de login) na config original com `npx`. Em
-instalações WSL padrão (Ubuntu com `~/.bashrc` contendo o init do nvm e um
-`~/.profile` que encadeia para ele), isso costuma bastar. Se ainda aparecer
-"Server disconnected", use a correção recomendada acima.
+**Não use `bash -lc` como atalho.** Parece resolver, mas na instalação
+padrão do nvm em Ubuntu o init fica no `~/.bashrc`, que começa com um
+early-return para shell não-interativo. Mesmo em shell de login o `node`
+continua fora do `PATH`, e o sintoma é idêntico ao original, o que só
+dificulta o diagnóstico.
 
 Se você não usa `VERBOO_ENV_FILE` e prefere invocar o `index.mjs` sem
-intermediário, troque o argumento pelo caminho do `node` seguido do
-`index.mjs` instalado. Nesse caso as credenciais precisam vir todas pelo
-bloco `env` da própria configuração.
+intermediário, troque o alvo do `exec` pelo caminho do `node` seguido do
+`index.mjs` instalado, mantendo as variáveis declaradas antes do `exec`.
 
 Por fim, `npx --yes verboo-bridge@latest` sempre resolve a versão mais
 recente do registro e pode baixar o pacote a cada início do cliente MCP,
