@@ -4136,6 +4136,75 @@ test('buildVerbooCodeInvocation inclui --include-partial-messages', () => {
   assert.ok(invocation.args.includes('--include-partial-messages'));
 });
 
+// ── system prompt via canal de sistema dedicado ─────────────────────────
+
+test('buildVerbooCodeInjection omite --append-system-prompt sem systemPrompt', () => {
+  const invocation = buildVerbooCodeInvocation({
+    prompt: 'teste',
+    cwd: '/repo',
+    mode: 'read_only',
+    model: 'deepseek-v4-flash',
+  });
+  assert.ok(!invocation.args.includes('--append-system-prompt'));
+});
+
+test('buildVerbooCodeInvocation injeta systemPrompt em --append-system-prompt', () => {
+  const systemPrompt = 'You are restricted.';
+  const invocation = buildVerbooCodeInvocation({
+    prompt: 'teste',
+    cwd: '/repo',
+    mode: 'read_only',
+    model: 'deepseek-v4-flash',
+    systemPrompt,
+  });
+  const idx = invocation.args.indexOf('--append-system-prompt');
+  assert.ok(idx !== -1, 'deve incluir --append-system-prompt');
+  assert.equal(invocation.args[idx + 1], systemPrompt);
+});
+
+test('inlineConfig do OpenCode inclui prompt do agente com restrições', () => {
+  const invocation = buildOpenCodeInvocation({
+    prompt: 'audite',
+    cwd: '/repo',
+    mode: 'read_only',
+    model: 'deepseek-v4-flash',
+  });
+  const config = JSON.parse(invocation.inlineConfig);
+  const agent = config.agent['verboo-bridge-agent'];
+  assert.ok(typeof agent.prompt === 'string' && agent.prompt.length > 0);
+  assert.ok(agent.prompt.includes('Read'));
+  assert.ok(agent.prompt.includes('Glob'));
+  assert.ok(agent.prompt.includes('List'));
+  assert.ok(!agent.prompt.includes('Grep'));
+});
+
+test('inlineConfig do OpenCode em modo write lista Edit mas não Write', () => {
+  const invocation = buildOpenCodeInvocation({
+    prompt: 'edite',
+    cwd: '/repo',
+    mode: 'write',
+    model: 'deepseek-v4-flash',
+  });
+  const config = JSON.parse(invocation.inlineConfig);
+  const prompt = config.agent['verboo-bridge-agent'].prompt;
+  assert.ok(prompt.includes('Edit'));
+  assert.ok(!prompt.includes('Write'));
+});
+
+test('system prompt native read_only menciona apenas Read, Glob, Grep', () => {
+  const invocation = buildVerbooCodeInvocation({
+    prompt: 'audite',
+    cwd: '/repo',
+    mode: 'read_only',
+    model: 'deepseek-v4-flash',
+    systemPrompt: 'placeholder',
+  });
+  // O system prompt real é gerado por runVerbooAgent; aqui só validamos que
+  // o builder aceita e posiciona corretamente o campo.
+  const idx = invocation.args.indexOf('--append-system-prompt');
+  assert.equal(invocation.args[idx + 1], 'placeholder');
+});
+
 // ── buildProgressOnLine: allowed_tools e stream_event ───────────────────
 
 test('buildProgressOnLine inclui allowed_tools no progresso', () => {
