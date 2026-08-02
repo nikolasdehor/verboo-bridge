@@ -4136,8 +4136,6 @@ test('buildVerbooCodeInvocation inclui --include-partial-messages', () => {
   assert.ok(invocation.args.includes('--include-partial-messages'));
 });
 
-// ── system prompt via canal de sistema dedicado ─────────────────────────
-
 test('buildVerbooCodeInjection omite --append-system-prompt sem systemPrompt', () => {
   const invocation = buildVerbooCodeInvocation({
     prompt: 'teste',
