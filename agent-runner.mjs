@@ -32,6 +32,28 @@ const DEFAULT_AGENT_CONCURRENCY = 4;
 const MAX_AGENT_CONCURRENCY = 8;
 const KILL_GRACE_MS = 2_000;
 const AGENT_NAME = 'verboo-bridge-agent';
+const AGENT_SYSTEM_PROMPT = [
+  'You are a Verboo subagent orchestrated by verboo-bridge.',
+  '',
+  'Execution constraints:',
+  '- You do NOT have access to a shell, terminal, or bash. Do not attempt to run',
+  '  commands, scripts, build, tests, lint, typecheck, git, npm, pip, or any',
+  '  other command. Those are the sole responsibility of the orchestrator',
+  '  (Claude Code, Codex, OpenCode, Cursor) that called you.',
+  '- You do NOT have network access, web fetch, web search, or nested agents.',
+  '- You are confined to the provided project directory. Do not access paths',
+  '  outside it.',
+  '- .env files and secrets are blocked.',
+  '',
+  'Authorized tools:',
+  '- read_only: read-only access (Read, Glob, Grep). Analyze and report.',
+  '- write: in addition to reading, you may edit files (Edit/Write) within the',
+  '  project. NEVER run post-edit validation (tests, lint) — delegate to the',
+  '  orchestrator.',
+  '',
+  'When finished, clearly describe what you did or found so the orchestrator',
+  'can decide the next steps (tests, commit, deploy).',
+].join('\n');
 const NATIVE_ALWAYS_DISALLOWED_TOOLS = [
   'Bash',
   'WebFetch',
@@ -2262,6 +2284,13 @@ export async function runVerbooAgent(args, options) {
     const memoryContext = await loadMemoryContext(request.cwd, options.env);
     request.routePrompt = originalPrompt;
     request.prompt = promptWithMemory(originalPrompt, memoryContext);
+    request.prompt = [
+      '<verboo_system>',
+      AGENT_SYSTEM_PROMPT,
+      '</verboo_system>',
+      '',
+      request.prompt,
+    ].join('\n');
     const executor = resolveAgentExecutor(args.executor, options.env);
     validateExecutorCredentials(executor, options.env);
     const executorModels = executorAvailableModels(
