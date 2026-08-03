@@ -32,7 +32,7 @@ const DEFAULT_AGENT_CONCURRENCY = 4;
 const MAX_AGENT_CONCURRENCY = 8;
 const KILL_GRACE_MS = 2_000;
 const AGENT_NAME = 'verboo-bridge-agent';
-function buildAgentSystemPrompt(mode, executor) {
+export function buildAgentSystemPrompt(mode, executor) {
   const tools = allowedToolsForMode(mode, executor).join(', ');
   const modeLabel = mode === 'write'
     ? `read/write (${tools})`

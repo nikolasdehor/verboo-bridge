@@ -18,6 +18,7 @@ import test from 'node:test';
 import {
   allowedToolsForMode,
   assertGlobalModelAllowed,
+  buildAgentSystemPrompt,
   buildOpenCodeInvocation,
   buildProgressOnLine,
   buildTaskkillInvocation,
@@ -4189,7 +4190,7 @@ test('inlineConfig do OpenCode em modo write lista Edit mas não Write', () => {
   assert.ok(!prompt.includes('Write'));
 });
 
-test('system prompt native read_only menciona apenas Read, Glob, Grep', () => {
+test('buildVerbooCodeInvocation posiciona o systemPrompt logo apos a flag', () => {
   const invocation = buildVerbooCodeInvocation({
     prompt: 'audite',
     cwd: '/repo',
@@ -4197,10 +4198,52 @@ test('system prompt native read_only menciona apenas Read, Glob, Grep', () => {
     model: 'deepseek-v4-flash',
     systemPrompt: 'placeholder',
   });
-  // O system prompt real é gerado por runVerbooAgent; aqui só validamos que
-  // o builder aceita e posiciona corretamente o campo.
   const idx = invocation.args.indexOf('--append-system-prompt');
   assert.equal(invocation.args[idx + 1], 'placeholder');
+});
+
+// O system prompt e a unica barreira que o MODELO enxerga (o resto e bloqueio
+// tecnico pos-hoc). Se ele anunciar ferramenta que a policy nega, o subagente
+// tenta e leva FORBIDDEN_TOOL_USED; se omitir ferramenta permitida, o subagente
+// se auto-limita a toa. Por isso a lista anunciada e testada contra a fonte de
+// verdade (allowedToolsForMode) em vez de contra literais duplicados aqui.
+for (const executor of ['native', 'opencode']) {
+  for (const mode of ['read_only', 'write']) {
+    test(`system prompt (${executor}/${mode}) anuncia exatamente as ferramentas permitidas`, () => {
+      const prompt = buildAgentSystemPrompt(mode, executor);
+      const esperadas = allowedToolsForMode(mode, executor);
+
+      for (const tool of esperadas) {
+        assert.ok(
+          prompt.includes(tool),
+          `system prompt deveria anunciar "${tool}" em ${executor}/${mode}`,
+        );
+      }
+
+      const todas = ['Read', 'Glob', 'Grep', 'List', 'Edit', 'Write'];
+      for (const tool of todas.filter((t) => !esperadas.includes(t))) {
+        assert.ok(
+          !new RegExp(`\\b${tool}\\b`).test(prompt.split('Authorized tools')[1] ?? ''),
+          `system prompt NAO deveria anunciar "${tool}" em ${executor}/${mode}`,
+        );
+      }
+    });
+  }
+}
+
+test('system prompt sempre proibe shell explicitamente, nos dois modos', () => {
+  // Regressao: o motivo original desta feature foi subagente tentando Bash sem
+  // saber que era proibido, resultando em FORBIDDEN_TOOL_USED.
+  for (const mode of ['read_only', 'write']) {
+    const prompt = buildAgentSystemPrompt(mode, 'native');
+    assert.match(prompt, /do NOT have access to a shell/i);
+    assert.match(prompt, /bash/i);
+  }
+});
+
+test('system prompt em modo write proibe validacao pos-edicao', () => {
+  const prompt = buildAgentSystemPrompt('write', 'native');
+  assert.match(prompt, /NEVER run post-edit validation/i);
 });
 
 // ── buildProgressOnLine: allowed_tools e stream_event ───────────────────
