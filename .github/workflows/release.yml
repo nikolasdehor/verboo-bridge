@@ -1,6 +1,7 @@
 name: CI / Release
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -48,7 +49,7 @@ jobs:
         run: npm test
 
   release:
-    if: github.event_name == 'push'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     needs: [validate, validate-windows]
     permissions:
       contents: write
@@ -67,10 +68,13 @@ jobs:
         id: check
         run: |
           VER=$(node -p 'require("./package.json").version')
-          if npm view "verboo-bridge@$VER" version 2>/dev/null; then
+          if RESULT=$(npm view "verboo-bridge@$VER" version --json); then
             echo "published=true" >> "$GITHUB_OUTPUT"
-          else
+          elif printf '%s' "$RESULT" | node -e 'let s = ""; process.stdin.on("data", c => s += c); process.stdin.on("end", () => { try { process.exit(JSON.parse(s).error.code === "E404" ? 0 : 1); } catch { process.exit(1); } });'; then
             echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            printf '%s\n' "$RESULT" >&2
+            exit 1
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
