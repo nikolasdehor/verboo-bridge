@@ -37,7 +37,7 @@
     "test:posix": "bash -n bin/vb bin/verboo-mcp"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.32.2"
   },
   "overrides": {
     "@hono/node-server": ">=2.0.5"
